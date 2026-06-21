@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "engine": "argos",
+  "source_lang": "en",
+  "target_lang": "zh",
+  "batch_size": 20,
+  "timeout_seconds": 30,
+  "translate_products": true,
+  "translate_reviews": true,
+  "use_cache": true
+}

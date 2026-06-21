@@ -1,0 +1,5 @@
+{
+  "root_dir": "data_warehouse",
+  "parquet_dir": "data_warehouse/parquet",
+  "duckdb_path": "data_warehouse/amazon_selection.duckdb"
+}

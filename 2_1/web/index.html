@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amazon 选品助手</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <!-- 轻量图表库（决策 §3 允许 ECharts/Chart.js，不引入 React 重型栈） -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">▲</span>
+        <span class="brand-name">选品助手</span>
+      </div>
+      <nav id="nav">
+        <div class="nav-group">
+          <div class="nav-group-title">采集与追踪</div>
+          <a class="nav-item" href="#/crawl">运行爬取</a>
+          <a class="nav-item" href="#/tasks">任务中心</a>
+          <a class="nav-item" href="#/tracking">关键词追踪</a>
+          <a class="nav-item" href="#/import">本地 HTML 入库</a>
+          <a class="nav-item" href="#/import-reviews">评论导入</a>
+          <a class="nav-item" href="#/warehouse">仓库同步</a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-title">商品分析</div>
+          <a class="nav-item" href="#/products">商品池 · 筛选</a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-title">洞察与决策</div>
+          <a class="nav-item" href="#/recommendations">推荐 · 蓝海</a>
+          <a class="nav-item" href="#/keywords">关键词机会</a>
+          <a class="nav-item" href="#/reviews">评论痛点</a>
+          <a class="nav-item" href="#/agent">AI 助手</a>
+        </div>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="api-status" class="dot dot-unknown" title="API 状态"></span>
+        <span id="api-status-text">检测中…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h1 id="view-title">推荐 · 蓝海</h1>
+        <div class="topbar-actions">
+          <button id="refresh-btn" class="btn" title="刷新当前页">↻ 刷新</button>
+        </div>
+      </header>
+      <section id="content" class="content"><!-- 视图渲染于此 --></section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

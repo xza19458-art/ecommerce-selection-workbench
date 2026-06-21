@@ -1,0 +1,57 @@
+# Python runtime and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example
+config/database.json
+config/warehouse.json
+config/agent.json
+config/translation.json
+2_1/config/database.json
+2_1/config/warehouse.json
+2_1/config/agent.json
+2_1/config/translation.json
+
+# Logs
+*.log
+debug.log
+logs/
+2_1/logs/
+
+# Generated crawler/input/output data
+html/
+reviews/
+cache/
+data_warehouse/
+.argos/
+2_1/html/
+2_1/reviews/
+2_1/cache/
+2_1/data_warehouse/
+2_1/.argos/
+2_1/数据结果/
+数据结果/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini

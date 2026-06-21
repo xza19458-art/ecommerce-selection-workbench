@@ -1,0 +1,3 @@
+# Optional translation dependencies.
+# Install only when config/translation.json enables the Argos engine.
+argostranslate

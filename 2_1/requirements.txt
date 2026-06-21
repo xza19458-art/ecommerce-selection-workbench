@@ -1,0 +1,15 @@
+beautifulsoup4
+cryptography
+duckdb
+lxml
+matplotlib
+numpy
+openpyxl
+pandas
+pymysql
+selenium
+webdriver-manager
+fastapi
+uvicorn[standard]
+pywebview
+pyinstaller

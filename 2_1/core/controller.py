@@ -234,12 +234,19 @@ class AppController:
             print(f"已保存第 {page_num} 页到: {page_save_path}")
             return True
 
-        self.collect_amazon_search_pages(url, pages=pages, on_page=save_page)
+        limits = _collection_limits()
+        effective_pages = _clamp_int(pages, 1, limits["max_pages_per_keyword"])
+        self.collect_amazon_search_pages(
+            url,
+            pages=effective_pages,
+            on_page=save_page,
+            page_delay_seconds=(limits["page_delay_min_seconds"], limits["page_delay_max_seconds"]),
+        )
 
     def run_keyword_crawl(
         self,
         keyword: str,
-        pages: int = 1,
+        pages: int | None = None,
         *,
         record_job: bool = True,
     ) -> dict:
@@ -257,14 +264,22 @@ class AppController:
         keyword = (keyword or "").strip()
         if not keyword:
             raise ValueError("请输入爬取关键词")
+        limits = _collection_limits()
         try:
-            pages = int(pages)
+            requested_pages = limits["pages_per_keyword"] if pages is None else int(pages)
         except (TypeError, ValueError) as exc:
             raise ValueError("请输入有效的爬取页数") from exc
-        if pages < 1:
-            raise ValueError("请输入有效的爬取页数")
-        if pages > 7:
-            raise ValueError("一次最多爬取 7 页")
+        pages = _clamp_int(requested_pages, 1, limits["max_pages_per_keyword"])
+        parameter_changes: list[dict] = []
+        if pages != requested_pages:
+            parameter_changes.append(
+                {
+                    "字段": "pages",
+                    "原值": requested_pages,
+                    "实际值": pages,
+                    "原因": f"服务端按设置将单关键词页数限制在 1..{limits['max_pages_per_keyword']}。",
+                }
+            )
 
         project_root = Path(__file__).resolve().parents[1]
         html_root = project_root / "html"
@@ -326,14 +341,22 @@ class AppController:
             return True
 
         try:
-            self.collect_amazon_search_pages(url, pages=pages, on_page=save_page, page_delay_seconds=(5, 10))
+            self.collect_amazon_search_pages(
+                url,
+                pages=pages,
+                on_page=save_page,
+                page_delay_seconds=(limits["page_delay_min_seconds"], limits["page_delay_max_seconds"]),
+            )
             status = "完成" if not stop_reason else "异常停止"
             message = stop_reason or "爬取完成；HTML 已保存，后续可到「本地 HTML 入库」预览并写入数据库。"
             self._try_finish_crawl_job(job_id, status, pages_saved, None if status == "完成" else message)
             return {
                 "关键词": keyword,
                 "URL": url,
-                "请求页数": pages,
+                "请求页数": requested_pages,
+                "实际页数": pages,
+                "页间隔秒": [limits["page_delay_min_seconds"], limits["page_delay_max_seconds"]],
+                "参数调整": parameter_changes,
                 "保存页数": len([p for p in pages_saved if p.get("状态") == "已保存"]),
                 "状态": status,
                 "开始时间": started_at.isoformat(sep=" "),
@@ -445,6 +468,29 @@ class AppController:
             "Parquet": str(summary.parquet_dir),
             "同步表": {table.name: table.rows for table in summary.tables},
         }
+
+    def get_settings(self) -> dict:
+        """Current user settings + schema + defaults (S3 设置页透出 services.settings)."""
+        from services.settings import get_default_settings, get_settings_schema, load_settings_result
+
+        result = load_settings_result()
+
+        return {
+            "settings": result.settings,
+            "changes": [change.to_dict() for change in result.changes],
+            "schema": get_settings_schema(),
+            "defaults": get_default_settings(),
+        }
+
+    def update_settings(self, patch: dict) -> dict:
+        """Deep-merge patch into settings, normalize + server-side clamp, persist.
+
+        Returns {settings, changes}: changes 是被服务端钳制/回落的项（B 层硬边界等），
+        供前端如实回报用户。C 层自定义评分只作单独层，不替换标准评分口径。
+        """
+        from services.settings import update_settings as _update
+
+        return _update(patch).to_dict()
 
     def get_top_recommendations(self, limit: int = 50) -> list[dict]:
         """Fetch top product recommendations from MySQL."""
@@ -913,3 +959,23 @@ class AppController:
 def _safe_file_part(value: str) -> str:
     cleaned = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", value.strip(), flags=re.UNICODE).strip("._")
     return cleaned[:80] or "amazon_search"
+
+
+def _collection_limits() -> dict[str, int]:
+    from services.settings import get_collection_limits
+
+    limits = get_collection_limits()
+    return {
+        "page_delay_min_seconds": limits.page_delay_min_seconds,
+        "page_delay_max_seconds": limits.page_delay_max_seconds,
+        "pages_per_keyword": limits.pages_per_keyword,
+        "max_pages_per_keyword": limits.max_pages_per_keyword,
+    }
+
+
+def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = minimum
+    return max(minimum, min(number, maximum))

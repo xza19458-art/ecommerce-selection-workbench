@@ -25,13 +25,14 @@ from services.snapshot_collection_plan import (
     SnapshotCollectionTask,
     build_snapshot_collection_plan,
 )
+from services.settings import CollectionLimits, get_collection_limits
 
 
 MAX_KEYWORDS_PER_RUN = 3
 MAX_PAGES_PER_KEYWORD = 7  # 2026-06-18 人类裁定调高至 7（Amazon 搜索常见到底页数），见 decisions/2026-06-18-限频边界调整.md
 MIN_INTERVAL_HOURS = 72
 MIN_PAGE_DELAY_SECONDS = 5  # 2026-06-18 对齐原有 crawl_amazon 实证节奏（页间 3-5s），效率/稳定折中，见 decisions/2026-06-18-限频边界调整.md
-MAX_RUNTIME_MINUTES = 120   # 2026-06-18 人类裁定放宽到 2 小时，要效率不只稳定
+MAX_RUNTIME_MINUTES = 120   # 默认 2 小时；S 系列设置允许用户调高，不再作为硬上限。
 
 BLOCKED_DIR_NAME = "_blocked"
 
@@ -110,18 +111,18 @@ def run_snapshot_collection(
     *,
     run: bool = False,
     max_keywords: int = MAX_KEYWORDS_PER_RUN,
-    min_interval_hours: int = MIN_INTERVAL_HOURS,
-    pages_per_keyword: int = 1,
-    max_pages_per_keyword: int = MAX_PAGES_PER_KEYWORD,
+    min_interval_hours: int | None = None,
+    pages_per_keyword: int | None = None,
+    max_pages_per_keyword: int | None = None,
     target_snapshots: int = 3,
     marketplace: str | None = None,
     keyword: str | None = None,
     keyword_exact: bool = False,
     save_root: str | Path = "html/snapshots",
     stop_file: str | Path = "runtime/stop_snapshot_collection.flag",
-    page_delay_min_seconds: int = MIN_PAGE_DELAY_SECONDS,
-    page_delay_max_seconds: int = 90,
-    max_runtime_minutes: int = MAX_RUNTIME_MINUTES,
+    page_delay_min_seconds: int | None = None,
+    page_delay_max_seconds: int | None = None,
+    max_runtime_minutes: int | None = None,
     manifest_path: str | Path | None = None,
     record_jobs: bool = True,
     ignore_interval: bool = False,
@@ -503,16 +504,41 @@ def _runtime_exceeded(started_monotonic: float, max_runtime_minutes: int) -> boo
     return (time.monotonic() - started_monotonic) >= max_runtime_minutes * 60
 
 
-def _normalize_runner_limits(**kwargs: int) -> dict[str, int]:
+def _normalize_runner_limits(
+    *,
+    collection_limits: CollectionLimits | None = None,
+    **kwargs: int | None,
+) -> dict[str, int]:
+    settings_limits = collection_limits or get_collection_limits()
     max_keywords = _clamp(kwargs["max_keywords"], 1, MAX_KEYWORDS_PER_RUN)
-    min_interval_hours = max(MIN_INTERVAL_HOURS, int(kwargs["min_interval_hours"]))
-    pages_per_keyword = _clamp(kwargs["pages_per_keyword"], 1, MAX_PAGES_PER_KEYWORD)
-    max_pages_per_keyword = _clamp(kwargs["max_pages_per_keyword"], 1, MAX_PAGES_PER_KEYWORD)
+    min_interval_hours = max(
+        settings_limits.tracking_min_interval_hours,
+        _int_value(kwargs["min_interval_hours"], settings_limits.tracking_min_interval_hours),
+    )
+    max_pages_per_keyword = _clamp(
+        _int_value(kwargs["max_pages_per_keyword"], settings_limits.max_pages_per_keyword),
+        1,
+        settings_limits.max_pages_per_keyword,
+    )
+    pages_per_keyword = _clamp(
+        _int_value(kwargs["pages_per_keyword"], settings_limits.pages_per_keyword),
+        1,
+        max_pages_per_keyword,
+    )
     if pages_per_keyword > max_pages_per_keyword:
         pages_per_keyword = max_pages_per_keyword
-    page_delay_min_seconds = max(MIN_PAGE_DELAY_SECONDS, int(kwargs["page_delay_min_seconds"]))
-    page_delay_max_seconds = max(page_delay_min_seconds, int(kwargs["page_delay_max_seconds"]))
-    max_runtime_minutes = _clamp(kwargs["max_runtime_minutes"], 1, MAX_RUNTIME_MINUTES)
+    page_delay_min_seconds = max(
+        MIN_PAGE_DELAY_SECONDS,
+        _int_value(kwargs["page_delay_min_seconds"], settings_limits.page_delay_min_seconds),
+    )
+    page_delay_max_seconds = max(
+        page_delay_min_seconds,
+        _int_value(kwargs["page_delay_max_seconds"], settings_limits.page_delay_max_seconds),
+    )
+    max_runtime_minutes = _positive_int(
+        kwargs["max_runtime_minutes"],
+        default=settings_limits.max_runtime_minutes,
+    )
     return {
         "max_keywords": max_keywords,
         "min_interval_hours": min_interval_hours,
@@ -530,6 +556,20 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         number = minimum
     return max(minimum, min(number, maximum))
+
+
+def _int_value(value: int | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_int(value: int | None, *, default: int) -> int:
+    number = _int_value(value, default)
+    return max(1, number)
 
 
 def _safe_name(value: str) -> str:

@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.keyword_tracking import KeywordTrackingTask
-from services.keyword_tracking_scheduler import is_tracking_task_due
+from services.keyword_tracking_scheduler import _effective_min_interval_hours, is_tracking_task_due
 
 
 def _task(**overrides) -> KeywordTrackingTask:
@@ -55,6 +55,19 @@ def test_recent_collection_is_not_due() -> None:
     assert "未达到 72" in reason
 
 
+def test_min_interval_argument_cannot_go_below_hard_floor() -> None:
+    now = datetime(2026, 6, 19, 12, 0, 0)
+    due, reason = is_tracking_task_due(
+        _task(last_collected_at="2026-06-18 12:00:00"),
+        now=now,
+        min_interval_hours=1,
+    )
+
+    assert due is False
+    assert "未达到 72" in reason
+    assert _effective_min_interval_hours(1) == 72
+
+
 def test_old_collection_is_due() -> None:
     now = datetime(2026, 6, 19, 12, 0, 0)
     due, reason = is_tracking_task_due(
@@ -71,6 +84,7 @@ if __name__ == "__main__":
         test_completed_snapshot_count_is_not_due,
         test_never_collected_active_task_is_due,
         test_recent_collection_is_not_due,
+        test_min_interval_argument_cannot_go_below_hard_floor,
         test_old_collection_is_due,
     ]
     for test in tests:

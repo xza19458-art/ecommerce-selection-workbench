@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.snapshot_collection_plan import SnapshotCollectionPlan, build_snapshot_collection_plan
+from services.settings import get_collection_limits
 
 
 def main() -> int:
@@ -19,9 +20,9 @@ def main() -> int:
         description="生成低频快照采集 dry-run 计划。只读 MySQL，不联网、不写库。"
     )
     parser.add_argument("--max-keywords", type=int, default=3, help="本轮最多采集关键词数，默认 3")
-    parser.add_argument("--min-interval-hours", type=int, default=72, help="同关键词最短采集间隔小时，默认 72")
-    parser.add_argument("--pages-per-keyword", type=int, default=1, help="单关键词默认页数，默认 1")
-    parser.add_argument("--max-pages-per-keyword", type=int, default=2, help="单关键词页数上限，默认 2")
+    parser.add_argument("--min-interval-hours", type=int, default=None, help="同关键词最短采集间隔小时；不传则读取 settings，硬下限 72")
+    parser.add_argument("--pages-per-keyword", type=int, default=None, help="单关键词默认页数；不传则读取 settings")
+    parser.add_argument("--max-pages-per-keyword", type=int, default=None, help="单关键词页数上限；不传则读取 settings，硬上限 7")
     parser.add_argument("--target-snapshots", type=int, default=3, help="趋势可用目标快照数，默认 3")
     parser.add_argument("--marketplace", default=None, help="站点过滤，如 US")
     parser.add_argument("--keyword", default=None, help="关键词模糊过滤")
@@ -30,11 +31,25 @@ def main() -> int:
     parser.add_argument("--include-pages", action="store_true", help="导出时展开到页级 URL")
     args = parser.parse_args()
 
+    limits = get_collection_limits()
+    max_pages_per_keyword = _clamp_int(
+        args.max_pages_per_keyword,
+        default=limits.max_pages_per_keyword,
+        minimum=1,
+        maximum=limits.max_pages_per_keyword,
+    )
+    pages_per_keyword = _clamp_int(
+        args.pages_per_keyword,
+        default=limits.pages_per_keyword,
+        minimum=1,
+        maximum=max_pages_per_keyword,
+    )
+
     plan = build_snapshot_collection_plan(
         max_keywords=args.max_keywords,
-        min_interval_hours=args.min_interval_hours,
-        default_pages=args.pages_per_keyword,
-        max_pages_per_keyword=args.max_pages_per_keyword,
+        min_interval_hours=max(limits.tracking_min_interval_hours, args.min_interval_hours or limits.tracking_min_interval_hours),
+        default_pages=pages_per_keyword,
+        max_pages_per_keyword=max_pages_per_keyword,
         target_snapshots=args.target_snapshots,
         marketplace=args.marketplace,
         keyword=args.keyword,
@@ -46,6 +61,14 @@ def main() -> int:
         _export_plan(plan, args.output, include_pages=args.include_pages)
         print(f"\n已导出: {args.output}")
     return 0
+
+
+def _clamp_int(value: int | None, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = default if value is None else int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(number, maximum))
 
 
 def _print_plan(plan: SnapshotCollectionPlan) -> None:

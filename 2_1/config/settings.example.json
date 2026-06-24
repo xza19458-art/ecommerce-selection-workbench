@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "ui": {
+    "theme": "system",
+    "language": "zh-CN",
+    "default_page_size": 20,
+    "table_density": "comfortable",
+    "confirm_before_write": true
+  },
+  "collection": {
+    "page_delay_min_seconds": 5,
+    "page_delay_max_seconds": 10,
+    "pages_per_keyword": 2,
+    "max_pages_per_keyword": 7,
+    "tracking_min_interval_hours": 72,
+    "snapshot_expire_days": 7,
+    "max_runtime_minutes": 120
+  },
+  "analytics": {
+    "opportunity_highlight_score": 70,
+    "custom_scoring": {
+      "enabled": false,
+      "weights": {
+        "demand": 0.3,
+        "competition": 0.25,
+        "rating": 0.15,
+        "price": 0.15,
+        "rank": 0.15,
+        "growth": 0.0
+      }
+    }
+  }
+}

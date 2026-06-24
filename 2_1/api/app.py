@@ -162,7 +162,7 @@ class TrackingTaskIn(BaseModel):
     keyword: str
     target_snapshots: int = 3
     marketplace: str = "US"
-    pages_per_keyword: int = 2
+    pages_per_keyword: int | None = None
 
 
 class TrackingStatusIn(BaseModel):
@@ -176,7 +176,7 @@ class TrackingCheckIn(BaseModel):
 
 class CrawlRunIn(BaseModel):
     keyword: str
-    pages: int = 1
+    pages: int | None = None
 
 
 class AgentChatIn(BaseModel):
@@ -323,6 +323,24 @@ def import_html_commit(body: HtmlImportIn) -> dict[str, Any]:
 @app.post("/api/warehouse/sync")
 def warehouse_sync() -> dict[str, Any]:
     return _ok(_controller.sync_analytics_warehouse())
+
+
+# ---------- 用户设置（S3 设置页·透出 services.settings） ----------
+# 边界：B 层（采集间隔/页数/72h/快照过期）由服务端按安全边界强制校验，不信前端；
+# C 层自定义评分只作独立参考层、不替换标准评分口径。GET 返回设置+schema，POST 回报调整记录。
+
+class SettingsPatchIn(BaseModel):
+    patch: dict[str, Any]
+
+
+@app.get("/api/settings")
+def settings_get() -> dict[str, Any]:
+    return _ok(_controller.get_settings())
+
+
+@app.post("/api/settings")
+def settings_update(body: SettingsPatchIn) -> dict[str, Any]:
+    return _ok(_controller.update_settings(body.patch))
 
 
 # ---------- 评论导入（阶段1 单元②·透出现有 review_import / review_html_export） ----------

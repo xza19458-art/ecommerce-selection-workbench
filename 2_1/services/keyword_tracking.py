@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from database.mysql_client import MySQLClient
+from services.settings import CollectionLimits, get_collection_limits
 
 
 STATUS_ACTIVE = "active"
@@ -62,14 +63,14 @@ def create_tracking_task(
     marketplace: str = "US",
     keyword: str,
     target_snapshots: int = 3,
-    pages_per_keyword: int = 2,
+    pages_per_keyword: int | None = None,
     client: MySQLClient | None = None,
 ) -> KeywordTrackingTask:
     db = client or MySQLClient()
     marketplace = _normalize_marketplace(marketplace)
     keyword = _normalize_keyword(keyword)
     target_snapshots = _normalize_positive_int(target_snapshots, default=3, maximum=365)
-    pages_per_keyword = _normalize_positive_int(pages_per_keyword, default=2, maximum=20)
+    pages_per_keyword = normalize_tracking_pages_per_keyword(pages_per_keyword)
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
@@ -379,6 +380,21 @@ def _normalize_positive_int(value: int, *, default: int, maximum: int) -> int:
 
 def _normalize_limit(value: int) -> int:
     return _normalize_positive_int(value, default=200, maximum=1000)
+
+
+def normalize_tracking_pages_per_keyword(
+    value: int | None,
+    *,
+    limits: CollectionLimits | None = None,
+) -> int:
+    """Normalize tracking page count with the user settings safety envelope."""
+
+    effective_limits = limits or get_collection_limits()
+    return _normalize_positive_int(
+        value,
+        default=effective_limits.pages_per_keyword,
+        maximum=effective_limits.max_pages_per_keyword,
+    )
 
 
 def _validate_status(status: str) -> None:

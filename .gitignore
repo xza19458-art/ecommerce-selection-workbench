@@ -23,10 +23,12 @@ config/database.json
 config/warehouse.json
 config/agent.json
 config/translation.json
+config/settings.json
 2_1/config/database.json
 2_1/config/warehouse.json
 2_1/config/agent.json
 2_1/config/translation.json
+2_1/config/settings.json
 
 # Logs
 *.log

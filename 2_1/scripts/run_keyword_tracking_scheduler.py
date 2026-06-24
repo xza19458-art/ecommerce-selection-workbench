@@ -19,7 +19,7 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true", help="执行到期任务；不加则只检查/排队预览")
     parser.add_argument("--task-id", type=int, default=None, help="只检查/执行指定任务 ID")
     parser.add_argument("--limit", type=int, default=20, help="最多检查 active 任务数")
-    parser.add_argument("--min-interval-hours", type=int, default=72, help="同任务最短采集间隔，默认 72")
+    parser.add_argument("--min-interval-hours", type=int, default=None, help="同任务最短采集间隔；不传则读取 settings，硬下限 72")
     parser.add_argument("--save-root", default="html/tracking_snapshots", help="B1 保存 HTML 根目录")
     parser.add_argument("--stop-file", default="runtime/stop_keyword_tracking.flag", help="存在该文件时停止本轮")
     parser.add_argument("--manifest-root", default="数据结果/keyword_tracking_runs", help="B1 运行清单目录")

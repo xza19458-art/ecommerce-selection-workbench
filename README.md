@@ -127,6 +127,7 @@ cd 2_1
 - **评论痛点分析**：导入评论样本或离线解析评论页 HTML，聚合低分评论痛点、风险和改良机会。
 - **分析仓库**：MySQL 作为主库，DuckDB/Parquet 作为只读分析仓库，用于加速分析查询和后续扩展。
 - **内置应用 Agent**：通过统一 tool schema 查询本地数据、解释商品/关键词、创建追踪任务，并对写库或联网类操作执行服务端二次确认。
+- **用户设置与安全边界**：支持本地 `settings.json` 管理界面偏好、采集节奏和自定义评分参考层；采集相关参数由服务端按安全边界强制校验，不替换标准评分口径。
 - **桌面化与打包**：支持 pywebview 桌面壳和 PyInstaller 开发快照。
 
 ## 自动化与内置应用 Agent
@@ -399,6 +400,7 @@ cd 2_1
 - `2_1/config/warehouse.json`
 - `2_1/config/agent.json`
 - `2_1/config/translation.json`
+- `2_1/config/settings.json`
 - `2_1/html/`
 - `2_1/reviews/`
 - `2_1/data_warehouse/`

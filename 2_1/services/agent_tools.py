@@ -136,11 +136,12 @@ class AgentToolExecutor:
     def _create_keyword_tracking(self, data: dict[str, Any]) -> dict[str, Any]:
         from services.keyword_tracking import create_tracking_task
 
+        raw_pages = data.get("pages_per_keyword")
         task = create_tracking_task(
             keyword=_required_str(data, "keyword"),
             marketplace=_optional_str(data.get("marketplace")) or "US",
             target_snapshots=_int(data.get("target_snapshots"), 3, 1, 365),
-            pages_per_keyword=_int(data.get("pages_per_keyword"), 2, 1, 7),
+            pages_per_keyword=_int(raw_pages, 2, 1, 7) if raw_pages is not None else None,
         )
         return task.to_dict()
 
@@ -252,7 +253,11 @@ def get_operation_tool_definitions() -> list[AgentToolDefinition]:
                     "keyword": _string("要追踪的关键词。"),
                     "target_snapshots": _integer("目标快照次数，默认 3。", default=3, minimum=1, maximum=365),
                     "marketplace": _string("站点，默认 US。"),
-                    "pages_per_keyword": _integer("每轮采集页数，默认 2，最大 7。", default=2, minimum=1, maximum=7),
+                    "pages_per_keyword": _integer(
+                        "每轮采集页数；不填则使用设置默认值，最大 7。",
+                        minimum=1,
+                        maximum=7,
+                    ),
                 },
                 required=["keyword"],
             ),

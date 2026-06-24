@@ -11,7 +11,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.snapshot_collection_plan import SnapshotCollectionPage, SnapshotCollectionTask
-from services.snapshot_collection_runner import _collect_task, classify_amazon_search_page
+from services.settings import get_collection_limits
+from services.snapshot_collection_runner import _collect_task, _normalize_runner_limits, classify_amazon_search_page
 
 
 def test_captcha_is_blocked() -> None:
@@ -131,6 +132,56 @@ def test_collect_task_uses_controller_search_flow() -> None:
     assert results[0].status == "empty"
 
 
+def test_runner_limits_use_settings_defaults_and_hard_clamps() -> None:
+    limits = get_collection_limits(
+        {
+            "collection": {
+                "page_delay_min_seconds": 8,
+                "page_delay_max_seconds": 12,
+                "pages_per_keyword": 4,
+                "max_pages_per_keyword": 5,
+                "tracking_min_interval_hours": 96,
+                "snapshot_expire_days": 3,
+                "max_runtime_minutes": 9999,
+            }
+        }
+    )
+
+    defaults = _normalize_runner_limits(
+        collection_limits=limits,
+        max_keywords=1,
+        min_interval_hours=None,
+        pages_per_keyword=None,
+        max_pages_per_keyword=None,
+        page_delay_min_seconds=None,
+        page_delay_max_seconds=None,
+        max_runtime_minutes=None,
+    )
+    clamped = _normalize_runner_limits(
+        collection_limits=limits,
+        max_keywords=99,
+        min_interval_hours=1,
+        pages_per_keyword=99,
+        max_pages_per_keyword=99,
+        page_delay_min_seconds=1,
+        page_delay_max_seconds=2,
+        max_runtime_minutes=9999,
+    )
+
+    assert defaults["pages_per_keyword"] == 4
+    assert defaults["max_pages_per_keyword"] == 5
+    assert defaults["min_interval_hours"] == 96
+    assert defaults["page_delay_min_seconds"] == 8
+    assert defaults["page_delay_max_seconds"] == 12
+    assert defaults["max_runtime_minutes"] == 9999
+    assert clamped["max_keywords"] == 3
+    assert clamped["min_interval_hours"] == 96
+    assert clamped["pages_per_keyword"] == 5
+    assert clamped["page_delay_min_seconds"] == 5
+    assert clamped["page_delay_max_seconds"] == 5
+    assert clamped["max_runtime_minutes"] == 9999
+
+
 if __name__ == "__main__":
     tests = [
         test_captcha_is_blocked,
@@ -138,6 +189,7 @@ if __name__ == "__main__":
         test_empty_search_is_empty,
         test_search_result_is_ok,
         test_collect_task_uses_controller_search_flow,
+        test_runner_limits_use_settings_defaults_and_hard_clamps,
     ]
     for test in tests:
         test()

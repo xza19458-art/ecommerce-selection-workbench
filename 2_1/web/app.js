@@ -167,7 +167,7 @@ async function viewRecommendations() {
       <div class="filters compact">
         <select id="rec-sort" class="sel">
           <option value="total_score">综合得分</option>
-          <option value="growth_score">增长分</option>
+          <option value="growth_score">增长分（占位）</option>
           <option value="price">价格</option>
           <option value="rating">评分</option>
           <option value="review_count">评论数</option>
@@ -226,7 +226,7 @@ async function loadRecommendations() {
       <div class="card" onclick="location.hash='#/product/${encodeURIComponent(r.asin)}'">
         <h3>${escapeHtml(displayTitle(r, r.asin))}</h3>
         <div class="row"><span>综合得分</span> <b>${scoreBadge(r.total_score)}</b></div>
-        <div class="row"><span>增长分</span> <b>${fmt.num(r.growth_score, 0)}</b></div>
+        <div class="row" title="占位值，趋势第二步接入真实增长分前未计入综合得分"><span>增长分（占位）</span> <b>${fmt.num(r.growth_score, 0)}</b></div>
         <div class="row"><span>价格</span> <b>${fmt.money(r.price)}</b></div>
         <div class="row"><span>评分 / 评论</span> <b>${fmt.num(r.rating)} · ${fmt.int(r.review_count)}</b></div>
         <div class="row"><span>近月购买</span> <b>${fmt.int(r.monthly_bought)}</b></div>
@@ -234,7 +234,7 @@ async function loadRecommendations() {
     pager.innerHTML = renderPager("rec-pager", page, [20, 50, 100]);
     bindPager("rec-pager", recommendationState, page, loadRecommendations);
     document.getElementById("rec-csv").onclick = () => {
-      const headers = ["ASIN", "标题", "综合得分", "增长分", "价格", "评分", "评论数", "近月购买"];
+      const headers = ["ASIN", "标题", "综合得分", "增长分(占位)", "价格", "评分", "评论数", "近月购买"];
       const data = rows.map((r) => [r.asin, displayTitle(r, r.asin), r.total_score, r.growth_score, r.price, r.rating, r.review_count, r.monthly_bought]);
     exportCsv("推荐蓝海.csv", headers, data);
   };
@@ -835,7 +835,7 @@ async function fillTrendConfidence(asin) {
       `<div style="margin-top:10px;line-height:1.65">${escapeHtml(a.summary)}</div>`,
     ];
     if (a.confidence !== "无法判断") {
-      parts.push(`<div style="margin-top:10px;color:var(--text-dim)">趋势分（参考，未计入综合得分）：<b style="color:var(--text)">${Number(a.growth_score).toFixed(0)}</b></div>`);
+      parts.push(`<div style="margin-top:10px;color:var(--text-dim)">趋势分（占位·未计入综合得分，趋势第二步接入真实值）：<b style="color:var(--text)">${Number(a.growth_score).toFixed(0)}</b></div>`);
     }
     box.innerHTML = parts.join("");
   } catch (err) {
@@ -994,7 +994,7 @@ function renderCompareTable(items) {
     const cells = items.map((it, i) => `<td class="num${i === bestIdx ? " best" : ""}">${m.render(it)}</td>`).join("");
     return `<tr><td>${m.label}</td>${cells}</tr>`;
   }).join("");
-  return `<table class="compare"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  return `<div class="table-wrap"><table class="compare"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 /* ---------- 视图：关键词机会 ---------- */
@@ -1397,9 +1397,9 @@ function summarizeCheck(r) {
 
 /* ---------- 表格辅助 ---------- */
 function tableHtml(headers, rows) {
-  return `<table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
+  return `<div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
     <tbody>${rows.map((r) => `<tr${r._click ? ` onclick="${r._click}"` : ""}>${
-      r.cells.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      r.cells.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
 }
 function truncate(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "…" : s; }
 function numOrNull(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -1468,7 +1468,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
     }).join("");
     const bar = opts.exportName
       ? `<div class="table-bar"><button class="btn btn-sm" data-csv="1">导出 CSV</button></div>` : "";
-    container.innerHTML = bar + `<table><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table>`;
+    container.innerHTML = bar + `<div class="table-wrap"><table><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table></div>`;
     container.querySelectorAll("th.sortable").forEach((th) => {
       th.onclick = () => {
         const k = th.dataset.key;
@@ -1710,6 +1710,153 @@ function renderWarehouseResult(r) {
   return `<div class="panel"><h2>同步结果</h2>${top}${tableRows ? `<h3 style="margin:14px 0 6px;font-size:13px">各表行数</h3>${tableRows}` : ""}</div>`;
 }
 
+/* ---------- 视图：设置（S4 文案复核，透出 services.settings 三层护栏） ---------- */
+async function viewSettings() {
+  loading();
+  let data;
+  try { data = await api("/api/settings"); }
+  catch (err) { return errorState(err); }
+  renderSettings((data && data.settings) || {});
+}
+
+const SETTINGS_FIELD_LABELS = {
+  "ui.theme": "界面主题",
+  "ui.language": "界面语言",
+  "ui.default_page_size": "默认每页条数",
+  "ui.table_density": "表格密度",
+  "ui.confirm_before_write": "写入或联网前确认",
+  "collection.page_delay_min_seconds": "页间最短等待",
+  "collection.page_delay_max_seconds": "页间最长等待",
+  "collection.pages_per_keyword": "默认采集页数",
+  "collection.max_pages_per_keyword": "单关键词页数上限",
+  "collection.tracking_min_interval_hours": "同一关键词自动追踪间隔",
+  "collection.snapshot_expire_days": "快照过期提醒",
+  "collection.max_runtime_minutes": "单轮采集最长时长",
+  "analytics.opportunity_highlight_score": "蓝海高亮线",
+  "analytics.custom_scoring.enabled": "个人自定义评分",
+  "analytics.custom_scoring.weights.demand": "需求权重",
+  "analytics.custom_scoring.weights.competition": "竞争权重",
+  "analytics.custom_scoring.weights.rating": "评分权重",
+  "analytics.custom_scoring.weights.price": "价格权重",
+  "analytics.custom_scoring.weights.rank": "排名权重",
+  "analytics.custom_scoring.weights.growth": "增长权重",
+};
+
+function settingsFieldLabel(path) {
+  return SETTINGS_FIELD_LABELS[path] || path;
+}
+
+function renderSettings(s) {
+  const ui = s.ui || {};
+  const col = s.collection || {};
+  const an = s.analytics || {};
+  const w = (an.custom_scoring || {}).weights || {};
+  const opt = (v, cur, label) => `<option value="${v}"${v === cur ? " selected" : ""}>${label}</option>`;
+  content.innerHTML = `
+    <div class="panel">
+      <h2>显示与偏好 <span class="layer-tag layer-a">A 自由设置</span></h2>
+      <div class="set-grid">
+        <label>界面主题<select id="set-theme" class="sel">${opt("system", ui.theme, "跟随系统")}${opt("light", ui.theme, "浅色")}${opt("dark", ui.theme, "深色")}</select></label>
+        <label>界面语言<select id="set-lang" class="sel" disabled>${opt("zh-CN", ui.language || "zh-CN", "简体中文")}</select></label>
+        <label>默认每页条数<input id="set-page-size" type="number" min="5" max="200" value="${escapeHtml(ui.default_page_size)}" /></label>
+        <label>表格密度<select id="set-density" class="sel">${opt("comfortable", ui.table_density, "宽松")}${opt("compact", ui.table_density, "紧凑")}</select></label>
+        <label class="set-check"><input id="set-confirm" type="checkbox"${ui.confirm_before_write ? " checked" : ""}/> 写入数据或联网前二次确认</label>
+        <label>蓝海高亮线（机会分达到此值时标记）<input id="set-highlight" type="number" min="0" max="100" value="${escapeHtml(an.opportunity_highlight_score)}" /></label>
+        <label>单轮采集最长时长（分钟）<input id="set-runtime" type="number" min="1" value="${escapeHtml(col.max_runtime_minutes)}" /><span class="set-hint">自由设置，不设服务端上限</span></label>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>采集安全 <span class="layer-tag layer-b">B 安全边界</span></h2>
+      <p class="set-banner-b">以下设置可在安全范围内调整；保存和执行时仍以服务端校验为准。超出边界的值会自动调整，并在保存结果中说明。</p>
+      <div class="set-grid">
+        <label>页间最短等待（秒）<input id="set-delay-min" type="number" min="5" value="${escapeHtml(col.page_delay_min_seconds)}" /><span class="set-hint">服务端安全下限 5 秒</span></label>
+        <label>页间最长等待（秒）<input id="set-delay-max" type="number" min="5" value="${escapeHtml(col.page_delay_max_seconds)}" /><span class="set-hint">不得小于最短等待</span></label>
+        <label>默认采集页数<input id="set-pages" type="number" min="1" max="7" value="${escapeHtml(col.pages_per_keyword)}" /><span class="set-hint">1-7 页</span></label>
+        <label>单关键词页数上限<input id="set-maxpages" type="number" min="1" max="7" value="${escapeHtml(col.max_pages_per_keyword)}" /><span class="set-hint">服务端安全上限 7 页</span></label>
+        <label>同一关键词自动追踪间隔（小时）<input id="set-track-hours" type="number" min="72" value="${escapeHtml(col.tracking_min_interval_hours)}" /><span class="set-hint">服务端安全下限 72 小时</span></label>
+        <label>快照过期提醒（天）<input id="set-expire-days" type="number" min="1" value="${escapeHtml(col.snapshot_expire_days)}" /><span class="set-hint">最少 1 天</span></label>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>自定义评分 <span class="layer-tag layer-c">C 独立口径</span></h2>
+      <p class="set-banner-c"><b>标准评分口径固定不变</b>。这里生成的是个人自定义评分，只用于本地并列参考，<b>不替换</b>商品的标准综合得分，也不能与其他用户的自定义分横向比较。</p>
+      <div class="set-grid">
+        <label class="set-check"><input id="set-custom-enabled" type="checkbox"${(an.custom_scoring || {}).enabled ? " checked" : ""}/> 启用个人自定义评分</label>
+      </div>
+      <div class="set-weights">
+        ${["demand", "competition", "rating", "price", "rank", "growth"].map((k) =>
+          `<label>${({demand:"需求权重",competition:"竞争权重",rating:"评分权重",price:"价格权重",rank:"排名权重",growth:"增长权重"})[k]}<input id="set-w-${k}" type="number" min="0" max="1" step="0.05" value="${escapeHtml(w[k])}" /></label>`
+        ).join("")}
+      </div>
+      <div class="set-hint">权重范围 0-1；增长权重在趋势第二步接入真实值前建议保持 0。</div>
+    </div>
+    <div class="set-actions">
+      <button class="btn" id="set-save">保存设置</button>
+      <button class="btn" id="set-reload">放弃改动并重新载入</button>
+    </div>
+    <div id="set-result"></div>`;
+  document.getElementById("set-save").onclick = saveSettings;
+  document.getElementById("set-reload").onclick = viewSettings;
+}
+
+function collectSettingsPatch() {
+  const num = (id) => { const v = document.getElementById(id).value.trim(); return v === "" ? null : Number(v); };
+  const bool = (id) => document.getElementById(id).checked;
+  const sel = (id) => document.getElementById(id).value;
+  return {
+    ui: {
+      theme: sel("set-theme"),
+      default_page_size: num("set-page-size"),
+      table_density: sel("set-density"),
+      confirm_before_write: bool("set-confirm"),
+    },
+    collection: {
+      page_delay_min_seconds: num("set-delay-min"),
+      page_delay_max_seconds: num("set-delay-max"),
+      pages_per_keyword: num("set-pages"),
+      max_pages_per_keyword: num("set-maxpages"),
+      tracking_min_interval_hours: num("set-track-hours"),
+      snapshot_expire_days: num("set-expire-days"),
+      max_runtime_minutes: num("set-runtime"),
+    },
+    analytics: {
+      opportunity_highlight_score: num("set-highlight"),
+      custom_scoring: {
+        enabled: bool("set-custom-enabled"),
+        weights: Object.fromEntries(
+          ["demand", "competition", "rating", "price", "rank", "growth"].map((k) => [k, num(`set-w-${k}`)])
+        ),
+      },
+    },
+  };
+}
+
+async function saveSettings() {
+  const box = document.getElementById("set-result");
+  const btn = document.getElementById("set-save");
+  btn.disabled = true;
+  box.innerHTML = `<div class="state"><div class="spinner"></div>保存中…</div>`;
+  try {
+    const r = await apiSend("/api/settings", "POST", { patch: collectSettingsPatch() });
+    const changes = (r && r.changes) || [];
+    renderSettings(r.settings || {});
+    const after = document.getElementById("set-result");
+    if (changes.length) {
+      after.innerHTML = `<div class="panel"><h2>已保存（${changes.length} 项已按安全边界调整）</h2>${
+        changes.map((c) => `<div class="row"><span>${escapeHtml(settingsFieldLabel(c.path))}</span> <b>${escapeHtml(c.original)} → ${escapeHtml(c.clamped)}</b></div><div class="set-hint">${escapeHtml(c.reason)}</div>`).join("")
+      }</div>`;
+      notice(`已保存；${changes.length} 项已按安全边界调整`, "ok");
+    } else {
+      notice("设置已保存", "ok");
+    }
+  } catch (err) {
+    box.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
+    notice(err.message, "bad");
+  } finally {
+    const b = document.getElementById("set-save"); if (b) b.disabled = false;
+  }
+}
+
 /* ---------- 路由 ---------- */
 const routes = [
   { re: /^#\/crawl$/, title: "运行爬取", run: viewCrawl },
@@ -1725,6 +1872,7 @@ const routes = [
   { re: /^#\/import$/, title: "本地 HTML 入库", run: viewImport },
   { re: /^#\/import-reviews$/, title: "评论导入", run: viewReviewImport },
   { re: /^#\/warehouse$/, title: "仓库同步", run: viewWarehouseSync },
+  { re: /^#\/settings$/, title: "设置", run: viewSettings },
 ];
 
 async function router() {

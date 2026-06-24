@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 from typing import Any
 
@@ -179,9 +180,11 @@ def fetch_product_history(
             if not snapshots:
                 snapshots = _fetch_product_snapshots_from_mysql(cursor, asin)
 
+    normalized_snapshots = [_normalize_row(row) for row in snapshots]
     return {
         "product": _normalize_row(product),
-        "snapshots": [_normalize_row(row) for row in snapshots],
+        "snapshots": normalized_snapshots,
+        "snapshot_freshness": build_snapshot_freshness(normalized_snapshots),
     }
 
 
@@ -251,6 +254,70 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     if "is_deal" in normalized:
         normalized["is_deal"] = "是" if normalized.get("is_deal") else "否"
     return normalized
+
+
+def build_snapshot_freshness(
+    snapshots: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    expire_days: int | None = None,
+) -> dict[str, Any]:
+    """Return a settings-based freshness marker for the latest product snapshot."""
+
+    effective_expire_days = expire_days if expire_days is not None else _snapshot_expire_days()
+    latest_at = _latest_snapshot_time(snapshots)
+    if latest_at is None:
+        return {
+            "latest_snapshot_at": None,
+            "snapshot_expire_days": effective_expire_days,
+            "age_days": None,
+            "is_stale": True,
+            "message": "暂无快照数据。",
+        }
+
+    current_time = now or datetime.now()
+    age_days = max(0.0, (current_time - latest_at).total_seconds() / 86400)
+    is_stale = age_days > effective_expire_days
+    return {
+        "latest_snapshot_at": latest_at.isoformat(sep=" "),
+        "snapshot_expire_days": effective_expire_days,
+        "age_days": round(age_days, 2),
+        "is_stale": is_stale,
+        "message": (
+            f"最新快照约 {age_days:.1f} 天前，已超过 {effective_expire_days} 天设置阈值。"
+            if is_stale
+            else f"最新快照约 {age_days:.1f} 天前，未超过 {effective_expire_days} 天设置阈值。"
+        ),
+    }
+
+
+def _snapshot_expire_days() -> int:
+    from services.settings import get_collection_limits
+
+    return get_collection_limits().snapshot_expire_days
+
+
+def _latest_snapshot_time(snapshots: list[dict[str, Any]]) -> datetime | None:
+    times = [_parse_datetime(row.get("snapshot_at")) for row in snapshots if row]
+    valid = [value for value in times if value is not None]
+    return max(valid) if valid else None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text).replace(tzinfo=None)
+    except ValueError:
+        return None
 
 
 def _build_pool_filters(

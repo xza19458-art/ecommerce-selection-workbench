@@ -18,9 +18,11 @@ from services.keyword_tracking import (
     STATUS_COMPLETED,
     KeywordTrackingTask,
     list_tracking_tasks,
+    normalize_tracking_pages_per_keyword,
     record_tracking_collection,
     refresh_tracking_task_progress,
 )
+from services.settings import CollectionLimits, get_collection_limits
 from services.snapshot_collection_runner import SnapshotCollectionRunSummary, run_snapshot_collection
 from services.snapshot_storage import ingest_snapshot_html_and_sync_warehouse
 
@@ -87,7 +89,7 @@ def run_keyword_tracking_scheduler(
     execute: bool = False,
     task_id: int | None = None,
     limit: int = 20,
-    min_interval_hours: int = MIN_TRACKING_INTERVAL_HOURS,
+    min_interval_hours: int | None = None,
     save_root: str | Path = "html/tracking_snapshots",
     stop_file: str | Path = "runtime/stop_keyword_tracking.flag",
     manifest_root: str | Path = "数据结果/keyword_tracking_runs",
@@ -99,12 +101,22 @@ def run_keyword_tracking_scheduler(
     started_at = datetime.now().replace(microsecond=0)
     decisions: list[TrackingQueueDecision] = []
     tasks = _load_tasks(task_id=task_id, limit=limit, client=db)
+    collection_limits = get_collection_limits()
+    effective_min_interval_hours = _effective_min_interval_hours(
+        min_interval_hours,
+        collection_limits=collection_limits,
+    )
 
     status = "完成"
     message = "关键词追踪检查完成。"
     for raw_task in tasks:
         task = refresh_tracking_task_progress(raw_task.id, client=db)
-        decision = _decide_task(task, now=started_at, min_interval_hours=min_interval_hours)
+        decision = _decide_task(
+            task,
+            now=started_at,
+            min_interval_hours=effective_min_interval_hours,
+            collection_limits=collection_limits,
+        )
         if decision.action != "queued":
             decisions.append(decision)
             continue
@@ -115,10 +127,11 @@ def run_keyword_tracking_scheduler(
 
         executed_decision = _execute_tracking_task(
             task,
-            min_interval_hours=min_interval_hours,
+            min_interval_hours=effective_min_interval_hours,
             save_root=save_root,
             stop_file=stop_file,
             manifest_root=manifest_root,
+            collection_limits=collection_limits,
             client=db,
         )
         decisions.append(executed_decision)
@@ -151,6 +164,7 @@ def is_tracking_task_due(
     """Return whether an active task should enter the collection queue."""
 
     current_time = now or datetime.now()
+    min_interval_hours = _effective_min_interval_hours(min_interval_hours)
     if task.status != STATUS_ACTIVE:
         return False, f"任务状态为 {task.status}，不进入队列。"
     if task.current_snapshots >= task.target_snapshots:
@@ -171,9 +185,16 @@ def _load_tasks(*, task_id: int | None, limit: int, client: MySQLClient) -> list
     return list_tracking_tasks(status=STATUS_ACTIVE, limit=limit, client=client)
 
 
-def _decide_task(task: KeywordTrackingTask, *, now: datetime, min_interval_hours: int) -> TrackingQueueDecision:
+def _decide_task(
+    task: KeywordTrackingTask,
+    *,
+    now: datetime,
+    min_interval_hours: int,
+    collection_limits: CollectionLimits,
+) -> TrackingQueueDecision:
     due, reason = is_tracking_task_due(task, now=now, min_interval_hours=min_interval_hours)
     action = "queued" if due else ("completed" if task.status == STATUS_COMPLETED else "skipped")
+    pages_per_keyword = normalize_tracking_pages_per_keyword(task.pages_per_keyword, limits=collection_limits)
     return TrackingQueueDecision(
         task_id=task.id,
         marketplace=task.marketplace,
@@ -184,7 +205,7 @@ def _decide_task(task: KeywordTrackingTask, *, now: datetime, min_interval_hours
         action=action,
         reason=reason,
         last_collected_at=task.last_collected_at,
-        pages_per_keyword=task.pages_per_keyword,
+        pages_per_keyword=pages_per_keyword,
     )
 
 
@@ -195,21 +216,26 @@ def _execute_tracking_task(
     save_root: str | Path,
     stop_file: str | Path,
     manifest_root: str | Path,
+    collection_limits: CollectionLimits,
     client: MySQLClient,
 ) -> TrackingQueueDecision:
     manifest_path = _build_manifest_path(manifest_root, task)
+    pages_per_keyword = normalize_tracking_pages_per_keyword(task.pages_per_keyword, limits=collection_limits)
     collection = run_snapshot_collection(
         run=True,
         max_keywords=1,
         min_interval_hours=min_interval_hours,
-        pages_per_keyword=task.pages_per_keyword,
-        max_pages_per_keyword=task.pages_per_keyword,
+        pages_per_keyword=pages_per_keyword,
+        max_pages_per_keyword=pages_per_keyword,
         target_snapshots=task.target_snapshots,
         marketplace=task.marketplace,
         keyword=task.keyword,
         keyword_exact=True,
         save_root=save_root,
         stop_file=stop_file,
+        page_delay_min_seconds=collection_limits.page_delay_min_seconds,
+        page_delay_max_seconds=collection_limits.page_delay_max_seconds,
+        max_runtime_minutes=collection_limits.max_runtime_minutes,
         manifest_path=manifest_path,
         ignore_interval=True,
         client=client,
@@ -221,7 +247,7 @@ def _execute_tracking_task(
             error_message=f"{collection.status}: {collection.message}",
             client=client,
         )
-        return _decision_from_error(task, updated, collection, saved_files)
+        return _decision_from_error(task, updated, collection, saved_files, collection_limits)
     if not saved_files:
         refreshed = refresh_tracking_task_progress(task.id, client=client)
         return TrackingQueueDecision(
@@ -234,7 +260,7 @@ def _execute_tracking_task(
             action="skipped",
             reason="B1 runner 未生成可入库 HTML，可能未到期或无任务。",
             last_collected_at=refreshed.last_collected_at,
-            pages_per_keyword=refreshed.pages_per_keyword,
+            pages_per_keyword=normalize_tracking_pages_per_keyword(refreshed.pages_per_keyword, limits=collection_limits),
             collection_status=collection.status,
         )
 
@@ -259,7 +285,7 @@ def _execute_tracking_task(
         action="collected",
         reason="采集、入库、仓库同步完成。",
         last_collected_at=updated.last_collected_at,
-        pages_per_keyword=updated.pages_per_keyword,
+        pages_per_keyword=normalize_tracking_pages_per_keyword(updated.pages_per_keyword, limits=collection_limits),
         collection_status=collection.status,
         saved_files=saved_files,
         imported_count=ingest_summary.ingestion.total_inserted,
@@ -271,6 +297,7 @@ def _decision_from_error(
     updated: KeywordTrackingTask,
     collection: SnapshotCollectionRunSummary,
     saved_files: tuple[str, ...],
+    collection_limits: CollectionLimits,
 ) -> TrackingQueueDecision:
     return TrackingQueueDecision(
         task_id=updated.id,
@@ -282,7 +309,7 @@ def _decision_from_error(
         action="error",
         reason=collection.message,
         last_collected_at=updated.last_collected_at,
-        pages_per_keyword=updated.pages_per_keyword,
+        pages_per_keyword=normalize_tracking_pages_per_keyword(updated.pages_per_keyword, limits=collection_limits),
         collection_status=collection.status,
         saved_files=saved_files,
     )
@@ -293,6 +320,22 @@ def _first_saved_url(collection: SnapshotCollectionRunSummary) -> str | None:
         if page.status == "saved":
             return page.url
     return None
+
+
+def _effective_min_interval_hours(
+    value: int | None,
+    *,
+    collection_limits: CollectionLimits | None = None,
+) -> int:
+    if collection_limits is not None:
+        minimum = collection_limits.tracking_min_interval_hours
+    else:
+        minimum = MIN_TRACKING_INTERVAL_HOURS
+    try:
+        requested = int(value) if value is not None else minimum
+    except (TypeError, ValueError):
+        requested = minimum
+    return max(MIN_TRACKING_INTERVAL_HOURS, minimum, requested)
 
 
 def _build_manifest_path(root: str | Path, task: KeywordTrackingTask) -> Path:

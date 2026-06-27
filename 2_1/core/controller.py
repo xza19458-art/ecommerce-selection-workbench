@@ -24,6 +24,7 @@ class AppController:
 
     def __init__(self) -> None:
         self._browser = None
+        self._amazon_location_prepared = False
 
     def _get_browser(self) -> webdriver.Chrome:
         """获取浏览器实例"""
@@ -89,6 +90,20 @@ class AppController:
             except:
                 pass
             self._browser = None
+            self._amazon_location_prepared = False
+
+    def open_amazon_page(self) -> dict:
+        """Open Amazon in the shared crawler browser for manual preparation."""
+        browser = self._get_browser()
+        browser.get("https://www.amazon.com/")
+        time.sleep(random.uniform(1, 2))
+        self._amazon_location_prepared = True
+        return {
+            "状态": "已打开",
+            "URL": getattr(browser, "current_url", "https://www.amazon.com/"),
+            "标题": getattr(browser, "title", ""),
+            "message": "Amazon 页面已打开，后续手动采集将复用当前浏览器会话。",
+        }
 
     def collect_amazon_search_pages(
         self,
@@ -122,22 +137,24 @@ class AppController:
         browser.get(url)
         time.sleep(random.uniform(2, 5))
 
-        # 设置地址为纽约
-        try:
-            location_button = browser.find_element(By.ID, "nav-global-location-popover-link")
-            location_button.click()
-            time.sleep(2)
+        if not self._amazon_location_prepared:
+            # 设置地址为纽约
+            try:
+                location_button = browser.find_element(By.ID, "nav-global-location-popover-link")
+                location_button.click()
+                time.sleep(2)
 
-            zip_input = browser.find_element(By.ID, "GLUXZipUpdateInput")
-            zip_input.clear()
-            zip_input.send_keys("10001")
+                zip_input = browser.find_element(By.ID, "GLUXZipUpdateInput")
+                zip_input.clear()
+                zip_input.send_keys("10001")
 
-            apply_button = browser.find_element(By.XPATH, '//input[@aria-labelledby="GLUXZipUpdate-announce"]')
-            apply_button.click()
+                apply_button = browser.find_element(By.XPATH, '//input[@aria-labelledby="GLUXZipUpdate-announce"]')
+                apply_button.click()
 
-            time.sleep(3)
-        except Exception as e:
-            print(f"设置地址失败: {str(e)}")
+                time.sleep(3)
+                self._amazon_location_prepared = True
+            except Exception as e:
+                print(f"设置地址失败: {str(e)}")
 
         for page_num in range(1, pages + 1):
             if stop_requested and stop_requested():
@@ -408,6 +425,73 @@ class AppController:
         except Exception:
             logger.warning("更新爬取任务日志失败。", exc_info=True)
 
+    def _try_create_import_job(self, keyword: str | None, files: list[Path]) -> int | None:
+        try:
+            from database.mysql_client import MySQLClient
+            from services.task_center import IMPORT_JOB_URL_PREFIX
+
+            project_root = Path(__file__).resolve().parents[1]
+            rel_files: list[str] = []
+            for file_path in files:
+                try:
+                    rel_files.append(file_path.relative_to(project_root).as_posix())
+                except ValueError:
+                    rel_files.append(file_path.as_posix())
+            file_label = ";".join(rel_files[:8])
+            if len(rel_files) > 8:
+                file_label += f";...(+{len(rel_files) - 8})"
+            db = MySQLClient()
+            with db.connect() as conn:
+                with conn.cursor() as cursor:
+                    return db.create_job(
+                        cursor,
+                        keyword or self._infer_import_keyword(files),
+                        f"{IMPORT_JOB_URL_PREFIX}{file_label}",
+                        None,
+                    )
+        except Exception:
+            logger.warning("创建入库任务日志失败。", exc_info=True)
+            return None
+
+    def _try_finish_import_job(
+        self,
+        job_id: int | None,
+        status: str,
+        total_found: int,
+        total_valid: int,
+        total_inserted: int,
+        error_message: str | None,
+    ) -> None:
+        if job_id is None:
+            return
+        try:
+            from database.mysql_client import MySQLClient
+
+            db = MySQLClient()
+            with db.connect() as conn:
+                with conn.cursor() as cursor:
+                    db.finish_job(
+                        cursor,
+                        job_id,
+                        status,
+                        total_found=total_found,
+                        total_valid=total_valid,
+                        total_inserted=total_inserted,
+                        error_message=error_message,
+                    )
+        except Exception:
+            logger.warning("更新入库任务日志失败。", exc_info=True)
+
+    def _infer_import_keyword(self, files: list[Path]) -> str | None:
+        if not files:
+            return None
+        project_html = Path(__file__).resolve().parents[1] / "html"
+        try:
+            rel = files[0].relative_to(project_html)
+        except ValueError:
+            return None
+        return rel.parts[0] if len(rel.parts) > 1 else None
+
     def process_files(self, files: list[str], save_folder: str = "数据结果", merge_analysis: bool = False) -> None:
         """处理选中的文件"""
         if merge_analysis and len(files) > 1:
@@ -448,7 +532,20 @@ class AppController:
         from services.ingestion import ingest_html_files_to_mysql
 
         html_files = [self._resolve_html_file(file_name) for file_name in files]
-        summary = ingest_html_files_to_mysql(html_files, keyword=keyword, require_complete=True)
+        job_id = self._try_create_import_job(keyword, html_files)
+        try:
+            summary = ingest_html_files_to_mysql(html_files, keyword=keyword, require_complete=True)
+        except Exception as exc:
+            self._try_finish_import_job(job_id, "失败", 0, 0, 0, str(exc))
+            raise
+        self._try_finish_import_job(
+            job_id,
+            "完成",
+            summary.total_found,
+            summary.total_valid,
+            summary.total_inserted,
+            None,
+        )
         return {
             "解析商品数": summary.total_found,
             "有效商品数": summary.total_valid,
@@ -504,6 +601,7 @@ class AppController:
         offset: int = 0,
         sort_by: str = "total_score",
         sort_dir: str = "desc",
+        min_score: float | None = None,
     ) -> dict:
         """Fetch paged product recommendations from MySQL."""
         from services.recommendations import fetch_recommendations_page
@@ -513,6 +611,7 @@ class AppController:
             offset=offset,
             sort_by=sort_by,
             sort_dir=sort_dir,
+            min_score=min_score,
         )
 
     def export_top_recommendations(self, save_folder: str = "数据结果", limit: int = 50) -> Path:

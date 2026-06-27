@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS product_snapshots (
   price DECIMAL(10,2) NOT NULL COMMENT '价格',
   rating DECIMAL(3,2) NOT NULL COMMENT '评分',
   review_count INT UNSIGNED NOT NULL COMMENT '评论数',
-  monthly_bought INT UNSIGNED NOT NULL COMMENT '近月购买量',
+  monthly_bought INT UNSIGNED NULL COMMENT '近月购买量（缺失=无徽标，NULL=未知；见 2026-06-24 裁定）',
   is_deal TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否促销',
   is_sponsored TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否广告',
   page_no INT UNSIGNED NULL COMMENT '搜索页码',

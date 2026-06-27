@@ -94,8 +94,13 @@ def run_keyword_tracking_scheduler(
     stop_file: str | Path = "runtime/stop_keyword_tracking.flag",
     manifest_root: str | Path = "数据结果/keyword_tracking_runs",
     client: MySQLClient | None = None,
+    controller: Any | None = None,
 ) -> TrackingSchedulerSummary:
-    """Check active tracking tasks and optionally execute due tasks serially."""
+    """Check active tracking tasks and optionally execute due tasks serially.
+
+    controller：传入则采集复用该浏览器持久会话、结束不关（复用手动预开的已暖会话）；
+    不传则采集器自建一次性浏览器。
+    """
 
     db = client or MySQLClient()
     started_at = datetime.now().replace(microsecond=0)
@@ -133,6 +138,7 @@ def run_keyword_tracking_scheduler(
             manifest_root=manifest_root,
             collection_limits=collection_limits,
             client=db,
+            controller=controller,
         )
         decisions.append(executed_decision)
         if executed_decision.action == "error":
@@ -218,6 +224,7 @@ def _execute_tracking_task(
     manifest_root: str | Path,
     collection_limits: CollectionLimits,
     client: MySQLClient,
+    controller: Any | None = None,
 ) -> TrackingQueueDecision:
     manifest_path = _build_manifest_path(manifest_root, task)
     pages_per_keyword = normalize_tracking_pages_per_keyword(task.pages_per_keyword, limits=collection_limits)
@@ -231,6 +238,7 @@ def _execute_tracking_task(
         marketplace=task.marketplace,
         keyword=task.keyword,
         keyword_exact=True,
+        seed_keyword=True,
         save_root=save_root,
         stop_file=stop_file,
         page_delay_min_seconds=collection_limits.page_delay_min_seconds,
@@ -239,6 +247,7 @@ def _execute_tracking_task(
         manifest_path=manifest_path,
         ignore_interval=True,
         client=client,
+        controller=controller,
     )
     saved_files = tuple(page.saved_file for page in collection.pages if page.status == "saved" and page.saved_file)
     if collection.status != "完成":

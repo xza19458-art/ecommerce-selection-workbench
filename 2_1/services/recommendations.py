@@ -47,6 +47,7 @@ def fetch_recommendations_page(
     offset: int = 0,
     sort_by: str = "total_score",
     sort_dir: str = "desc",
+    min_score: float | None = None,
     client: MySQLClient | None = None,
 ) -> dict[str, Any]:
     db = client or MySQLClient()
@@ -57,7 +58,8 @@ def fetch_recommendations_page(
         with conn.cursor() as cursor:
             has_title_zh = db.has_columns(cursor, "products", ("title_zh",))
             title_select = _product_title_select(has_title_zh)
-            from_sql = """
+            where_sql, params = _recommendation_filters(min_score=min_score)
+            from_sql = f"""
                 FROM product_scores ps
                 JOIN products p ON p.id = ps.product_id
                 LEFT JOIN keywords k ON k.id = ps.keyword_id
@@ -74,8 +76,9 @@ def fetch_recommendations_page(
                   WHERE ps2.product_id = ps.product_id
                     AND (ps2.keyword_id <=> ps.keyword_id)
                 )
+                {where_sql}
             """
-            cursor.execute(f"SELECT COUNT(*) AS total {from_sql}")
+            cursor.execute(f"SELECT COUNT(*) AS total {from_sql}", params)
             total_row = cursor.fetchone() or {}
             total = int(total_row.get("total") or 0)
             cursor.execute(
@@ -99,7 +102,7 @@ def fetch_recommendations_page(
                 {order_sql}
                 LIMIT %s OFFSET %s
                 """,
-                (limit_value, offset_value),
+                params + [limit_value, offset_value],
             )
             rows = cursor.fetchall()
     return {
@@ -161,6 +164,16 @@ def _recommendation_order_by(sort_by: str, sort_dir: str) -> tuple[str, str, str
         normalized_sort,
         normalized_dir,
     )
+
+
+def _recommendation_filters(*, min_score: float | None) -> tuple[str, list[Any]]:
+    if min_score is None:
+        return "", []
+    try:
+        score = float(min_score)
+    except (TypeError, ValueError):
+        return "", []
+    return "AND ps.total_score >= %s", [score]
 
 
 def _normalize_limit(limit: int) -> int:

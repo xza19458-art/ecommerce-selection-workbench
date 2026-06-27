@@ -1,7 +1,7 @@
 "use strict";
 /* D2 前端骨架：hash 路由 + fetch 封装 + 只读页。
    后端契约：所有 /api/* 返回 {ok, data, message}（见 decisions/2026-06-19-前端架构转Web.md §6）。
-   写/联网类端点（建追踪任务、触发采集）后续由 D1 补，本骨架先做只读页。 */
+   写入数据 / 联网类端点（建追踪任务、触发采集）后续由 D1 补，本骨架先做只读页。 */
 
 const content = document.getElementById("content");
 const viewTitle = document.getElementById("view-title");
@@ -13,9 +13,9 @@ async function api(path) {
   try {
     payload = await resp.json();
   } catch {
-    throw new Error(`响应非 JSON（HTTP ${resp.status}）`);
+    throw new Error(`后端响应格式异常（HTTP ${resp.status}）`);
   }
-  if (!payload.ok) throw new Error(payload.message || `请求失败（HTTP ${resp.status}）`);
+  if (!payload.ok) throw new Error(payload.message || `请求未成功（HTTP ${resp.status}）`);
   return payload.data;
 }
 
@@ -29,9 +29,9 @@ async function apiSend(path, method, body) {
   try {
     payload = await resp.json();
   } catch {
-    throw new Error(`响应非 JSON（HTTP ${resp.status}）`);
+    throw new Error(`后端响应格式异常（HTTP ${resp.status}）`);
   }
-  if (!payload.ok) throw new Error(payload.message || `请求失败（HTTP ${resp.status}）`);
+  if (!payload.ok) throw new Error(payload.message || `请求未成功（HTTP ${resp.status}）`);
   return payload.data;
 }
 
@@ -42,6 +42,8 @@ function notice(msg, kind = "ok") {
   if (!el) {
     el = document.createElement("div");
     el.id = "notice";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
     document.body.appendChild(el);
   }
   el.textContent = msg;
@@ -63,7 +65,7 @@ function loading() {
 }
 function errorState(err) {
   content.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}
-    <div class="hint">只读页依赖后端查询；若 MySQL 未启动或数据为空会报错。可先启动数据库后点右上角「刷新」。</div></div>`;
+    <div class="hint">当前页面依赖后端服务；若数据库未启动或暂无数据，可能无法加载。可先启动数据库后点右上角「刷新」。</div></div>`;
 }
 function emptyState(msg) {
   content.innerHTML = `<div class="state">${escapeHtml(msg)}</div>`;
@@ -87,10 +89,11 @@ function isDeal(v) {
 
 const productCompareSelection = new Set();
 let productCompareRows = new Map();
-const recommendationState = { limit: 20, offset: 0, sortBy: "total_score", sortDir: "desc" };
+const recommendationState = { limit: 20, offset: 0, sortBy: "total_score", sortDir: "desc", blueOnly: false };
 const productState = { limit: 50, offset: 0 };
 const keywordState = { limit: 50, offset: 0, keyword: "", minProducts: "" };
 const keywordProductState = { keyword: "", limit: 25, offset: 0 };
+const taskErrorRows = new Map();
 const agentState = {
   conversationId: null,
   messages: [],
@@ -98,6 +101,7 @@ const agentState = {
   sending: false,
   config: null,
 };
+const SIDEBAR_NARROW_QUERY = "(max-width: 860px)";
 
 function normalizePage(payload, fallbackLimit = 50) {
   if (Array.isArray(payload)) {
@@ -127,7 +131,10 @@ function renderPager(id, page, sizes = [20, 50, 100]) {
   return `
     <div class="pager" id="${id}">
       <button class="btn btn-sm" data-page="prev"${offset <= 0 ? " disabled" : ""}>上一页</button>
-      <span>${pageNo} / ${totalPages}</span>
+      <span>第</span>
+      <input class="pager-jump" data-page-jump type="number" min="1" max="${totalPages}" value="${pageNo}" aria-label="页码" />
+      <span>/ ${totalPages} 页</span>
+      <button class="btn btn-sm" data-page="go">跳转</button>
       <button class="btn btn-sm" data-page="next"${offset + limit >= total ? " disabled" : ""}>下一页</button>
       <select class="sel sel-sm" data-page-size>
         ${allSizes.map((size) => `<option value="${size}"${size === limit ? " selected" : ""}>每页 ${size}</option>`).join("")}
@@ -143,7 +150,15 @@ function bindPager(id, state, page, loadFn) {
   const total = Math.max(0, Number(page.total) || 0);
   const prev = el.querySelector('[data-page="prev"]');
   const next = el.querySelector('[data-page="next"]');
+  const go = el.querySelector('[data-page="go"]');
+  const jump = el.querySelector("[data-page-jump]");
   const pageSize = el.querySelector("[data-page-size]");
+  const jumpToPage = () => {
+    const totalPages = Math.max(1, Math.ceil(total / state.limit));
+    const pageNo = Math.max(1, Math.min(Number(jump?.value) || 1, totalPages));
+    state.offset = (pageNo - 1) * state.limit;
+    loadFn();
+  };
   if (prev) prev.onclick = () => {
     state.offset = Math.max(0, state.offset - state.limit);
     loadFn();
@@ -153,11 +168,102 @@ function bindPager(id, state, page, loadFn) {
     state.offset = Math.min(maxOffset, state.offset + state.limit);
     loadFn();
   };
+  if (go) go.onclick = jumpToPage;
+  if (jump) jump.onkeydown = (event) => {
+    if (event.key === "Enter") jumpToPage();
+  };
   if (pageSize) pageSize.onchange = () => {
     state.limit = Number(pageSize.value) || state.limit;
     state.offset = 0;
     loadFn();
   };
+}
+
+function isNarrowSidebar() {
+  return window.matchMedia(SIDEBAR_NARROW_QUERY).matches;
+}
+
+function updateSidebarA11y() {
+  const toggle = document.getElementById("sidebar-toggle");
+  if (!toggle) return;
+  const expanded = isNarrowSidebar()
+    ? document.body.classList.contains("sidebar-open")
+    : !document.body.classList.contains("sidebar-collapsed");
+  toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+}
+
+function setSidebarOpen(open) {
+  if (isNarrowSidebar()) {
+    document.body.classList.toggle("sidebar-open", open);
+    document.body.classList.remove("sidebar-collapsed");
+  } else {
+    document.body.classList.toggle("sidebar-collapsed", !open);
+    document.body.classList.remove("sidebar-open");
+  }
+  updateSidebarA11y();
+}
+
+function toggleSidebar() {
+  if (isNarrowSidebar()) setSidebarOpen(!document.body.classList.contains("sidebar-open"));
+  else setSidebarOpen(document.body.classList.contains("sidebar-collapsed"));
+}
+
+function syncSidebarForViewport() {
+  if (isNarrowSidebar()) document.body.classList.remove("sidebar-collapsed");
+  else document.body.classList.remove("sidebar-open");
+  updateSidebarA11y();
+}
+
+function closeSidebarIfNarrow() {
+  if (isNarrowSidebar()) setSidebarOpen(false);
+}
+
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+}
+
+function focusFirstField() {
+  const el = content.querySelector("input:not([type='checkbox']):not([type='radio']):not([disabled]), textarea:not([disabled]), select:not([disabled])");
+  if (el) {
+    el.focus();
+    if (typeof el.select === "function" && el.tagName.toLowerCase() === "input") el.select();
+  }
+}
+
+function handleGlobalShortcuts(event) {
+  const key = event.key;
+  const typing = isTypingTarget(document.activeElement);
+  if (key === "Escape") {
+    if (closeTaskLogDialog()) {
+      event.preventDefault();
+      return;
+    }
+    if (document.body.classList.contains("sidebar-open")) {
+      event.preventDefault();
+      setSidebarOpen(false);
+      return;
+    }
+    if (typing && document.activeElement) document.activeElement.blur();
+    return;
+  }
+  if (typing) return;
+  if (key === "r" || key === "R") {
+    event.preventDefault();
+    router();
+    notice("已刷新当前页", "ok");
+    return;
+  }
+  if (key === "/") {
+    event.preventDefault();
+    focusFirstField();
+    return;
+  }
+  if (key === "[" || (event.altKey && key === "ArrowLeft")) {
+    event.preventDefault();
+    history.back();
+  }
 }
 
 /* ---------- 视图：推荐 ---------- */
@@ -178,6 +284,10 @@ async function viewRecommendations() {
           <option value="desc">降序</option>
           <option value="asc">升序</option>
         </select>
+        <label class="check-inline">
+          <input id="rec-blue" type="checkbox" />
+          只看蓝海（≥70）
+        </label>
       </div>
       <button class="btn btn-sm" id="rec-csv">导出当前页 CSV</button>
     </div>
@@ -186,6 +296,7 @@ async function viewRecommendations() {
     <div id="rec-pager-wrap"></div>`;
   document.getElementById("rec-sort").value = recommendationState.sortBy;
   document.getElementById("rec-dir").value = recommendationState.sortDir;
+  document.getElementById("rec-blue").checked = recommendationState.blueOnly;
   document.getElementById("rec-sort").onchange = () => {
     recommendationState.sortBy = document.getElementById("rec-sort").value;
     recommendationState.offset = 0;
@@ -196,6 +307,11 @@ async function viewRecommendations() {
     recommendationState.offset = 0;
     loadRecommendations();
   };
+  document.getElementById("rec-blue").onchange = () => {
+    recommendationState.blueOnly = document.getElementById("rec-blue").checked;
+    recommendationState.offset = 0;
+    loadRecommendations();
+  };
   await loadRecommendations();
 }
 
@@ -203,19 +319,25 @@ async function loadRecommendations() {
   const box = document.getElementById("rec-cards");
   const meta = document.getElementById("rec-meta");
   const pager = document.getElementById("rec-pager-wrap");
+  const csv = document.getElementById("rec-csv");
   box.innerHTML = `<div class="state"><div class="spinner"></div>加载中…</div>`;
   meta.textContent = "";
   pager.innerHTML = "";
+  if (csv) {
+    csv.disabled = true;
+    csv.onclick = null;
+  }
   const q = new URLSearchParams({
     limit: String(recommendationState.limit),
     offset: String(recommendationState.offset),
     sort_by: recommendationState.sortBy,
     sort_dir: recommendationState.sortDir,
   });
+  if (recommendationState.blueOnly) q.set("min_score", "70");
   try {
     const page = normalizePage(await api(`/api/recommendations?${q.toString()}`), recommendationState.limit);
     const rows = page.rows;
-    meta.textContent = pageSummary(page, "商品") + " · 可按评分/价格/评论/增长等排序";
+    meta.textContent = pageSummary(page, "商品") + (recommendationState.blueOnly ? " · 已筛选蓝海 ≥70" : "") + " · 可按评分/价格/评论/增长等排序";
     if (!rows.length) {
       box.innerHTML = `<div class="state">暂无推荐数据。</div>`;
       pager.innerHTML = renderPager("rec-pager", page, [20, 50, 100]);
@@ -233,6 +355,7 @@ async function loadRecommendations() {
       </div>`).join("")}</div>`;
     pager.innerHTML = renderPager("rec-pager", page, [20, 50, 100]);
     bindPager("rec-pager", recommendationState, page, loadRecommendations);
+    if (csv) csv.disabled = false;
     document.getElementById("rec-csv").onclick = () => {
       const headers = ["ASIN", "标题", "综合得分", "增长分(占位)", "价格", "评分", "评论数", "近月购买"];
       const data = rows.map((r) => [r.asin, displayTitle(r, r.asin), r.total_score, r.growth_score, r.price, r.rating, r.review_count, r.monthly_bought]);
@@ -307,7 +430,7 @@ async function loadProducts(resetPage = false) {
     if (!rows.length) {
       productCompareRows = new Map();
       updateProductCompareBar();
-      box.innerHTML = `<div class="state">无匹配商品。</div>`;
+      box.innerHTML = `<div class="state">暂无匹配商品。</div>`;
       pager.innerHTML = renderPager("prod-pager", page, [20, 50, 100]);
       bindPager("prod-pager", productState, page, loadProducts);
       return;
@@ -378,13 +501,13 @@ function viewAgent() {
         <div class="agent-head">
           <div>
             <h2>AI 助手</h2>
-            <div class="agent-sub">只读自动执行 · 写库 / 联网操作需二次确认</div>
+            <div class="agent-sub">只读查询自动执行 · 写入数据 / 联网操作需二次确认</div>
           </div>
           <button class="btn btn-sm" id="agent-new">新会话</button>
         </div>
         <div id="agent-messages" class="agent-messages"></div>
         <form id="agent-form" class="agent-form">
-          <textarea id="agent-input" rows="3" placeholder="输入你的选品问题"></textarea>
+          <textarea id="agent-input" rows="3" placeholder="输入你的选品问题（Enter 发送 · Shift+Enter 换行）"></textarea>
           <button id="agent-send" class="btn" type="submit">发送</button>
         </form>
       </section>
@@ -398,7 +521,7 @@ function viewAgent() {
           <div class="state"><div class="spinner"></div>读取配置…</div>
         </div>
         <div class="agent-side-title">边界</div>
-        <div class="agent-boundary">创建追踪、修改状态、触发采集会先暂停并等待确认；取消不会写库或联网。</div>
+        <div class="agent-boundary">创建追踪、修改状态、触发采集会先暂停并等待确认；取消不会写入数据或联网。</div>
       </aside>
     </div>`;
 
@@ -427,6 +550,9 @@ function viewAgent() {
   });
   loadAgentConfig();
   renderAgentMessages();
+  // P2-1 轻量打磨：进入页面即聚焦输入框，省一次点击。
+  const input = document.getElementById("agent-input");
+  if (input) input.focus();
 }
 
 function renderAgentMessages() {
@@ -521,7 +647,7 @@ async function sendAgentMessage() {
     applyAgentResponse(data, pending);
   } catch (err) {
     pending.role = "error";
-    pending.content = err.message || "请求失败。";
+    pending.content = err.message || "请求未成功。";
     pending.pending = false;
     pending.toolCalls = [];
   } finally {
@@ -535,7 +661,7 @@ async function sendAgentMessage() {
 function applyAgentResponse(data, message) {
   agentState.conversationId = data.conversation_id || agentState.conversationId;
   agentState.pendingAction = data.pending_action || null;
-  message.content = data.reply || "没有返回内容。";
+  message.content = data.reply || "暂无返回内容。";
   message.pending = false;
   message.toolCalls = data.tool_calls || [];
   message.pendingAction = data.pending_action || null;
@@ -549,7 +675,7 @@ function renderAgentPendingAction(action) {
         <code>${escapeHtml(formatAgentToolInput(action.input || {}))}</code>
       </div>
       <div class="agent-action-buttons">
-        <button class="btn btn-sm btn-warn" onclick="confirmAgentAction(true)">执行</button>
+        <button class="btn btn-sm btn-warn" onclick="confirmAgentAction(true)">确认执行</button>
         <button class="btn btn-sm" onclick="confirmAgentAction(false)">取消</button>
       </div>
     </div>`;
@@ -583,7 +709,7 @@ window.confirmAgentAction = async (approved) => {
     applyAgentResponse(data, pending);
   } catch (err) {
     pending.role = "error";
-    pending.content = err.message || "确认操作失败。";
+    pending.content = err.message || "确认操作未成功。";
     pending.pending = false;
     pending.toolCalls = [];
     pending.pendingAction = action;
@@ -616,17 +742,17 @@ function renderAgentConfig(config) {
   ).join("");
   const keyStatus = config.api_key_configured
     ? `已保存：${config.api_key_preview || "已隐藏"}`
-    : "未保存 Key";
+    : "未保存 API Key";
   const statusClass = config.valid ? "agent-config-ok" : "agent-config-bad";
   const statusText = config.valid
     ? `${config.provider_label || config.provider} · ${config.model || "未填模型"} · ${keyStatus}`
     : (config.error || "配置未完成");
   box.innerHTML = `
     <form id="agent-config-form" class="agent-config-form">
-      <label>接口
+      <label>模型接口
         <select id="agent-provider" class="sel">${providerOptions}</select>
       </label>
-      <label>Base URL
+      <label>接口地址（Base URL）
         <input id="agent-base-url" value="${escapeHtml(config.base_url || "")}" />
       </label>
       <label>模型
@@ -637,13 +763,13 @@ function renderAgentConfig(config) {
       </label>
       <label class="agent-check">
         <input id="agent-tools-enabled" type="checkbox"${config.supports_tool_calls ? " checked" : ""} />
-        启用工具调用
+        允许调用工具
       </label>
       <div class="agent-config-grid">
         <label>温度
           <input id="agent-temperature" type="number" min="0" max="2" step="0.1" value="${escapeHtml(config.temperature ?? 0.2)}" />
         </label>
-        <label>输出
+        <label>最大输出
           <input id="agent-max-tokens" type="number" min="128" max="8192" step="128" value="${escapeHtml(config.max_tokens ?? 2400)}" />
         </label>
         <label>超时
@@ -652,7 +778,7 @@ function renderAgentConfig(config) {
       </div>
       <div class="actions">
         <button class="btn btn-sm" id="agent-config-save" type="submit">保存</button>
-        <button class="btn btn-sm" id="agent-config-test" type="button">测试</button>
+        <button class="btn btn-sm" id="agent-config-test" type="button">测试连接</button>
       </div>
       <div id="agent-config-status" class="agent-config-status ${statusClass}">${escapeHtml(statusText)}</div>
     </form>`;
@@ -716,14 +842,14 @@ async function saveAgentConfig(testOnly) {
     } else {
       agentState.config = data;
       renderAgentConfig(data);
-      notice("Agent 配置已保存", "ok");
+      notice("AI 助手配置已保存", "ok");
     }
   } catch (err) {
     if (status) {
       status.className = "agent-config-status agent-config-bad";
-      status.textContent = err.message || "操作失败";
+      status.textContent = err.message || "操作未成功";
     }
-    notice(err.message || "Agent 配置操作失败", "bad");
+    notice(err.message || "AI 助手配置操作未成功", "bad");
   } finally {
     if (save) save.disabled = false;
     if (test) test.disabled = false;
@@ -741,6 +867,12 @@ async function viewProductDetail(asin) {
     <div class="detail-head">
       <a class="link back-link" href="#/products">← 返回商品池</a>
       <h2 style="margin:0;font-size:16px">${escapeHtml(displayTitle(p, asin))}</h2>
+      ${p.image_url ? `<figure class="product-hero">
+        <img class="product-hero__img" loading="lazy" alt="商品主图"
+             src="/api/products/${encodeURIComponent(asin)}/image"
+             onerror="this.closest('.product-hero').classList.add('product-hero--failed')" />
+        <figcaption class="product-hero__cap">商品图 · 首次查看时联网缓存</figcaption>
+      </figure>` : ""}
       <div class="meta">ASIN: ${escapeHtml(asin)} · 综合得分 ${scoreBadge(p.total_score)}
         · 首次采集 ${fmt.text(p.first_seen_at)} · 最近采集 ${fmt.text(p.last_seen_at)}</div>
     </div>
@@ -869,6 +1001,13 @@ function renderTrendChart(snaps) {
   const x = snaps.map((s) => String(s.snapshot_at));
   let leftKey = "price";
 
+  const fmtLeft = (key, v) => {
+    if (v == null) return "—";
+    if (key === "price") return fmt.money(v);
+    if (key === "rating") return fmt.num(v, 1);
+    return fmt.int(v);
+  };
+
   function draw() {
     const left = TREND_LEFT_METRICS.find((m) => m.key === leftKey);
     bar.innerHTML = TREND_LEFT_METRICS.map((m) =>
@@ -879,7 +1018,19 @@ function renderTrendChart(snaps) {
     });
     chart.setOption({
       backgroundColor: "transparent",
-      tooltip: { trigger: "axis" },
+      tooltip: {
+        trigger: "axis",
+        // 带单位的中文 tooltip：价格 $、评分 1 位小数、排名整数、其余整数。
+        formatter: (params) => {
+          if (!params || !params.length) return "";
+          const lines = params.map((p) => {
+            const isRank = String(p.seriesName).indexOf("自然排名") === 0;
+            const val = isRank ? fmt.int(p.value) : fmtLeft(left.key, p.value);
+            return `${p.marker}${escapeHtml(String(p.seriesName))}: ${val}`;
+          });
+          return [escapeHtml(String(params[0].axisValue))].concat(lines).join("<br/>");
+        },
+      },
       legend: { textStyle: { color: "#9aa7b4" } },
       grid: { left: 56, right: 56, top: 36, bottom: 70 },
       dataZoom: [{ type: "slider", height: 16, bottom: 20, borderColor: "#29313c", textStyle: { color: "#9aa7b4" } }],
@@ -889,8 +1040,8 @@ function renderTrendChart(snaps) {
         { type: "value", name: "排名", inverse: true, axisLabel: { color: "#9aa7b4" }, splitLine: { show: false } },
       ],
       series: [
-        { name: left.label, type: "line", yAxisIndex: 0, smooth: true, showSymbol: true, itemStyle: { color: left.color }, data: snaps.map((s) => numOrNull(s[left.key])) },
-        { name: "自然排名（越低越好）", type: "line", yAxisIndex: 1, smooth: true, showSymbol: true, itemStyle: { color: "#d29922" }, data: snaps.map((s) => numOrNull(s.organic_rank)) },
+        { name: left.label, type: "line", yAxisIndex: 0, smooth: true, showSymbol: true, connectNulls: true, itemStyle: { color: left.color }, data: snaps.map((s) => numOrNull(s[left.key])) },
+        { name: "自然排名（越低越好）", type: "line", yAxisIndex: 1, smooth: true, showSymbol: true, connectNulls: true, itemStyle: { color: "#d29922" }, data: snaps.map((s) => numOrNull(s.organic_rank)) },
       ],
     }, true);
   }
@@ -994,7 +1145,7 @@ function renderCompareTable(items) {
     const cells = items.map((it, i) => `<td class="num${i === bestIdx ? " best" : ""}">${m.render(it)}</td>`).join("");
     return `<tr><td>${m.label}</td>${cells}</tr>`;
   }).join("");
-  return `<div class="table-wrap"><table class="compare"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  return wrapTable(`<table class="compare"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`);
 }
 
 /* ---------- 视图：关键词机会 ---------- */
@@ -1190,18 +1341,106 @@ function formatPainPoints(value) {
 /* ---------- 视图：任务中心 ---------- */
 async function viewTasks() {
   loading();
-  const rows = await api("/api/tasks?limit=100");
-  if (!rows || !rows.length) return emptyState("暂无采集 / 入库任务记录。");
+  const rawRows = await api("/api/tasks?limit=100");
+  const rows = (rawRows || []).map((row, index) => ({ ...row, _taskRowId: String(row.id ?? index) }));
+  if (!rows || !rows.length) return emptyState("暂无采集或写入任务记录。");
+  taskErrorRows.clear();
+  rows.forEach((row) => taskErrorRows.set(row._taskRowId, row));
   content.innerHTML = `<div class="result-meta">共 ${rows.length} 条 · 点列头排序</div><div id="task-table"></div>`;
   renderSortableTable(document.getElementById("task-table"), [
     { key: "time", label: "时间", render: (r) => fmt.text(r.created_at || r.started_at), sortVal: (r) => r.created_at || r.started_at || "" },
-    { key: "type", label: "类型", render: (r) => escapeHtml(r.job_type || r.type || "—"), sortVal: (r) => r.job_type || r.type || "" },
+    { key: "type", label: "类型", render: (r) => escapeHtml(taskDisplayType(r)), sortVal: (r) => taskDisplayType(r) },
     { key: "keyword", label: "关键词", render: (r) => escapeHtml(r.keyword || "—"), sortVal: (r) => r.keyword || "" },
     { key: "status", label: "状态", render: (r) => statusBadge(r.status), sortVal: (r) => r.status || "" },
-    { key: "valid_count", label: "有效数", align: "num", numeric: true, render: (r) => fmt.int(r.valid_count), sortVal: (r) => r.valid_count },
-    { key: "ingested_count", label: "入库数", align: "num", numeric: true, render: (r) => fmt.int(r.ingested_count), sortVal: (r) => r.ingested_count },
-    { key: "error", label: "失败原因", render: (r) => escapeHtml(truncate(r.error || r.failure_reason || "—", 40)), csv: (r) => r.error || r.failure_reason || "" },
-  ], rows, { defaultSort: { key: "time", dir: -1 }, exportName: "任务记录" });
+    { key: "valid_count", label: "有效数", align: "num", numeric: true, render: (r) => taskMetric(r, "valid"), sortVal: (r) => taskMetricValue(r, "valid") },
+    { key: "ingested_count", label: "入库数", align: "num", numeric: true, render: (r) => taskMetric(r, "ingested"), sortVal: (r) => taskMetricValue(r, "ingested") },
+    { key: "error", label: "错误日志", sortable: false, render: renderTaskErrorCell, csv: taskErrorText },
+  ], rows, {
+    defaultSort: { key: "time", dir: -1 },
+    exportName: "任务记录",
+    onDraw: bindTaskErrorButtons,
+  });
+}
+
+function taskDisplayType(row) {
+  const explicit = row.job_type || row.type;
+  if (explicit === "入库" || explicit === "爬取") return explicit;
+  if (String(row.url || "").startsWith("local_html_import:")) return "入库";
+  if (row.pages == null || Number(row.total_inserted || 0) > 0) return "入库";
+  return "爬取";
+}
+
+function isImportTask(row) {
+  return taskDisplayType(row) === "入库";
+}
+
+function taskMetricValue(row, kind) {
+  if (!isImportTask(row)) return null;
+  if (kind === "valid") return row.valid_count ?? row.total_valid;
+  return row.ingested_count ?? row.total_inserted;
+}
+
+function taskMetric(row, kind) {
+  return isImportTask(row) ? fmt.int(taskMetricValue(row, kind)) : "—";
+}
+
+function taskErrorText(row) {
+  return row?.error_message || row?.error || row?.failure_reason || "";
+}
+
+function renderTaskErrorCell(row) {
+  if (!taskErrorText(row)) return "—";
+  return `<button type="button" class="btn btn-sm task-log-btn" data-task-error="${escapeHtml(row._taskRowId)}">查看日志</button>`;
+}
+
+function bindTaskErrorButtons(container) {
+  container.querySelectorAll("[data-task-error]").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      showTaskError(button.dataset.taskError);
+    };
+  });
+}
+
+function showTaskError(taskRowId) {
+  const row = taskErrorRows.get(String(taskRowId));
+  const text = taskErrorText(row);
+  if (!text) {
+    notice("这条任务没有错误日志", "bad");
+    return;
+  }
+  const title = `任务 #${row.id ?? taskRowId} 报错日志`;
+  openTaskLogDialog(title, text);
+}
+
+function openTaskLogDialog(title, text) {
+  closeTaskLogDialog();
+  const modal = document.createElement("div");
+  modal.id = "task-log-dialog";
+  modal.className = "modal-backdrop";
+  modal.innerHTML = `
+    <section class="modal-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+      <div class="modal-head">
+        <h2>${escapeHtml(title)}</h2>
+        <button type="button" class="btn btn-sm" data-close-log>关闭</button>
+      </div>
+      <pre class="log-pre" tabindex="0">${escapeHtml(text)}</pre>
+    </section>`;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeTaskLogDialog();
+  });
+  document.body.appendChild(modal);
+  const closeButton = modal.querySelector("[data-close-log]");
+  if (closeButton) closeButton.onclick = closeTaskLogDialog;
+  const pre = modal.querySelector(".log-pre");
+  if (pre) pre.focus();
+}
+
+function closeTaskLogDialog() {
+  const modal = document.getElementById("task-log-dialog");
+  if (!modal) return false;
+  modal.remove();
+  return true;
 }
 function statusBadge(s) {
   const v = String(s || "").toLowerCase();
@@ -1211,25 +1450,53 @@ function statusBadge(s) {
   return `<span class="badge ${cls}">${escapeHtml(s || "—")}</span>`;
 }
 
-/* ---------- 视图：运行爬取（GUI "运行爬取" Web 化） ---------- */
+/* ---------- 视图：手动采集（GUI 采集入口 Web 化） ---------- */
 function viewCrawl() {
   content.innerHTML = `
     <div class="panel">
-      <h2>运行爬取</h2>
+      <h2>手动采集</h2>
       <div class="filters" style="margin:0">
-        <input id="cr-keyword" placeholder="爬取关键词" style="width:260px" />
+        <input id="cr-keyword" placeholder="采集关键词" style="width:260px" />
         <input id="cr-pages" type="number" min="1" max="7" value="1" placeholder="页数" style="width:90px" />
-        <button class="btn btn-warn" id="cr-run">运行爬取</button>
+        <button class="btn btn-warn" id="cr-run">开始采集</button>
+        <button class="btn" id="cr-open-amazon">预开启 Amazon 页面</button>
       </div>
       <p style="color:var(--text-dim);font-size:12.5px;margin:10px 0 0;line-height:1.6">
-        会打开浏览器访问 Amazon 搜索页并保存 HTML 到 <code>2_1/html/&lt;关键词&gt;/</code>；不自动入库。遇到登录页、验证码、空页或有效商品为 0 会停止。
+        会打开浏览器访问 Amazon 搜索页并保存 HTML 到 <code>2_1/html/&lt;关键词&gt;/</code>；不自动写入数据库。遇到登录页、验证码、空页或有效商品为 0 会停止。
       </p>
     </div>
     <div id="cr-result"></div>`;
   document.getElementById("cr-run").onclick = runManualCrawl;
+  document.getElementById("cr-open-amazon").onclick = openAmazonForCrawl;
   document.getElementById("cr-keyword").addEventListener("keydown", (e) => {
     if (e.key === "Enter") runManualCrawl();
   });
+}
+
+async function openAmazonForCrawl() {
+  const box = document.getElementById("cr-result");
+  const btn = document.getElementById("cr-open-amazon");
+  if (!confirm("预开启 Amazon 页面？\n\n会打开或复用浏览器访问 Amazon 首页。")) return;
+  btn.disabled = true;
+  box.innerHTML = `<div class="state"><div class="spinner"></div>正在打开 Amazon 页面…</div>`;
+  try {
+    const result = await apiSend("/api/crawl/open-amazon", "POST");
+    box.innerHTML = `
+      <div class="panel">
+        <h3>Amazon 页面已打开</h3>
+        <div class="result-list">
+          <div class="row"><span>状态</span> <b>${escapeHtml(result["状态"] || "已打开")}</b></div>
+          <div class="row"><span>标题</span> <b>${escapeHtml(result["标题"] || "Amazon")}</b></div>
+          <div class="row"><span>URL</span> <b>${escapeHtml(result["URL"] || "")}</b></div>
+        </div>
+      </div>`;
+    notice("Amazon 页面已打开", "ok");
+  } catch (err) {
+    box.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
+    notice(err.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function runManualCrawl() {
@@ -1237,17 +1504,17 @@ async function runManualCrawl() {
   const pages = Number(document.getElementById("cr-pages").value) || 1;
   const box = document.getElementById("cr-result");
   const btn = document.getElementById("cr-run");
-  if (!keyword) { notice("请填写爬取关键词", "bad"); return; }
-  if (pages < 1 || pages > 7) { notice("页数需在 1-7 之间", "bad"); return; }
+  if (!keyword) { notice("请填写采集关键词", "bad"); return; }
+  if (pages < 1 || pages > 7) { notice("采集页数需在 1-7 页之间", "bad"); return; }
   if (!confirm(
-    `立即联网爬取「${keyword}」${pages} 页？\n\n会打开浏览器访问 Amazon 搜索页并保存 HTML；不自动入库。遇到验证码/登录/空页会停止。`
+    `立即联网采集「${keyword}」${pages} 页？\n\n会打开浏览器访问 Amazon 搜索页并保存 HTML；不自动写入数据库。遇到验证码、登录页或空页会停止。`
   )) return;
   btn.disabled = true;
-  box.innerHTML = `<div class="state"><div class="spinner"></div>爬取中…（浏览器会自动打开，请勿刷新页面）</div>`;
+  box.innerHTML = `<div class="state"><div class="spinner"></div>采集中…（浏览器会自动打开，请勿刷新页面）</div>`;
   try {
     const result = await apiSend("/api/crawl/run", "POST", { keyword, pages });
     box.innerHTML = renderCrawlResult(result);
-    notice(result["状态"] === "完成" ? "爬取完成" : "爬取已停止，请查看原因", result["状态"] === "完成" ? "ok" : "bad");
+    notice(result["状态"] === "完成" ? "采集完成" : "采集已停止，请查看原因", result["状态"] === "完成" ? "ok" : "bad");
   } catch (err) {
     box.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
     notice(err.message, "bad");
@@ -1275,8 +1542,8 @@ function renderCrawlResult(result) {
       `<code>${escapeHtml(p["保存文件"] || "—")}</code>`,
       escapeHtml(p["原因"] || "—"),
     ] }))
-  ) : `<div class="state">没有保存页面。</div>`;
-  return `<div class="panel"><h2>爬取结果</h2>${summary}
+  ) : `<div class="state">暂无保存页面。</div>`;
+  return `<div class="panel"><h2>采集结果</h2>${summary}
     <div class="actions" style="margin:12px 0"><a class="btn btn-sm" href="#/import">去本地 HTML 入库</a><a class="btn btn-sm" href="#/tasks">查看任务中心</a></div>
     ${rows}</div>`;
 }
@@ -1370,7 +1637,7 @@ window.trackDelete = async (id) => {
 window.trackPreview = async (id) => {
   try {
     const r = await apiSend("/api/tracking/check", "POST", { execute: false, task_id: id });
-    notice("预览完成（未联网）：" + summarizeCheck(r), "ok");
+    notice("检查完成（未联网）：" + summarizeCheck(r), "ok");
   } catch (err) { notice(err.message, "bad"); }
 };
 
@@ -1388,7 +1655,7 @@ window.trackCollect = async (id) => {
 };
 
 function summarizeCheck(r) {
-  if (!r) return "无返回";
+  if (!r) return "暂无返回内容";
   if (typeof r === "string") return r;
   const keys = ["checked", "due", "executed", "skipped", "collected", "completed", "message"];
   const parts = keys.filter((k) => r[k] != null && r[k] !== "").map((k) => `${k}=${r[k]}`);
@@ -1396,10 +1663,17 @@ function summarizeCheck(r) {
 }
 
 /* ---------- 表格辅助 ---------- */
+/* 统一表格外壳：横向滚动容器（P0-2）。
+   P2-3 技术债收敛：`tableHtml`=静态表、`renderSortableTable`=可排序/导出表，二者按职责分工，
+   不强行合并两套不同用途的渲染；仅把三处重复的 `.table-wrap` 外壳收敛到本 helper。 */
+function wrapTable(inner) {
+  return `<div class="table-wrap">${inner}</div>`;
+}
+
 function tableHtml(headers, rows) {
-  return `<div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
+  return wrapTable(`<table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
     <tbody>${rows.map((r) => `<tr${r._click ? ` onclick="${r._click}"` : ""}>${
-      r.cells.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+      r.cells.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
 }
 function truncate(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "…" : s; }
 function numOrNull(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -1468,7 +1742,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
     }).join("");
     const bar = opts.exportName
       ? `<div class="table-bar"><button class="btn btn-sm" data-csv="1">导出 CSV</button></div>` : "";
-    container.innerHTML = bar + `<div class="table-wrap"><table><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table></div>`;
+    container.innerHTML = bar + wrapTable(`<table><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table>`);
     container.querySelectorAll("th.sortable").forEach((th) => {
       th.onclick = () => {
         const k = th.dataset.key;
@@ -1491,6 +1765,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
         tr.onclick = () => opts.onRowClick(rows[i]);
       });
     }
+    if (opts.onDraw) opts.onDraw(container, rows);
   }
   draw();
 }
@@ -1504,17 +1779,17 @@ async function viewImport() {
     <div class="panel">
       <h2>本地 HTML 入库</h2>
       <p style="color:var(--text-dim);font-size:12.5px;line-height:1.6">
-        从 <code>2_1/html/</code> 目录选择已保存的 Amazon 搜索结果页 HTML，先<b>预览</b>有效入库候选与过滤原因，确认后<b>写入 MySQL</b>。
-        仅允许该目录下文件（白名单）；预览只解析不写库，入库需二次确认。
+        从 <code>2_1/html/</code> 目录选择已保存的 Amazon 搜索结果页 HTML，先<b>预览入库</b>有效候选与过滤原因，确认后<b>写入数据库（MySQL）</b>。
+        仅允许该目录下文件（白名单）；预览只解析不写入数据库，写入需二次确认。
       </p>
       ${files.length ? `
       <div class="filters" style="margin-top:10px">
         <input id="imp-keyword" placeholder="关键词（可选，标注来源）" style="width:200px" />
-        <button class="btn" id="imp-preview">预览</button>
-        <button class="btn btn-warn" id="imp-commit">确认入库</button>
+        <button class="btn" id="imp-preview">预览入库</button>
+        <button class="btn btn-warn" id="imp-commit">确认写入</button>
       </div>
       <div id="imp-files" class="file-list file-tree">${renderHtmlFileTree(files)}</div>`
-      : `<div class="state">html/ 目录下暂无 .html 文件。先把保存的搜索页 HTML 放进 <code>2_1/html/</code> 再来。</div>`}
+      : `<div class="state"><code>2_1/html/</code> 目录暂无 HTML 文件。先把保存的搜索页 HTML 放进该目录再来。</div>`}
     </div>
     <div id="imp-result"></div>`;
   if (!files.length) return;
@@ -1568,20 +1843,20 @@ async function runImport(commit) {
   const files = [...document.querySelectorAll(".imp-file:checked")].map((c) => c.value);
   const box = document.getElementById("imp-result");
   if (!files.length) { notice("请至少勾选一个 HTML 文件", "bad"); return; }
-  if (commit && !confirm(`确认把 ${files.length} 个 HTML 文件解析入库到 MySQL？\n建议先「预览」确认有效候选与过滤情况。`)) return;
-  box.innerHTML = `<div class="state"><div class="spinner"></div>${commit ? "入库中…" : "解析预览中…"}</div>`;
+  if (commit && !confirm(`确认把 ${files.length} 个 HTML 文件解析并写入数据库（MySQL）？\n建议先「预览入库」确认有效候选与过滤情况。`)) return;
+  box.innerHTML = `<div class="state"><div class="spinner"></div>${commit ? "写入中…" : "预览入库中…"}</div>`;
   const keyword = document.getElementById("imp-keyword").value.trim() || null;
   try {
     const r = await apiSend(`/api/import/html/${commit ? "commit" : "preview"}`, "POST", { files, keyword });
     box.innerHTML = renderImportResult(r, commit);
-    notice(commit ? "入库完成" : "预览完成", "ok");
+    notice(commit ? "写入完成" : "预览入库完成", "ok");
   } catch (err) {
     box.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
   }
 }
 
 function renderImportResult(r, commit) {
-  return renderSummaryPanel(commit ? "入库结果" : "预览结果", r);
+  return renderSummaryPanel(commit ? "写入结果" : "预览入库结果", r);
 }
 
 /* 通用：把 controller 返回的中文摘要 dict 渲染成面板（过滤原因单列、列表值用顿号拼接）。 */
@@ -1606,15 +1881,15 @@ async function viewReviewImport() {
     <div class="panel">
       <h2>导入评论文件（CSV / JSON）</h2>
       <p style="color:var(--text-dim);font-size:12.5px;line-height:1.6">
-        从 <code>2_1/reviews/</code> 选择评论 CSV/JSON，先<b>预览</b>再写入 MySQL（按内容哈希去重并刷新评论洞察）。文件缺 ASIN 时可填默认 ASIN。
+        从 <code>2_1/reviews/</code> 选择评论 CSV/JSON，先<b>预览导入</b>再写入数据库（MySQL），按内容哈希去重并刷新评论洞察。文件缺 ASIN 时可填默认 ASIN。
       </p>
       ${imp.length ? `
       <div class="filters" style="margin-top:10px">
         <select id="rv-file" class="sel">${imp.map((f) => `<option value="${escapeHtml(f)}">${escapeHtml(f)}</option>`).join("")}</select>
         <input id="rv-asin" placeholder="默认 ASIN（可选）" style="width:160px" />
-        <button class="btn" id="rv-preview">预览</button>
+        <button class="btn" id="rv-preview">预览导入</button>
         <button class="btn btn-warn" id="rv-commit">确认导入</button>
-      </div>` : `<div class="state">reviews/ 目录下暂无 CSV/JSON。可先在下方解析评论 HTML 生成，或放入文件。</div>`}
+      </div>` : `<div class="state"><code>2_1/reviews/</code> 目录暂无 CSV/JSON 文件。可先在下方解析评论 HTML 生成，或放入文件。</div>`}
       <div id="rv-imp-result"></div>
     </div>
     <div class="panel">
@@ -1629,7 +1904,7 @@ async function viewReviewImport() {
         <button class="btn" id="rh-parse">解析</button>
       </div>
       <div class="file-list">${htmls.map((f, i) => `<label class="file-row"><input type="checkbox" class="rh-file" value="${escapeHtml(f)}"${i === 0 ? " checked" : ""}/> ${escapeHtml(f)}</label>`).join("")}</div>`
-      : `<div class="state">reviews/ 目录下暂无评论 HTML。</div>`}
+      : `<div class="state"><code>2_1/reviews/</code> 目录暂无评论 HTML。</div>`}
       <div id="rv-html-result"></div>
     </div>`;
   if (imp.length) {
@@ -1643,13 +1918,13 @@ async function runReviewImport(commit) {
   const file = document.getElementById("rv-file").value;
   const box = document.getElementById("rv-imp-result");
   if (!file) { notice("请选择评论文件", "bad"); return; }
-  if (commit && !confirm(`确认把「${file}」的评论写入 MySQL？建议先预览确认有效/过滤情况。`)) return;
-  box.innerHTML = `<div class="state"><div class="spinner"></div>${commit ? "导入中…" : "预览中…"}</div>`;
+  if (commit && !confirm(`确认把「${file}」的评论写入数据库（MySQL）？建议先预览导入，确认有效候选与过滤情况。`)) return;
+  box.innerHTML = `<div class="state"><div class="spinner"></div>${commit ? "导入中…" : "预览导入中…"}</div>`;
   const default_asin = document.getElementById("rv-asin").value.trim() || null;
   try {
     const r = await apiSend(`/api/import/reviews/${commit ? "commit" : "preview"}`, "POST", { file, default_asin });
-    box.innerHTML = renderSummaryPanel(commit ? "导入结果" : "预览结果", r);
-    notice(commit ? "评论已导入" : "预览完成", "ok");
+    box.innerHTML = renderSummaryPanel(commit ? "导入结果" : "预览导入结果", r);
+    notice(commit ? "评论已导入" : "预览导入完成", "ok");
   } catch (err) { box.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`; }
 }
 
@@ -1859,7 +2134,7 @@ async function saveSettings() {
 
 /* ---------- 路由 ---------- */
 const routes = [
-  { re: /^#\/crawl$/, title: "运行爬取", run: viewCrawl },
+  { re: /^#\/crawl$/, title: "手动采集", run: viewCrawl },
   { re: /^#\/recommendations$/, title: "推荐 · 蓝海", run: viewRecommendations },
   { re: /^#\/products$/, title: "商品池 · 筛选", run: viewProducts },
   { re: /^#\/compare(?:\/(.+))?$/, title: "商品对比", run: (m) => viewCompare(m[1] ? decodeURIComponent(m[1]) : "") },
@@ -1903,7 +2178,24 @@ async function pingHealth() {
   }
 }
 
+let shellControlsReady = false;
+function initShellControls() {
+  if (shellControlsReady) return;
+  shellControlsReady = true;
+  const toggle = document.getElementById("sidebar-toggle");
+  const backdrop = document.getElementById("sidebar-backdrop");
+  if (toggle) toggle.onclick = toggleSidebar;
+  if (backdrop) backdrop.onclick = () => setSidebarOpen(false);
+  document.querySelectorAll(".nav-item").forEach((a) => {
+    a.addEventListener("click", closeSidebarIfNarrow);
+  });
+  window.addEventListener("resize", syncSidebarForViewport);
+  document.addEventListener("keydown", handleGlobalShortcuts);
+  syncSidebarForViewport();
+}
+
 document.getElementById("refresh-btn").onclick = router;
+document.getElementById("back-btn").onclick = () => history.back();
 window.addEventListener("hashchange", router);
-window.addEventListener("DOMContentLoaded", () => { pingHealth(); router(); });
-if (document.readyState !== "loading") { pingHealth(); router(); }
+window.addEventListener("DOMContentLoaded", () => { initShellControls(); pingHealth(); router(); });
+if (document.readyState !== "loading") { initShellControls(); pingHealth(); router(); }

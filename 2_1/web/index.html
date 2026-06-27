@@ -10,7 +10,7 @@
 </head>
 <body>
   <div class="layout">
-    <aside class="sidebar">
+    <aside id="sidebar" class="sidebar">
       <div class="brand">
         <span class="brand-mark">▲</span>
         <span class="brand-name">选品助手</span>
@@ -18,7 +18,7 @@
       <nav id="nav">
         <div class="nav-group">
           <div class="nav-group-title">采集与追踪</div>
-          <a class="nav-item" href="#/crawl">运行爬取</a>
+          <a class="nav-item" href="#/crawl">手动采集</a>
           <a class="nav-item" href="#/tasks">任务中心</a>
           <a class="nav-item" href="#/tracking">关键词追踪</a>
           <a class="nav-item" href="#/import">本地 HTML 入库</a>
@@ -46,12 +46,15 @@
         <span id="api-status-text">检测中…</span>
       </div>
     </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" aria-hidden="true"></div>
 
     <main class="main">
       <header class="topbar">
         <h1 id="view-title">推荐 · 蓝海</h1>
         <div class="topbar-actions">
-          <button id="refresh-btn" class="btn" title="刷新当前页">↻ 刷新</button>
+          <button id="sidebar-toggle" class="btn btn-icon" title="展开/收起导航" aria-label="展开或收起导航" aria-controls="sidebar" aria-expanded="true">☰</button>
+          <button id="back-btn" class="btn" title="返回上一页（[ 或 Alt+←）">← 返回</button>
+          <button id="refresh-btn" class="btn" title="刷新当前页（R）">↻ 刷新</button>
         </div>
       </header>
       <section id="content" class="content"><!-- 视图渲染于此 --></section>

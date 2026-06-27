@@ -118,6 +118,7 @@ def build_snapshot_collection_plan(
     marketplace: str | None = None,
     keyword: str | None = None,
     keyword_exact: bool = False,
+    seed_keyword: bool = False,
     save_root: str | Path = "html/snapshots",
     now: datetime | None = None,
     client: MySQLClient | None = None,
@@ -127,6 +128,10 @@ def build_snapshot_collection_plan(
     The planner ranks existing keyword pools by snapshot scarcity, elapsed time
     since last keyword collection, and existing product score. It deliberately
     does not perform network access or database writes.
+
+    ``seed_keyword=True`` 用于关键词追踪的冷启动：当传入的 ``keyword`` 还没有商品池
+    （候选为空）时，直接按 (keyword, marketplace, pages) 合成一个直采任务，让全新词
+    也能采到首个快照。已有商品池的词不受影响（候选非空即走原排序逻辑，不重复播种）。
     """
 
     generated_at = (now or datetime.now()).replace(second=0, microsecond=0)
@@ -160,6 +165,29 @@ def build_snapshot_collection_plan(
             )[: _normalize_limit(max_keywords, 1, 50)]
         )
     ]
+    if seed_keyword and keyword and (keyword.strip()) and not eligible:
+        # 冷启动播种：该词尚无商品池，按 (keyword, marketplace) 直接造一个首采任务。
+        eligible.append(
+            _candidate_to_task(
+                {
+                    "keyword_id": 0,
+                    "marketplace": (marketplace or "US"),
+                    "keyword": keyword.strip(),
+                    "tracked_products": 0,
+                    "avg_snapshots_per_product": 0,
+                    "min_snapshots_per_product": 0,
+                    "max_score": None,
+                    "last_collected_at": None,
+                },
+                priority=1,
+                generated_at=generated_at,
+                min_interval_hours=min_interval_hours,
+                default_pages=default_pages,
+                max_pages_per_keyword=max_pages_per_keyword,
+                target_snapshots=target_snapshots,
+                save_root=save_root,
+            )
+        )
     return SnapshotCollectionPlan(
         generated_at=generated_at,
         min_interval_hours=min_interval_hours,

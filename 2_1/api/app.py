@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -70,6 +70,7 @@ def recommendations(
     offset: int = 0,
     sort_by: str = "total_score",
     sort_dir: str = "desc",
+    min_score: float | None = None,
 ) -> dict[str, Any]:
     return _ok(
         _controller.get_recommendations_page(
@@ -77,6 +78,7 @@ def recommendations(
             offset=offset,
             sort_by=sort_by,
             sort_dir=sort_dir,
+            min_score=min_score,
         )
     )
 
@@ -109,6 +111,26 @@ def products(
 @app.get("/api/products/{asin}")
 def product_detail(asin: str) -> dict[str, Any]:
     return _ok(_controller.get_product_history(asin))
+
+
+@app.get("/api/products/{asin}/image")
+def product_image(asin: str):
+    # 商品主图联网缓存：首次查看时从采集存下的 Amazon image_url 下载并缓存到本地，
+    # 之后命中缓存。仅允许 Amazon 媒体域名，纯只读派生数据。无图/失败回 404，
+    # 前端 onerror 隐藏图片区。
+    from services.product_image_cache import content_type_for, fetch_product_image
+
+    path = fetch_product_image(asin)
+    if path is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "data": None, "message": "无可用商品图"},
+        )
+    return FileResponse(
+        path,
+        media_type=content_type_for(path),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/products/{asin}/trend")
@@ -234,9 +256,17 @@ def tracking_delete(task_id: int) -> dict[str, Any]:
 def tracking_check(body: TrackingCheckIn) -> dict[str, Any]:
     # execute=False 只预览到期情况、不联网（安全默认）；execute=True 串行执行真实采集
     # （联网，守采集边界），需前端确认后传入。
+    # 真实采集复用共享 _controller 的持久浏览器会话（与手动采集/预开同一实例，复用已暖
+    # 会话、采完不关）；dry-run 预览不碰浏览器，不传 controller。
     from services.keyword_tracking_scheduler import run_keyword_tracking_scheduler
 
-    return _ok(run_keyword_tracking_scheduler(execute=body.execute, task_id=body.task_id))
+    return _ok(
+        run_keyword_tracking_scheduler(
+            execute=body.execute,
+            task_id=body.task_id,
+            controller=_controller if body.execute else None,
+        )
+    )
 
 
 # ---------- 手动运行爬取（GUI "运行爬取" 的 Web 入口） ----------
@@ -245,10 +275,12 @@ def tracking_check(body: TrackingCheckIn) -> dict[str, Any]:
 
 @app.post("/api/crawl/run")
 def crawl_run(body: CrawlRunIn) -> dict[str, Any]:
-    try:
-        return _ok(_controller.run_keyword_crawl(body.keyword, pages=body.pages, record_job=True))
-    finally:
-        _controller.stop_browser()
+    return _ok(_controller.run_keyword_crawl(body.keyword, pages=body.pages, record_job=True))
+
+
+@app.post("/api/crawl/open-amazon")
+def crawl_open_amazon() -> dict[str, Any]:
+    return _ok(_controller.open_amazon_page())
 
 
 # ---------- 本地 HTML 入库（阶段1 单元①·透出现有 ingestion） ----------

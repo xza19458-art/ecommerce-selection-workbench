@@ -118,6 +118,7 @@ def run_snapshot_collection(
     marketplace: str | None = None,
     keyword: str | None = None,
     keyword_exact: bool = False,
+    seed_keyword: bool = False,
     save_root: str | Path = "html/snapshots",
     stop_file: str | Path = "runtime/stop_snapshot_collection.flag",
     page_delay_min_seconds: int | None = None,
@@ -127,11 +128,17 @@ def run_snapshot_collection(
     record_jobs: bool = True,
     ignore_interval: bool = False,
     client: MySQLClient | None = None,
+    controller: Any | None = None,
 ) -> SnapshotCollectionRunSummary:
     """Run or preview a manual low-frequency snapshot collection round.
 
     ignore_interval=True 仅供人工显式补采时豁免 72h 间隔（如刚采过但要按新页数上限
     补齐）；默认 False 仍严守 72h 硬下限。其余限频硬上限不受影响。
+
+    seed_keyword=True：冷启动播种，给还没商品池的关键词也排首采任务（追踪用）。
+
+    controller：传入则复用该浏览器会话且**结束不关闭**（生命周期归调用方，复用已暖
+    会话）；不传则本函数自建一次性 controller 并在结束时关闭（CLI 路径，向后兼容）。
     """
 
     started_at = datetime.now().replace(microsecond=0)
@@ -154,6 +161,7 @@ def run_snapshot_collection(
         marketplace=marketplace,
         keyword=keyword,
         keyword_exact=keyword_exact,
+        seed_keyword=seed_keyword,
         save_root=save_root,
         now=snapshot_at,
         client=client,
@@ -190,7 +198,10 @@ def run_snapshot_collection(
         return summary
 
     db = client or MySQLClient()
-    controller = _build_controller()
+    # 传入 controller 则复用其已暖会话、结束不关；未传则自建一次性 controller 并在结束关闭。
+    owns_controller = controller is None
+    if owns_controller:
+        controller = _build_controller()
     page_results: list[PageCollectionResult] = []
     status = "完成"
     message = "采集完成；已保存 HTML。后续入库请使用 B2 的 import_snapshots_and_sync.py。"
@@ -227,7 +238,8 @@ def run_snapshot_collection(
                 message = task_message
                 break
     finally:
-        controller.stop_browser()
+        if owns_controller:
+            controller.stop_browser()
 
     summary = SnapshotCollectionRunSummary(
         dry_run=False,

@@ -46,6 +46,10 @@ DISPLAY_FIELDS = {
     "quality_status": "数据质量",
 }
 
+# 入库完整性必填字段。monthly_bought（近月购买量）**不在**此列：很多正常 listing
+# 本就没有 "X bought in past month" 徽标，100% 必填会误删真实商品、甚至把整页判为
+# 有效=0 触发"空页即停"。改为最佳努力解析、缺失存 NULL（scoring._score_demand 已对
+# None 返回 0，安全）。决策见 decisions/2026-06-24-monthly_bought-必填口径裁定.md。
 STORAGE_REQUIRED_FIELDS = (
     "asin",
     "title",
@@ -54,7 +58,6 @@ STORAGE_REQUIRED_FIELDS = (
     "price",
     "rating",
     "review_count",
-    "monthly_bought",
 )
 
 

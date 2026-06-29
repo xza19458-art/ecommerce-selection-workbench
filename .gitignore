@@ -24,11 +24,13 @@ config/warehouse.json
 config/agent.json
 config/translation.json
 config/settings.json
+config/crawl_queues.json
 2_1/config/database.json
 2_1/config/warehouse.json
 2_1/config/agent.json
 2_1/config/translation.json
 2_1/config/settings.json
+2_1/config/crawl_queues.json
 
 # Logs
 *.log

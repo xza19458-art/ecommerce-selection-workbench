@@ -201,6 +201,11 @@ class CrawlRunIn(BaseModel):
     pages: int | None = None
 
 
+class CrawlQueueIn(BaseModel):
+    name: str
+    items: list[dict[str, Any]] = []
+
+
 class AgentChatIn(BaseModel):
     conversation_id: str | None = None
     message: str | None = None
@@ -278,9 +283,38 @@ def crawl_run(body: CrawlRunIn) -> dict[str, Any]:
     return _ok(_controller.run_keyword_crawl(body.keyword, pages=body.pages, record_job=True))
 
 
+@app.post("/api/crawl/run-import")
+def crawl_run_import(body: CrawlRunIn) -> dict[str, Any]:
+    # 采集队列单元：抓页存 HTML + 自动写 MySQL（不触发仓库同步，队尾统一同步）。
+    # 联网 + 写库的危险操作，由前端队列在用户确认后逐词调用，照守采集边界。
+    return _ok(_controller.run_keyword_crawl_and_import(body.keyword, pages=body.pages))
+
+
 @app.post("/api/crawl/open-amazon")
 def crawl_open_amazon() -> dict[str, Any]:
     return _ok(_controller.open_amazon_page())
+
+
+# 命名采集队列（工作流配置，本地 JSON，非业务数据、不进 MySQL）。
+@app.get("/api/crawl/queues")
+def crawl_queues_list() -> dict[str, Any]:
+    from services.crawl_queues import list_queues
+
+    return _ok(list_queues())
+
+
+@app.post("/api/crawl/queues")
+def crawl_queues_save(body: CrawlQueueIn) -> dict[str, Any]:
+    from services.crawl_queues import save_queue
+
+    return _ok(save_queue(body.name, body.items))
+
+
+@app.delete("/api/crawl/queues/{name}")
+def crawl_queues_delete(name: str) -> dict[str, Any]:
+    from services.crawl_queues import delete_queue
+
+    return _ok({"deleted": delete_queue(name)})
 
 
 # ---------- 本地 HTML 入库（阶段1 单元①·透出现有 ingestion） ----------

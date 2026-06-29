@@ -304,6 +304,10 @@ th.sortable:hover { color: var(--accent); }
 }
 .check-inline input { accent-color: var(--accent); }
 
+/* ---- 采集队列管理条 ---- */
+.queue-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
+.queue-spacer { flex: 1 1 16px; }
+
 /* ---- 详情 ---- */
 .detail-head { margin-bottom: 18px; }
 .detail-head .meta { color: var(--text-dim); font-size: 13px; margin-top: 6px; }

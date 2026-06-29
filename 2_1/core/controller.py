@@ -386,6 +386,73 @@ class AppController:
             self._try_finish_crawl_job(job_id, "失败", pages_saved, str(exc))
             raise
 
+    def run_keyword_crawl_and_import(
+        self,
+        keyword: str,
+        pages: int | None = None,
+        *,
+        marketplace: str = "US",
+    ) -> dict:
+        """队列采集单元：抓页存 HTML（复用 run_keyword_crawl）后自动入库 MySQL。
+
+        仅写 MySQL、**不触发仓库同步**（队列在队尾统一同步一次，省开销）。把 per-page 的
+        blocked/empty 归一成 outcome（完成/被拦/未采到/失败）供前端标记与暂停判定。已采到的
+        有效页即使整轮被拦也照常入库，不浪费已抓数据。采集硬限频/被拦即停全由 run_keyword_crawl
+        负责，本方法只加"自动入库 + 结果归类"。
+        """
+        crawl = self.run_keyword_crawl(keyword, pages=pages, record_job=True)
+        page_list = crawl.get("页面") or []
+        saved_pages = [page for page in page_list if page.get("状态") == "已保存"]
+        has_blocked = any(page.get("状态") == "blocked" for page in page_list)
+        crawl_status = crawl.get("状态")
+
+        imported = 0
+        import_error: str | None = None
+        if saved_pages:
+            project_root = Path(__file__).resolve().parents[1]
+            files = [str(project_root / page["保存文件"]) for page in saved_pages if page.get("保存文件")]
+            if files:
+                try:
+                    from services.ingestion import ingest_html_files_to_mysql
+
+                    summary = ingest_html_files_to_mysql(
+                        files,
+                        keyword=(keyword or "").strip(),
+                        marketplace=marketplace,
+                        require_complete=True,
+                    )
+                    imported = int(getattr(summary, "total_inserted", 0) or 0)
+                except Exception as exc:  # 入库失败不崩，标记失败让队列暂停
+                    import_error = f"入库失败: {exc}"
+
+        if has_blocked:
+            outcome = "被拦"
+            reason = next((p.get("原因") for p in page_list if p.get("状态") == "blocked"), None) \
+                or "页面被风控（验证码/登录/防爬页）"
+        elif import_error:
+            outcome, reason = "失败", import_error
+        elif crawl_status != "完成":
+            outcome = "失败"
+            reason = crawl.get("message") or "采集异常停止"
+        elif not saved_pages:
+            outcome = "未采到"
+            reason = crawl.get("message") or "未采到有效商品（空页或解析有效为 0）"
+        else:
+            outcome = "完成"
+            reason = f"已保存 {len(saved_pages)} 页，入库 {imported} 个商品"
+
+        return {
+            "关键词": (keyword or "").strip(),
+            "采集状态": crawl_status,
+            "outcome": outcome,
+            "原因": reason,
+            "保存页数": len(saved_pages),
+            "入库商品数": imported,
+            "采集时间": crawl.get("结束时间"),
+            "页面": page_list,
+            "保存目录": crawl.get("保存目录"),
+        }
+
     def _try_create_crawl_job(self, keyword: str, url: str, pages: int) -> int | None:
         try:
             from database.mysql_client import MySQLClient

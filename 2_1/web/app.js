@@ -1452,8 +1452,31 @@ function statusBadge(s) {
   return `<span class="badge ${cls}">${escapeHtml(s || "—")}</span>`;
 }
 
-/* ---------- 视图：手动采集（GUI 采集入口 Web 化） ---------- */
+/* ---------- 采集队列状态（手动采集·构建队列） ---------- */
+let crawlQueue = { name: "", items: [] }; // items: { keyword, pages, status, reason, collected_at }
+let crawlQueuePaused = false;
+let crawlQueueRunning = false;
+let savedQueueNames = [];
+let queueAutoLoaded = false; // 首次进入自动载入最近队列，只做一次
+
+function nextQueueName() {
+  let n = 1;
+  while (savedQueueNames.includes("队列" + n)) n++;
+  return "队列" + n;
+}
+function newCrawlQueue() { crawlQueue = { name: nextQueueName(), items: [] }; }
+
+async function loadSavedQueues() {
+  try {
+    const list = await api("/api/crawl/queues");
+    savedQueueNames = (list || []).map((q) => q.name);
+    return list || [];
+  } catch (e) { savedQueueNames = []; return []; }
+}
+
+/* ---------- 视图：手动采集（GUI 采集入口 Web 化，含采集队列） ---------- */
 function viewCrawl() {
+  if (!crawlQueue.name) newCrawlQueue();
   content.innerHTML = `
     <div class="panel">
       <h2>手动采集</h2>
@@ -1461,18 +1484,249 @@ function viewCrawl() {
         <input id="cr-keyword" placeholder="采集关键词" style="width:260px" />
         <input id="cr-pages" type="number" min="1" max="7" value="1" placeholder="页数" style="width:90px" />
         <button class="btn btn-warn" id="cr-run">开始采集</button>
+        <button class="btn btn-warn" id="cr-queue-add" style="display:none">加入队列</button>
         <button class="btn" id="cr-open-amazon">预开启 Amazon 页面</button>
+        <label class="check-inline"><input type="checkbox" id="cr-queue-mode" /> 队列模式</label>
       </div>
       <p style="color:var(--text-dim);font-size:12.5px;margin:10px 0 0;line-height:1.6">
         会打开浏览器访问 Amazon 搜索页并保存 HTML 到 <code>2_1/html/&lt;关键词&gt;/</code>；不自动写入数据库。遇到登录页、验证码、空页或有效商品为 0 会停止。
       </p>
     </div>
+    <div id="cr-queue" class="panel" style="display:none">
+      <h2>采集队列</h2>
+      <div class="queue-bar">
+        <select id="q-select" class="sel sel-sm"></select>
+        <input id="q-name" class="pager-jump" style="width:150px" placeholder="队列名" />
+        <button class="btn btn-sm" id="q-save">保存队列</button>
+        <button class="btn btn-sm btn-bad" id="q-del">删除队列</button>
+        <span class="queue-spacer"></span>
+        <span id="q-progress" class="selected-count">0 / 0</span>
+        <button class="btn btn-sm btn-warn" id="q-start">开始</button>
+        <button class="btn btn-sm" id="q-pause" disabled>暂停</button>
+      </div>
+      <p style="color:var(--text-dim);font-size:12.5px;margin:8px 0 12px;line-height:1.6">
+        按顺序逐词联网采集并<b>自动入库</b>（队尾统一同步仓库）、复用浏览器会话。暂停会在<b>当前词采完后</b>停下；遇风控/未采到目标自动暂停并标记。<b>采集中请勿关闭或切走本页</b>。
+      </p>
+      <div id="q-list"></div>
+    </div>
     <div id="cr-result"></div>`;
+  const modeBox = document.getElementById("cr-queue-mode");
+  modeBox.onchange = () => setQueueMode(modeBox.checked);
   document.getElementById("cr-run").onclick = runManualCrawl;
+  document.getElementById("cr-queue-add").onclick = addToQueue;
   document.getElementById("cr-open-amazon").onclick = openAmazonForCrawl;
   document.getElementById("cr-keyword").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") runManualCrawl();
+    if (e.key !== "Enter") return;
+    if (document.getElementById("cr-queue-mode").checked) addToQueue();
+    else runManualCrawl();
   });
+  document.getElementById("q-select").onchange = onQueueSelect;
+  document.getElementById("q-save").onclick = saveCurrentQueue;
+  document.getElementById("q-del").onclick = deleteCurrentQueue;
+  document.getElementById("q-start").onclick = runQueue;
+  document.getElementById("q-pause").onclick = pauseQueue;
+  document.getElementById("q-name").value = crawlQueue.name;
+  renderQueueList();
+  setQueueControls();
+  refreshQueueSelect();
+}
+
+function setQueueMode(on) {
+  document.getElementById("cr-queue").style.display = on ? "" : "none";
+  document.getElementById("cr-run").style.display = on ? "none" : "";
+  document.getElementById("cr-queue-add").style.display = on ? "" : "none";
+  if (on) refreshQueueSelect();
+}
+
+async function refreshQueueSelect() {
+  const sel = document.getElementById("q-select");
+  if (!sel) return;
+  const list = await loadSavedQueues();
+  // 首次进入且当前队列为空：自动载入最近保存的队列（按 updated_at），省一步手选。
+  if (!queueAutoLoaded && !crawlQueue.items.length && list.length) {
+    queueAutoLoaded = true;
+    const recent = list.slice().sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0];
+    crawlQueue = {
+      name: recent.name,
+      items: recent.items.map((it) => ({ keyword: it.keyword, pages: it.pages, status: "待采", reason: "", collected_at: it.collected_at || "" })),
+    };
+    const nameEl = document.getElementById("q-name");
+    if (nameEl) nameEl.value = crawlQueue.name;
+    renderQueueList();
+    setQueueControls();
+  }
+  // 新建空队列若自动命名撞上已保存同名：改名。否则下拉会"看着选中却没载入"，且保存会覆盖已存队列。
+  if (!crawlQueue.items.length && savedQueueNames.includes(crawlQueue.name)) {
+    crawlQueue.name = nextQueueName();
+    const nameEl = document.getElementById("q-name");
+    if (nameEl) nameEl.value = crawlQueue.name;
+  }
+  sel.innerHTML = ['<option value="__new__">＋ 新建队列</option>']
+    .concat(list.map((q) => `<option value="${escapeHtml(q.name)}">${escapeHtml(q.name)}（${q.items.length}）</option>`))
+    .join("");
+  // 仅当当前是"已载入、非空、已保存"的队列才高亮它；空队列一律显示"新建队列"，避免假选中。
+  sel.value = (crawlQueue.items.length && savedQueueNames.includes(crawlQueue.name)) ? crawlQueue.name : "__new__";
+}
+
+async function onQueueSelect(e) {
+  if (crawlQueueRunning) { notice("队列采集中，请先暂停", "bad"); refreshQueueSelect(); return; }
+  const value = e.target.value;
+  if (value === "__new__") {
+    newCrawlQueue();
+  } else {
+    const list = await api("/api/crawl/queues");
+    const q = (list || []).find((x) => x.name === value);
+    if (q) crawlQueue = { name: q.name, items: q.items.map((it) => ({ keyword: it.keyword, pages: it.pages, status: "待采", reason: "", collected_at: it.collected_at || "" })) };
+  }
+  document.getElementById("q-name").value = crawlQueue.name;
+  renderQueueList();
+  setQueueControls();
+}
+
+function addToQueue() {
+  const kwEl = document.getElementById("cr-keyword");
+  const keyword = kwEl.value.trim();
+  const pages = Math.max(1, Math.min(7, Number(document.getElementById("cr-pages").value) || 1));
+  if (!keyword) { notice("请填写采集关键词", "bad"); return; }
+  if (crawlQueue.items.some((it) => it.keyword.toLowerCase() === keyword.toLowerCase())) {
+    notice("该关键词已在队列中", "bad"); return;
+  }
+  crawlQueue.items.push({ keyword, pages, status: "待采", reason: "", collected_at: "" });
+  kwEl.value = "";
+  renderQueueList();
+  setQueueControls();
+}
+
+window.queueRemove = (idx) => {
+  if (crawlQueueRunning) { notice("队列采集中，暂不能移除", "bad"); return; }
+  crawlQueue.items.splice(idx, 1);
+  renderQueueList();
+  setQueueControls();
+};
+
+function queueStatusBadge(status) {
+  const map = { "完成": "badge-good", "待采": "badge-dim", "采集中": "badge-warn", "被拦": "badge-bad", "未采到": "badge-warn", "失败": "badge-bad" };
+  return `<span class="badge ${map[status] || "badge-dim"}">${escapeHtml(status || "待采")}</span>`;
+}
+
+function renderQueueList() {
+  const box = document.getElementById("q-list");
+  if (!box) return;
+  if (!crawlQueue.items.length) {
+    box.innerHTML = `<div class="state">队列为空：上方输入关键词点「加入队列」。</div>`;
+    updateQueueProgress();
+    return;
+  }
+  const rows = crawlQueue.items.map((it, i) => `
+    <tr>
+      <td>${escapeHtml(it.keyword)}</td>
+      <td class="num">${it.pages}</td>
+      <td>${queueStatusBadge(it.status)}${it.reason ? ` <span style="color:var(--text-dim);font-size:12px">${escapeHtml(it.reason)}</span>` : ""}</td>
+      <td>${it.collected_at ? escapeHtml(fmt.text(it.collected_at)) : '<span style="color:var(--text-dim)">未采集</span>'}</td>
+      <td><button class="btn btn-sm btn-bad" onclick="queueRemove(${i})" ${crawlQueueRunning ? "disabled" : ""}>移除</button></td>
+    </tr>`).join("");
+  box.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>关键词</th><th class="num">页数</th><th>状态</th><th>上次采集</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  updateQueueProgress();
+}
+
+function updateQueueProgress() {
+  const el = document.getElementById("q-progress");
+  if (!el) return;
+  const done = crawlQueue.items.filter((it) => it.status === "完成").length;
+  el.textContent = `${done} / ${crawlQueue.items.length}`;
+}
+
+function setQueueControls() {
+  const start = document.getElementById("q-start");
+  const pause = document.getElementById("q-pause");
+  if (!start || !pause) return;
+  start.disabled = crawlQueueRunning;
+  pause.disabled = !crawlQueueRunning;
+  start.textContent = crawlQueue.items.some((it) => it.status === "完成") ? "继续" : "开始";
+}
+
+function pauseQueue() {
+  crawlQueuePaused = true;
+  notice("将在当前关键词采完后暂停…", "ok");
+  document.getElementById("q-pause").disabled = true;
+}
+
+async function runQueue() {
+  if (crawlQueueRunning) return;
+  const pending = crawlQueue.items.filter((it) => it.status !== "完成");
+  if (!pending.length) { notice("队列没有待采任务", "bad"); return; }
+  if (!confirm(
+    `开始队列连续联网采集？\n\n会逐词打开/复用浏览器抓 Amazon 并自动入库，遇风控/未采到会自动暂停。共 ${pending.length} 个待采。\n\n采集中请勿关闭或切走本页。`
+  )) return;
+  crawlQueueRunning = true;
+  crawlQueuePaused = false;
+  setQueueControls();
+  renderQueueList();
+  let importedTotal = 0;
+  for (const it of crawlQueue.items) {
+    if (crawlQueuePaused) break;
+    if (it.status === "完成") continue;
+    it.status = "采集中";
+    it.reason = "";
+    renderQueueList();
+    try {
+      const r = await apiSend("/api/crawl/run-import", "POST", { keyword: it.keyword, pages: it.pages });
+      it.status = r.outcome || "完成";
+      it.reason = r["原因"] || "";
+      if (it.status === "完成") {
+        it.collected_at = r["采集时间"] || new Date().toISOString().slice(0, 19).replace("T", " ");
+      }
+      importedTotal += Number(r["入库商品数"]) || 0;
+    } catch (err) {
+      it.status = "失败";
+      it.reason = err.message;
+    }
+    renderQueueList();
+    if (it.status !== "完成") crawlQueuePaused = true; // 任一非完成 → 自动暂停
+    if (crawlQueuePaused) break;
+  }
+  crawlQueueRunning = false;
+  setQueueControls();
+  renderQueueList();
+  if (importedTotal > 0) {
+    try { await apiSend("/api/warehouse/sync", "POST"); }
+    catch (e) { notice("队尾仓库同步失败：" + e.message, "bad"); }
+  }
+  const remain = crawlQueue.items.filter((it) => it.status !== "完成").length;
+  if (crawlQueuePaused) notice(`队列已暂停（剩 ${remain} 个待采），累计入库 ${importedTotal}`, "bad");
+  else notice(`队列完成，累计入库 ${importedTotal}`, "ok");
+}
+
+async function saveCurrentQueue() {
+  const name = document.getElementById("q-name").value.trim();
+  if (!name) { notice("请填写队列名", "bad"); return; }
+  if (!crawlQueue.items.length) { notice("空队列无需保存", "bad"); return; }
+  try {
+    const saved = await apiSend("/api/crawl/queues", "POST", {
+      name,
+      items: crawlQueue.items.map((it) => ({ keyword: it.keyword, pages: it.pages, collected_at: it.collected_at || "" })),
+    });
+    crawlQueue.name = saved.name;
+    notice("队列已保存", "ok");
+    await refreshQueueSelect();
+  } catch (err) { notice(err.message, "bad"); }
+}
+
+async function deleteCurrentQueue() {
+  const name = crawlQueue.name;
+  if (!savedQueueNames.includes(name)) { notice("该队列尚未保存，无需删除", "bad"); return; }
+  if (!confirm(`删除已保存队列「${name}」？（不影响已采数据）`)) return;
+  try {
+    await apiSend(`/api/crawl/queues/${encodeURIComponent(name)}`, "DELETE");
+    notice("已删除", "ok");
+    newCrawlQueue();
+    document.getElementById("q-name").value = crawlQueue.name;
+    renderQueueList();
+    setQueueControls();
+    await refreshQueueSelect();
+  } catch (err) { notice(err.message, "bad"); }
 }
 
 async function openAmazonForCrawl() {

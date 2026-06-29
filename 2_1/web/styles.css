@@ -1,24 +1,48 @@
 :root {
-  --bg: #0f1216;
-  --bg-panel: #161b22;
-  --bg-elev: #1c232c;
-  --border: #29313c;
-  --text: #e6edf3;
-  --text-dim: #9aa7b4;
-  --accent: #4c8dff;
-  --accent-soft: rgba(76, 141, 255, 0.14);
+  /* 背景分层：底 → 面板 → 浮起 → 弹层，层差更清晰，配阴影做"质感" */
+  --bg: #0b0e13;
+  --bg-panel: #141a22;
+  --bg-elev: #1b222d;
+  --bg-raised: #222b38;
+  --border: #2a323d;
+  --border-subtle: #20262f;
+  --text: #e9eef5;
+  --text-dim: #98a4b3;
+  --accent: #4d8dff;
+  --accent-hover: #6ba2ff;
+  --accent-soft: rgba(77, 141, 255, 0.14);
   --good: #3fb950;
   --warn: #d29922;
   --bad: #f85149;
   --radius: 10px;
+  --radius-sm: 7px;
+  --radius-lg: 14px;
+  /* 深色阴影 + 顶部 1px 高光，营造浮起层次（现在最缺的质感） */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .32), 0 1px 1px rgba(0, 0, 0, .22);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, .42);
+  --shadow-lg: 0 20px 52px rgba(0, 0, 0, .55);
+  --hairline: inset 0 1px 0 rgba(255, 255, 255, .04);
+  --ring: 0 0 0 3px var(--accent-soft);
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
 }
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
-body { background: var(--bg); color: var(--text); font-size: 14px; }
+body {
+  background-color: var(--bg);
+  /* 极淡的强调色辉光，给纯深底加一点纵深，不喧宾夺主 */
+  background-image:
+    radial-gradient(1100px 560px at 100% -12%, rgba(77, 141, 255, .06), transparent 60%),
+    radial-gradient(820px 460px at -8% 112%, rgba(77, 141, 255, .035), transparent 55%);
+  background-attachment: fixed;
+  color: var(--text);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
 
-.layout { display: flex; min-height: 100vh; }
+/* 锁定整体高度=视口：侧栏与顶栏固定，只有右侧内容区内部滚动 */
+.layout { display: flex; height: 100vh; overflow: hidden; }
 
 /* ---- 侧边栏 ---- */
 .sidebar {
@@ -32,21 +56,54 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
   overflow-y: auto;
   transition: width .18s ease, padding .18s ease, transform .18s ease;
 }
-.brand { display: flex; align-items: center; gap: 9px; padding: 6px 8px 18px; }
-.brand-mark { color: var(--accent); font-size: 18px; }
-.brand-name { font-weight: 600; font-size: 16px; letter-spacing: .5px; }
+.sidebar-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 2px 2px 16px;
+}
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.sidebar-toggle, .sidebar-reopen {
+  display: inline-grid; place-items: center; flex-shrink: 0;
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--bg-elev); color: var(--text-dim);
+  border: 1px solid var(--border); cursor: pointer;
+  font-size: 17px; line-height: 1;
+  transition: background .14s, color .14s, border-color .14s;
+}
+.sidebar-toggle:hover, .sidebar-reopen:hover {
+  color: var(--accent); border-color: var(--accent); background: var(--bg-raised);
+}
+/* 收起后浮出的展开按钮：固定左上角，仅在侧栏隐藏时出现 */
+.sidebar-reopen {
+  position: fixed; top: 14px; left: 14px; z-index: 60;
+  display: none; box-shadow: var(--shadow-sm), var(--hairline);
+}
+body.sidebar-collapsed .sidebar-reopen { display: inline-grid; }
+.brand-mark {
+  display: inline-grid; place-items: center;
+  width: 30px; height: 30px; border-radius: 9px;
+  color: var(--accent); font-size: 16px;
+  background: var(--accent-soft);
+  box-shadow: var(--hairline), 0 0 0 1px rgba(77, 141, 255, .22);
+}
+.brand-name { font-weight: 600; font-size: 16px; letter-spacing: .4px; }
 .nav-group { margin-bottom: 16px; }
 .nav-group-title {
   font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
   color: var(--text-dim); padding: 4px 8px; margin-bottom: 2px;
 }
 .nav-item {
-  display: block; padding: 8px 10px; border-radius: 8px;
+  position: relative;
+  display: block; padding: 8px 10px 8px 13px; border-radius: 8px;
   color: var(--text-dim); text-decoration: none; font-size: 13.5px;
-  transition: background .12s, color .12s;
+  transition: background .14s, color .14s;
 }
 .nav-item:hover { background: var(--bg-elev); color: var(--text); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+/* 选中态左侧强调竖条，导航层级更清晰 */
+.nav-item.active::before {
+  content: ""; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+  width: 3px; height: 16px; border-radius: 3px; background: var(--accent);
+}
 .sidebar-foot {
   margin-top: auto; display: flex; align-items: center; gap: 8px;
   padding: 10px 8px 2px; font-size: 12px; color: var(--text-dim);
@@ -58,22 +115,27 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .dot-unknown { background: var(--text-dim); }
 
 /* ---- 主区 ---- */
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 24px; border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  box-shadow: var(--hairline), 0 1px 0 rgba(0, 0, 0, .25);
 }
 .topbar h1 { font-size: 18px; margin: 0; font-weight: 600; }
 .topbar-actions { display: flex; align-items: center; gap: 8px; }
-.content { padding: 22px 24px; overflow-y: auto; }
+.content { flex: 1; min-height: 0; padding: 22px 24px; overflow-y: auto; }
 
 .btn {
   background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
   padding: 7px 13px; border-radius: 8px; cursor: pointer; font-size: 13px;
   text-decoration: none; display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-sm), var(--hairline);
+  transition: border-color .14s, color .14s, background .14s, transform .06s;
 }
-.btn:hover { border-color: var(--accent); color: var(--accent); }
-.btn:disabled { opacity: .48; cursor: not-allowed; border-color: var(--border); color: var(--text-dim); }
+.btn:hover { border-color: var(--accent); color: var(--accent); background: var(--bg-raised); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .48; cursor: not-allowed; border-color: var(--border); color: var(--text-dim); box-shadow: none; transform: none; }
 .btn-sm { padding: 4px 9px; font-size: 12px; }
 .btn-icon { width: 34px; padding-left: 0; padding-right: 0; }
 .btn-warn { border-color: rgba(210,153,34,.4); color: var(--warn); }
@@ -99,8 +161,9 @@ body.sidebar-collapsed .sidebar > * {
 .notice {
   position: fixed; top: 16px; left: 50%;
   transform: translateX(-50%) translateY(-20px);
-  background: var(--bg-elev); border: 1px solid var(--border); color: var(--text);
-  padding: 10px 18px; border-radius: 8px; font-size: 13px;
+  background: var(--bg-raised); border: 1px solid var(--border); color: var(--text);
+  padding: 10px 18px; border-radius: var(--radius); font-size: 13px;
+  box-shadow: var(--shadow-md), var(--hairline);
   opacity: 0; pointer-events: none; z-index: 50; max-width: 72vw;
   transition: opacity .2s, transform .2s;
 }
@@ -126,7 +189,7 @@ body.sidebar-collapsed .sidebar > * {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .36);
+  box-shadow: var(--shadow-lg), var(--hairline);
 }
 .modal-head {
   display: flex;
@@ -159,9 +222,10 @@ body.sidebar-collapsed .sidebar > * {
 .card {
   background: var(--bg-panel); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 14px 16px; cursor: pointer;
-  transition: border-color .12s, transform .12s;
+  box-shadow: var(--shadow-sm), var(--hairline);
+  transition: border-color .14s, transform .14s, box-shadow .14s;
 }
-.card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--shadow-md), var(--hairline); }
 .card h3 { margin: 0 0 8px; font-size: 14px; line-height: 1.4; font-weight: 600; }
 .card .row { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--text-dim); margin: 3px 0; }
 .card .row b { color: var(--text); font-weight: 600; }
@@ -246,6 +310,7 @@ th.sortable:hover { color: var(--accent); }
 .panel {
   background: var(--bg-panel); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
+  box-shadow: var(--shadow-sm), var(--hairline);
 }
 .panel h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
 .advice-row { display: flex; gap: 12px; margin: 8px 0; align-items: flex-start; }
@@ -358,6 +423,15 @@ th.sortable:hover { color: var(--accent); }
 a.link { color: var(--accent); text-decoration: none; }
 a.link:hover { text-decoration: underline; }
 
+/* 统一键盘焦点环（质感 + 可达性）；只在键盘聚焦时出现，不打扰鼠标点击 */
+.btn:focus-visible, .chip:focus-visible, a.link:focus-visible,
+input:focus-visible, select:focus-visible, textarea:focus-visible,
+.nav-item:focus-visible, summary:focus-visible, .prod-check:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring), var(--hairline);
+}
+
 /* ---- 商品对比 ---- */
 table.compare td:first-child, table.compare th:first-child { color: var(--text-dim); white-space: nowrap; }
 table.compare td.best { color: var(--good); font-weight: 700; }
@@ -374,6 +448,7 @@ table.compare tbody tr { cursor: default; }
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-sm), var(--hairline);
 }
 .agent-main {
   display: flex;
@@ -647,7 +722,9 @@ table.compare tbody tr { cursor: default; }
 }
 
 @media (max-width: 860px) {
-  .layout { display: block; min-height: 100vh; }
+  /* 窄屏改回整页自然滚动（侧栏为抽屉、顶栏 sticky），撤销宽屏的视口锁定 */
+  .layout { display: block; height: auto; overflow: visible; min-height: 100vh; }
+  .content { min-height: auto; overflow-y: visible; }
   .sidebar {
     position: fixed;
     inset: 0 auto 0 0;
@@ -672,9 +749,12 @@ table.compare tbody tr { cursor: default; }
     top: 0;
     z-index: 30;
     background: var(--bg);
-    padding: 12px 14px;
+    padding: 12px 14px 12px 56px;
   }
   .topbar h1 { font-size: 16px; }
+  /* 窄屏：浮出展开按钮即抽屉开关，抽屉打开时隐藏 */
+  .sidebar-reopen { display: inline-grid; }
+  body.sidebar-open .sidebar-reopen { display: none; }
   .content { padding: 16px 14px; }
   .table-toolbar {
     align-items: stretch;

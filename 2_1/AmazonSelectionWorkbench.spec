@@ -84,6 +84,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon="web/app-icon.ico",
     disable_windowed_traceback=False,
     argv_emulation=False,
 )

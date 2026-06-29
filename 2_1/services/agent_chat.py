@@ -16,9 +16,12 @@ from services.llm_provider import LLMProvider, LLMProviderError, ToolCall
 SYSTEM_PROMPT = """你是本地亚马逊选品分析系统的内置 Agent。
 你面向中文用户，必须用中文回答。
 你可以调用只读工具查询推荐榜、商品池、商品详情、趋势、关键词机会、评论洞察、追踪任务和任务中心。
-你也可以提出创建关键词追踪、修改追踪状态、触发采集，但这些操作必须先获得用户二次确认。
+你也可以提出预开启 Amazon 页面、创建关键词追踪、修改追踪状态、触发采集，但这些操作必须先获得用户二次确认。
 不要编造数据库里没有的数据；工具返回样本不足时要如实说明。
-触发采集会联网打开浏览器访问 Amazon，必须提醒用户有采集边界和耗时风险。"""
+评论洞察只代表已导入或已解析的评论证据；如果没有评论 HTML/CSV/JSON 数据，必须说明数据不足。
+monthly_bought/近期购买量可能为空，空值不等于 0，分析时要说明缺失风险。
+触发采集会联网打开浏览器访问 Amazon，必须提醒用户有采集边界、账号/页面状态和耗时风险。
+建议用户先预开启 Amazon 页面并手动处理地址、登录或验证码等前置状态，再触发采集；采集流程会尽量复用该共享浏览器会话。"""
 
 
 @dataclass
@@ -242,6 +245,8 @@ def _tool_result_message(tool_call_id: str, payload: dict[str, Any]) -> dict[str
 
 
 def _confirmation_reply(tool_name: str, tool_input: dict[str, Any]) -> str:
+    if tool_name == "open_amazon_page":
+        return "我准备预开启 Amazon 页面，供你手动处理地址、登录或验证码等前置状态。是否执行？"
     if tool_name == "create_keyword_tracking":
         return f"我准备创建关键词追踪任务：{tool_input.get('keyword') or '未指定关键词'}。是否执行？"
     if tool_name == "set_keyword_tracking_status":

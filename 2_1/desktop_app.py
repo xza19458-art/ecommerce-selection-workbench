@@ -29,6 +29,10 @@ if str(ROOT) not in sys.path:
 APP_TITLE = "Amazon 选品助手"
 HOST = "127.0.0.1"
 HEALTH_TIMEOUT = 30.0  # 秒：后端就绪轮询上限
+APP_BACKGROUND_COLOR = "#0b0e13"
+APP_TITLE_BAR_TEXT_COLOR = "#e9eef5"
+APP_TITLE_BAR_BORDER_COLOR = "#20262f"
+APP_ICON_RESOURCE = ("web", "app-icon.ico")
 
 logger = logging.getLogger("desktop_app")
 
@@ -71,6 +75,72 @@ def _make_server(port: int):
 
     config = uvicorn.Config("api.app:app", host=HOST, port=port, log_level="warning")
     return _ThreadedServer(config)
+
+
+def _app_icon_path() -> Path | None:
+    from pkg_paths import resource_path
+
+    icon_path = resource_path(*APP_ICON_RESOURCE)
+    return icon_path if icon_path.exists() else None
+
+
+def _hex_to_colorref(hex_color: str) -> int:
+    """把 #RRGGBB 转成 Windows DWM 使用的 COLORREF。"""
+    value = hex_color.removeprefix("#")
+    red = int(value[0:2], 16)
+    green = int(value[2:4], 16)
+    blue = int(value[4:6], 16)
+    return red | (green << 8) | (blue << 16)
+
+
+def _set_dwm_attribute(hwnd: int, attribute: int, value: int) -> bool:
+    """Best-effort 设置 Windows DWM 属性，老系统不支持时返回 False。"""
+    import ctypes
+    from ctypes import wintypes
+
+    data = ctypes.c_int(value)
+    result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        wintypes.HWND(hwnd),
+        ctypes.c_uint(attribute),
+        ctypes.byref(data),
+        ctypes.sizeof(data),
+    )
+    return result == 0
+
+
+def _apply_window_chrome_theme(window) -> None:
+    """尽力把 Windows 原生标题栏调整为深色，避免应用顶部突兀白边。"""
+    if sys.platform != "win32":
+        return
+
+    try:
+        if not window.events.shown.wait(timeout=10):
+            logger.debug("窗口显示事件超时，跳过标题栏主题设置。")
+            return
+
+        native = getattr(window, "native", None)
+        handle = getattr(native, "Handle", None)
+        if handle is None:
+            logger.debug("未获取到 Windows 窗口句柄，跳过标题栏主题设置。")
+            return
+
+        hwnd = int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle.ToInt32())
+
+        # DWMWA_USE_IMMERSIVE_DARK_MODE：Win10/11 新版本为 20，旧版本常见为 19。
+        for attribute in (20, 19):
+            if _set_dwm_attribute(hwnd, attribute, 1):
+                break
+
+        # Win11 支持显式标题栏/边框/文字色；老版本不支持时会安静失败。
+        title_bar_colors = {
+            34: _hex_to_colorref(APP_TITLE_BAR_BORDER_COLOR),  # DWMWA_BORDER_COLOR
+            35: _hex_to_colorref(APP_BACKGROUND_COLOR),  # DWMWA_CAPTION_COLOR
+            36: _hex_to_colorref(APP_TITLE_BAR_TEXT_COLOR),  # DWMWA_TEXT_COLOR
+        }
+        for attribute, value in title_bar_colors.items():
+            _set_dwm_attribute(hwnd, attribute, value)
+    except Exception:  # noqa: BLE001
+        logger.debug("设置 Windows 深色标题栏失败，继续使用系统默认外观。", exc_info=True)
 
 
 def serve_in_thread(port: int):
@@ -153,9 +223,21 @@ def main() -> int:
             return 1
 
         logger.info("后端就绪，打开桌面窗口。")
-        webview.create_window(APP_TITLE, base_url, width=1280, height=860, min_size=(960, 640))
+        icon_path = _app_icon_path()
+        window = webview.create_window(
+            APP_TITLE,
+            base_url,
+            width=1280,
+            height=860,
+            min_size=(960, 640),
+            background_color=APP_BACKGROUND_COLOR,
+        )
         # 注意：数据相关报错（如 MySQL 未启动）由 Web 页内统一中文提示，不影响窗口启动。
-        webview.start()  # 阻塞直到窗口关闭
+        webview.start(
+            func=_apply_window_chrome_theme,
+            args=(window,),
+            icon=str(icon_path) if icon_path else None,
+        )  # 阻塞直到窗口关闭
 
         logger.info("窗口已关闭，停止后端。")
         server.should_exit = True

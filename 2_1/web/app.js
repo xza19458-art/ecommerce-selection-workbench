@@ -184,12 +184,14 @@ function isNarrowSidebar() {
 }
 
 function updateSidebarA11y() {
-  const toggle = document.getElementById("sidebar-toggle");
-  if (!toggle) return;
   const expanded = isNarrowSidebar()
     ? document.body.classList.contains("sidebar-open")
     : !document.body.classList.contains("sidebar-collapsed");
-  toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  const value = expanded ? "true" : "false";
+  for (const id of ["sidebar-toggle", "sidebar-reopen"]) {
+    const el = document.getElementById(id);
+    if (el) el.setAttribute("aria-expanded", value);
+  }
 }
 
 function setSidebarOpen(open) {
@@ -2183,8 +2185,10 @@ function initShellControls() {
   if (shellControlsReady) return;
   shellControlsReady = true;
   const toggle = document.getElementById("sidebar-toggle");
+  const reopen = document.getElementById("sidebar-reopen");
   const backdrop = document.getElementById("sidebar-backdrop");
   if (toggle) toggle.onclick = toggleSidebar;
+  if (reopen) reopen.onclick = toggleSidebar;
   if (backdrop) backdrop.onclick = () => setSidebarOpen(false);
   document.querySelectorAll(".nav-item").forEach((a) => {
     a.addEventListener("click", closeSidebarIfNarrow);

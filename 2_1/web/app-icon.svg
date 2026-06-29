@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Amazon selection workbench icon">
+  <defs>
+    <linearGradient id="bg" x1="32" y1="16" x2="224" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#151b24"/>
+      <stop offset="1" stop-color="#0b0e13"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="128" y1="48" x2="128" y2="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8bb6ff"/>
+      <stop offset="1" stop-color="#4d8dff"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#bg)"/>
+  <rect x="17" y="17" width="222" height="222" rx="47" fill="none" stroke="#263142" stroke-width="2"/>
+  <path d="M128 46 202 182H54L128 46Z" fill="url(#mark)"/>
+  <path d="M128 82 170 160H86L128 82Z" fill="#0b0e13" opacity=".92"/>
+  <path d="M82 198h92" stroke="#d8e5ff" stroke-width="14" stroke-linecap="round" opacity=".92"/>
+  <path d="M188 198h14" stroke="#4d8dff" stroke-width="14" stroke-linecap="round"/>
+</svg>

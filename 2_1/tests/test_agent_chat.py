@@ -10,11 +10,14 @@ if str(ROOT) not in sys.path:
 
 from api import app as api_app
 from services.agent_chat import AgentChatService, AgentConversationStore
-from services.agent_tools import AgentToolResult
+from services.agent_tools import AgentToolExecutor, AgentToolResult, get_agent_tool_definitions
 from services.llm_provider import LLMResponse, ToolCall
 
 
 class FakeController:
+    def __init__(self) -> None:
+        self.opened_amazon = False
+
     def get_product_pool(self, **kwargs):
         return [{"asin": "B000000002", "title": "Example Product", "filters": kwargs}]
 
@@ -32,6 +35,10 @@ class FakeController:
 
     def get_task_jobs(self, **kwargs):
         return []
+
+    def open_amazon_page(self):
+        self.opened_amazon = True
+        return {"状态": "已打开", "URL": "https://www.amazon.com/", "message": "ok"}
 
 
 class FakeExecutor:
@@ -70,7 +77,7 @@ class OperationProvider:
     def __init__(self, tool_name="create_keyword_tracking", tool_input=None) -> None:
         self.calls = 0
         self.tool_name = tool_name
-        self.tool_input = tool_input or {"keyword": "wipes"}
+        self.tool_input = {"keyword": "wipes"} if tool_input is None else tool_input
         self.seen_tool_count = 0
         self.tool_payloads: list[dict] = []
         self.messages_seen: list[list[dict]] = []
@@ -100,7 +107,7 @@ def test_agent_chat_executes_readonly_tool_then_returns_final_reply() -> None:
     result = service.chat(conversation_id=None, message="show products", confirm=None)
 
     assert provider.calls == 2
-    assert provider.seen_tool_count == 11
+    assert provider.seen_tool_count == len(get_agent_tool_definitions())
     assert provider.saw_tool_result is True
     assert result["conversation_id"]
     assert result["reply"] == "Found one example product."
@@ -137,7 +144,7 @@ def test_operation_tool_returns_pending_action_without_execution() -> None:
     result = service.chat(conversation_id=None, message="create tracking", confirm=None)
 
     assert provider.calls == 1
-    assert provider.seen_tool_count == 11
+    assert provider.seen_tool_count == len(get_agent_tool_definitions())
     assert executor.calls == []
     assert result["pending_action"] == {
         "tool": "create_keyword_tracking",
@@ -145,6 +152,62 @@ def test_operation_tool_returns_pending_action_without_execution() -> None:
         "tool_call_id": "op_1",
     }
     assert result["tool_calls"] == []
+
+
+def test_open_amazon_page_is_confirmation_operation() -> None:
+    provider = OperationProvider(tool_name="open_amazon_page", tool_input={})
+    executor = FakeExecutor()
+    service = AgentChatService(
+        provider,
+        controller=FakeController(),
+        store=AgentConversationStore(),
+        executor=executor,
+    )
+
+    result = service.chat(conversation_id=None, message="先打开 Amazon", confirm=None)
+
+    assert provider.calls == 1
+    assert executor.calls == []
+    assert result["pending_action"] == {
+        "tool": "open_amazon_page",
+        "input": {},
+        "tool_call_id": "op_1",
+    }
+
+
+def test_open_amazon_page_tool_uses_shared_controller() -> None:
+    controller = FakeController()
+    executor = AgentToolExecutor(controller=controller)
+
+    result = executor.execute("open_amazon_page", {})
+
+    assert result.ok is True
+    assert controller.opened_amazon is True
+    assert result.data["URL"] == "https://www.amazon.com/"
+
+
+def test_trigger_collection_reuses_shared_controller() -> None:
+    import services.keyword_tracking_scheduler as scheduler
+
+    controller = FakeController()
+    seen: dict = {}
+
+    def fake_run_keyword_tracking_scheduler(**kwargs):
+        seen.update(kwargs)
+        return {"status": "完成", "message": "ok"}
+
+    old_runner = scheduler.run_keyword_tracking_scheduler
+    try:
+        scheduler.run_keyword_tracking_scheduler = fake_run_keyword_tracking_scheduler
+        executor = AgentToolExecutor(controller=controller)
+        result = executor.execute("trigger_collection", {"task_id": 7})
+    finally:
+        scheduler.run_keyword_tracking_scheduler = old_runner
+
+    assert result.ok is True
+    assert seen["execute"] is True
+    assert seen["task_id"] == 7
+    assert seen["controller"] is controller
 
 
 def test_normal_message_is_blocked_while_action_is_pending() -> None:
@@ -287,6 +350,9 @@ if __name__ == "__main__":
         test_agent_chat_executes_readonly_tool_then_returns_final_reply,
         test_confirm_without_pending_action_returns_safe_message,
         test_operation_tool_returns_pending_action_without_execution,
+        test_open_amazon_page_is_confirmation_operation,
+        test_open_amazon_page_tool_uses_shared_controller,
+        test_trigger_collection_reuses_shared_controller,
         test_normal_message_is_blocked_while_action_is_pending,
         test_confirm_approved_executes_pending_action_and_continues,
         test_confirm_cancel_does_not_execute_pending_action,

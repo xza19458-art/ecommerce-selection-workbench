@@ -57,6 +57,7 @@ class AgentToolExecutor:
             "query_review_insights": self._query_review_insights,
             "query_tracking_tasks": self._query_tracking_tasks,
             "query_tasks": self._query_tasks,
+            "open_amazon_page": self._open_amazon_page,
             "create_keyword_tracking": self._create_keyword_tracking,
             "set_keyword_tracking_status": self._set_keyword_tracking_status,
             "trigger_collection": self._trigger_collection,
@@ -133,6 +134,9 @@ class AgentToolExecutor:
             status=_optional_str(data.get("status")),
         )
 
+    def _open_amazon_page(self, _data: dict[str, Any]) -> dict[str, Any]:
+        return self.controller.open_amazon_page()
+
     def _create_keyword_tracking(self, data: dict[str, Any]) -> dict[str, Any]:
         from services.keyword_tracking import create_tracking_task
 
@@ -161,6 +165,7 @@ class AgentToolExecutor:
         return run_keyword_tracking_scheduler(
             execute=True,
             task_id=_optional_int(data.get("task_id")),
+            controller=self.controller,
         )
 
 
@@ -245,6 +250,15 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
 
 def get_operation_tool_definitions() -> list[AgentToolDefinition]:
     return [
+        AgentToolDefinition(
+            name="open_amazon_page",
+            description=(
+                "预开启 Amazon 首页，供用户手动处理地址、登录、验证码或页面状态；"
+                "不采集、不入库，但会联网打开共享浏览器会话，必须先向用户确认。"
+            ),
+            parameters=_schema({}),
+            requires_confirmation=True,
+        ),
         AgentToolDefinition(
             name="create_keyword_tracking",
             description="创建关键词追踪任务。写入 MySQL，必须先向用户确认，不能自动执行。",

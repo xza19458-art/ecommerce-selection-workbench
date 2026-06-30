@@ -114,13 +114,13 @@ def product_detail(asin: str) -> dict[str, Any]:
 
 
 @app.get("/api/products/{asin}/image")
-def product_image(asin: str):
+def product_image(asin: str, large: bool = False):
     # 商品主图联网缓存：首次查看时从采集存下的 Amazon image_url 下载并缓存到本地，
-    # 之后命中缓存。仅允许 Amazon 媒体域名，纯只读派生数据。无图/失败回 404，
-    # 前端 onerror 隐藏图片区。
+    # 之后命中缓存。仅允许 Amazon 媒体域名，纯只读派生数据。无图/失败回 404。
+    # large=1 取原始全分辨率图（点击放大看细节），同样缓存。
     from services.product_image_cache import content_type_for, fetch_product_image
 
-    path = fetch_product_image(asin)
+    path = fetch_product_image(asin, large=large)
     if path is None:
         return JSONResponse(
             status_code=404,

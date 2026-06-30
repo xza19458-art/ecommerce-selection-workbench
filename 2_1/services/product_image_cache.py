@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 import urllib.request
 from urllib.parse import urlparse
 
@@ -96,14 +97,17 @@ def _cache_path_for(url: str) -> Path:
     return _cache_dir() / f"{digest}{_ext_from_url(url)}"
 
 
-def fetch_product_image(asin: str, *, client: MySQLClient | None = None) -> Path | None:
-    """返回该 ASIN 主图的本地缓存路径；缺失则联网下载一次再缓存。
+# Amazon 图 URL 形如 .../I/<id>._AC_UY218_.jpg；去掉尺寸修饰段得原始全分辨率图（看细节用）。
+_SIZE_MODIFIER_RE = re.compile(r"\._[A-Za-z0-9,_-]+_\.(jpg|jpeg|png|webp|gif)$", re.IGNORECASE)
 
-    返回 ``None`` 表示无 image_url、域名不在白名单、或下载失败——端点据此回 404，
-    前端 onerror 隐藏图片区。
-    """
-    url = resolve_image_url(asin, client=client)
-    if not url or not _is_allowed_host(url):
+
+def _to_large_url(url: str) -> str:
+    return _SIZE_MODIFIER_RE.sub(r".\1", url)
+
+
+def _download_and_cache(url: str) -> Path | None:
+    """下载 url 并缓存（按 url 哈希命名）；命中则直接返回。失败返回 None。"""
+    if not _is_allowed_host(url):
         return None
     path = _cache_path_for(url)
     if path.exists() and path.stat().st_size > 0:
@@ -121,3 +125,18 @@ def fetch_product_image(asin: str, *, client: MySQLClient | None = None) -> Path
     tmp.write_bytes(data)
     tmp.replace(path)
     return path
+
+
+def fetch_product_image(asin: str, *, large: bool = False, client: MySQLClient | None = None) -> Path | None:
+    """返回该 ASIN 主图的本地缓存路径；缺失则联网下载一次再缓存。
+
+    large=True 取原始全分辨率图（点击放大看细节用）；高清取不到时回退缩略图，保证有图。
+    返回 ``None`` 表示无 image_url、域名不在白名单、或下载失败——端点据此回 404。
+    """
+    url = resolve_image_url(asin, client=client)
+    if not url or not _is_allowed_host(url):
+        return None
+    if large:
+        big = _to_large_url(url)
+        return _download_and_cache(big) or (_download_and_cache(url) if big != url else None)
+    return _download_and_cache(url)

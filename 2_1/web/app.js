@@ -86,6 +86,12 @@ function displayTitle(row, fallback = "—") {
 function isDeal(v) {
   return v === true || v === 1 || v === "1" || v === "是" || String(v).toLowerCase() === "true";
 }
+/* 行/卡片点击导航：用户正在选中文字（拖选复制正文）时不跳转，方便复制用于搜索/分析/分享。 */
+function hasTextSelection() {
+  const sel = window.getSelection && window.getSelection();
+  return !!(sel && String(sel).trim().length);
+}
+window.navHash = (hash) => { if (hasTextSelection()) return; location.hash = hash; };
 
 const productCompareSelection = new Set();
 let productCompareRows = new Map();
@@ -347,7 +353,7 @@ async function loadRecommendations() {
       return;
     }
     box.innerHTML = `<div class="cards">${rows.map((r) => `
-      <div class="card" onclick="location.hash='#/product/${encodeURIComponent(r.asin)}'">
+      <div class="card" onclick="navHash('#/product/${encodeURIComponent(r.asin)}')">
         <h3>${escapeHtml(displayTitle(r, r.asin))}</h3>
         <div class="row"><span>综合得分</span> <b>${scoreBadge(r.total_score)}</b></div>
         <div class="row" title="占位值，趋势第二步接入真实增长分前未计入综合得分"><span>增长分（占位）</span> <b>${fmt.num(r.growth_score, 0)}</b></div>
@@ -870,10 +876,11 @@ async function viewProductDetail(asin) {
       <a class="link back-link" href="#/products">← 返回商品池</a>
       <h2 style="margin:0;font-size:16px">${escapeHtml(displayTitle(p, asin))}</h2>
       ${p.image_url ? `<figure class="product-hero">
-        <img class="product-hero__img" loading="lazy" alt="商品主图"
+        <img class="product-hero__img" loading="lazy" alt="商品主图" title="点击放大看细节"
              src="/api/products/${encodeURIComponent(asin)}/image"
+             onclick="openImageZoom('${encodeURIComponent(asin)}')"
              onerror="this.closest('.product-hero').classList.add('product-hero--failed')" />
-        <figcaption class="product-hero__cap">商品图 · 首次查看时联网缓存</figcaption>
+        <figcaption class="product-hero__cap">商品图 · 点击放大看细节</figcaption>
       </figure>` : ""}
       <div class="meta">ASIN: ${escapeHtml(asin)} · 综合得分 ${scoreBadge(p.total_score)}
         · 首次采集 ${fmt.text(p.first_seen_at)} · 最近采集 ${fmt.text(p.last_seen_at)}</div>
@@ -1444,6 +1451,68 @@ function closeTaskLogDialog() {
   modal.remove();
   return true;
 }
+
+/* 商品图点击放大看细节：高清大图（large=1）；滚轮以光标为中心缩放、放大后可拖动平移。 */
+window.openImageZoom = (asin) => {
+  closeImageZoom();
+  const box = document.createElement("div");
+  box.id = "img-zoom";
+  box.className = "img-zoom-backdrop";
+  box.innerHTML = `
+    <button type="button" class="img-zoom-close" aria-label="关闭" title="关闭（Esc）">✕</button>
+    <div class="img-zoom-loading"><div class="spinner"></div>加载高清图…</div>
+    <div class="img-zoom-hint">滚轮缩放 · 拖动平移 · Esc 关闭</div>
+    <img class="img-zoom-img" alt="商品大图" style="display:none" src="/api/products/${asin}/image?large=1" />`;
+  document.body.appendChild(box);
+  const img = box.querySelector(".img-zoom-img");
+  const loading = box.querySelector(".img-zoom-loading");
+  img.onload = () => { loading.style.display = "none"; img.style.display = ""; };
+  img.onerror = () => {
+    if (!img.dataset.fb) { img.dataset.fb = "1"; img.src = `/api/products/${asin}/image`; return; }
+    loading.innerHTML = "图片加载失败";
+  };
+
+  let scale = 1, tx = 0, ty = 0, dragging = false, didDrag = false, sx = 0, sy = 0;
+  const apply = () => {
+    img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    img.style.cursor = scale > 1 ? (dragging ? "grabbing" : "grab") : "zoom-in";
+  };
+  box.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const cx = window.innerWidth / 2, cy = window.innerHeight / 2; // 图居中，视口中心≈图中心
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const next = Math.min(6, Math.max(1, scale * factor));
+    // 以光标为锚点缩放：缩放前后光标下的图上点保持不动
+    const px = (e.clientX - cx - tx) / scale;
+    const py = (e.clientY - cy - ty) / scale;
+    tx = e.clientX - cx - next * px;
+    ty = e.clientY - cy - next * py;
+    scale = next;
+    if (scale === 1) { tx = 0; ty = 0; }
+    apply();
+  }, { passive: false });
+  box.addEventListener("mousedown", (e) => {
+    didDrag = false;
+    if (scale <= 1 || e.target !== img) return; // 仅放大后、在图上才拖动
+    e.preventDefault();
+    dragging = true; sx = e.clientX - tx; sy = e.clientY - ty; apply();
+  });
+  box.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    didDrag = true; tx = e.clientX - sx; ty = e.clientY - sy; apply();
+  });
+  box.addEventListener("mouseup", () => { dragging = false; apply(); });
+  box.addEventListener("click", (e) => { if (e.target === box && !didDrag) closeImageZoom(); });
+  box.querySelector(".img-zoom-close").onclick = closeImageZoom;
+  document.addEventListener("keydown", imgZoomEsc);
+  apply();
+};
+function imgZoomEsc(e) { if (e.key === "Escape") closeImageZoom(); }
+function closeImageZoom() {
+  const box = document.getElementById("img-zoom");
+  if (box) box.remove();
+  document.removeEventListener("keydown", imgZoomEsc);
+}
 function statusBadge(s) {
   const v = String(s || "").toLowerCase();
   const cls = /(完成|成功|已保存|done|success|ok|completed)/.test(v) ? "badge-good"
@@ -1993,7 +2062,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
         const cls = c.align === "num" ? "num" : c.align === "check" ? "check-cell" : "";
         return `<td${cls ? ` class="${cls}"` : ""}>${v}</td>`;
       }).join("");
-      const click = opts.rowHash ? ` onclick="location.hash='${opts.rowHash(item)}'"` : "";
+      const click = opts.rowHash ? ` onclick="navHash('${opts.rowHash(item)}')"` : "";
       return `<tr${click}>${tds}</tr>`;
     }).join("");
     const bar = opts.exportName
@@ -2018,7 +2087,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
     if (opts.onRowClick) {
       container.querySelectorAll("tbody tr").forEach((tr, i) => {
         tr.style.cursor = "pointer";
-        tr.onclick = () => opts.onRowClick(rows[i]);
+        tr.onclick = () => { if (hasTextSelection()) return; opts.onRowClick(rows[i]); };
       });
     }
     if (opts.onDraw) opts.onDraw(container, rows);

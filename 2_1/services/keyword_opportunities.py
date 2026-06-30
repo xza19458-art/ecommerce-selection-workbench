@@ -329,8 +329,10 @@ def _keyword_opportunity_warehouse_select(where_sql: str, having_sql: str) -> st
 def _build_filters(*, keyword: str | None, table_alias: str = "k", placeholder: str = "%s") -> tuple[str, list[Any]]:
     if not keyword:
         return "", []
-    like = f"%{keyword.strip()}%"
-    return f"WHERE {table_alias}.keyword LIKE {placeholder}", [like]
+    # 关键词机会走 DuckDB 仓库（dim_keywords），而 DuckDB 的 LIKE **区分大小写**（不同于
+    # MySQL 的 ci collation）。两侧都 LOWER() 统一不区分大小写，MySQL/DuckDB 路径通用。
+    like = f"%{keyword.strip().lower()}%"
+    return f"WHERE LOWER({table_alias}.keyword) LIKE {placeholder}", [like]
 
 
 def _build_having(

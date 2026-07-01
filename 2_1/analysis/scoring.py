@@ -25,7 +25,8 @@ def score_record(record: Any) -> ProductScore:
     competition_score = _score_competition(record.review_count)
     rating_score = _score_rating(record.rating)
     price_score = _score_price(record.price)
-    rank_score = _score_rank(record.organic_rank)
+    rank_confidence = getattr(record, "rank_confidence", "unknown")
+    rank_score = _score_rank(record.organic_rank, rank_confidence)
 
     total = (
         demand_score * 0.25
@@ -43,8 +44,10 @@ def score_record(record: Any) -> ProductScore:
         f"评分 {record.rating:.1f}，评分质量得分 {rating_score:.0f}",
         f"价格 ${record.price:.2f}，价格带得分 {price_score:.0f}",
     ]
-    if record.organic_rank:
-        reasons.append(f"当前自然排名 {record.organic_rank}，排名得分 {rank_score:.0f}")
+    if record.organic_rank and _rank_confidence_is_usable(rank_confidence):
+        reasons.append(f"当前自然序位估算 {record.organic_rank}，序位得分 {rank_score:.0f}")
+    elif record.organic_rank:
+        reasons.append("当前搜索位置置信度不足，序位得分按中性处理")
     if record.is_deal:
         reasons.append("当前存在促销信号，需后续观察是否为短期拉升")
 
@@ -98,7 +101,9 @@ def _score_price(price: float | None) -> float:
     return 35.0
 
 
-def _score_rank(rank: int | None) -> float:
+def _score_rank(rank: int | None, confidence: str | None = None) -> float:
+    if confidence is not None and not _rank_confidence_is_usable(confidence):
+        return 50.0
     if not rank:
         return 50.0
     if rank <= 10:
@@ -106,6 +111,10 @@ def _score_rank(rank: int | None) -> float:
     if rank >= 100:
         return 25.0
     return _clamp(100 - (rank - 10) / 90 * 75)
+
+
+def _rank_confidence_is_usable(confidence: str | None) -> bool:
+    return confidence in {None, "", "page_first", "batch_continuous"}
 
 
 def _clamp(value: float, min_value: float = 0.0, max_value: float = 100.0) -> float:

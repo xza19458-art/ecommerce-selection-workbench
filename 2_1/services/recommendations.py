@@ -19,7 +19,7 @@ RECOMMENDATION_COLUMNS = {
     "rating": "评分",
     "review_count": "评论数",
     "monthly_bought": "近月购买量",
-    "organic_rank": "自然排名",
+    "organic_rank": "自然序位估算",
     "is_deal": "是否促销",
     "score_date": "评分日期",
     "reason": "推荐理由",

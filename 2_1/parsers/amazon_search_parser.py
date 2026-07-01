@@ -40,7 +40,11 @@ DISPLAY_FIELDS = {
     "is_deal": "是否促销",
     "is_sponsored": "是否广告",
     "page_no": "页码",
-    "organic_rank": "自然排名",
+    "organic_rank": "自然序位估算",
+    "result_slot": "页面卡片位置",
+    "raw_result_position": "Amazon原始位置",
+    "page_organic_rank": "页内自然序位",
+    "rank_confidence": "排名置信度",
     "snapshot_at": "采集时间",
     "source_file": "来源文件",
     "quality_status": "数据质量",
@@ -77,6 +81,10 @@ class AmazonProductRecord:
     page_no: int | None
     organic_rank: int | None
     snapshot_at: datetime
+    result_slot: int | None = None
+    raw_result_position: int | None = None
+    page_organic_rank: int | None = None
+    rank_confidence: str = "unknown"
     source_file: str | None = None
     brand: str | None = None
     category_path: str | None = None
@@ -155,14 +163,24 @@ def parse_amazon_search_content(
     rejected: list[AmazonProductRecord] = []
     seen_asins: set[str] = set()
 
-    for item in _iter_product_items(soup):
+    page_organic_counter = 0
+    for result_slot, item in enumerate(_iter_product_items(soup), start=1):
         record = _parse_item(
             item,
             marketplace=marketplace,
             snapshot_at=snapshot,
             source_file=source_file,
             page_no=page_no,
+            result_slot=result_slot,
         )
+        if not record.is_sponsored:
+            page_organic_counter += 1
+            record.page_organic_rank = page_organic_counter
+            record.organic_rank = page_organic_counter
+            record.rank_confidence = "page_first" if page_no == 1 else "page_local"
+        else:
+            record.rank_confidence = "sponsored"
+
         if record.asin in seen_asins:
             record.reject_reasons.append("重复ASIN")
         else:
@@ -243,6 +261,7 @@ def _parse_item(
     snapshot_at: datetime,
     source_file: str | None,
     page_no: int | None,
+    result_slot: int,
 ) -> AmazonProductRecord:
     asin = (item.get("data-asin") or "").strip().upper()
     title = _text_first(item, ["h2 span", "h2 a span", "h2"])
@@ -252,7 +271,7 @@ def _parse_item(
     rating = _extract_rating(item)
     review_count = _extract_review_count(item)
     monthly_bought = _extract_monthly_bought(item)
-    organic_rank = _extract_rank(item)
+    raw_result_position = _extract_rank(item)
     is_sponsored = _is_sponsored(item)
     is_deal = bool(item.select_one(".a-badge-text, .s-label-popover-default, [aria-label*='deal' i]"))
 
@@ -269,7 +288,11 @@ def _parse_item(
         is_deal=is_deal,
         is_sponsored=is_sponsored,
         page_no=page_no,
-        organic_rank=organic_rank,
+        organic_rank=None,
+        result_slot=result_slot,
+        raw_result_position=raw_result_position,
+        page_organic_rank=None,
+        rank_confidence="unknown",
         snapshot_at=snapshot_at,
         source_file=source_file,
     )

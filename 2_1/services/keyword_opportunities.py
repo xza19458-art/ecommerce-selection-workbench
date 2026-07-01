@@ -457,7 +457,7 @@ def _build_reason(row: dict[str, Any]) -> str:
             parts.append("价格偏高，需验证转化和履约成本")
 
     if top10_count:
-        parts.append(f"已有 {top10_count} 个商品进入自然排名前 10")
+        parts.append(f"已有 {top10_count} 个商品进入自然序位估算前 10")
     if product_count and sponsored_count / product_count >= 0.4:
         parts.append("广告/赞助占比较高，需关注投放压力")
 

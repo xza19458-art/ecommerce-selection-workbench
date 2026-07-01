@@ -25,6 +25,14 @@ class IngestionSummary:
     rejected_reasons: dict[str, int]
 
 
+@dataclass(frozen=True)
+class _ParsedPage:
+    order: int
+    page_no: int | None
+    records: list[AmazonProductRecord]
+    rejected_records: list[AmazonProductRecord]
+
+
 def parse_html_files(
     html_files: Iterable[str | Path],
     *,
@@ -35,15 +43,24 @@ def parse_html_files(
 ) -> tuple[list[AmazonProductRecord], list[AmazonProductRecord]]:
     valid_records: list[AmazonProductRecord] = []
     rejected_records: list[AmazonProductRecord] = []
+    parsed_pages: list[_ParsedPage] = []
     seen: set[tuple[str, datetime]] = set()
 
-    for html_file in html_files:
+    for order, html_file in enumerate(html_files):
         result = parse_amazon_search_html(
             html_file,
             keyword=keyword,
             marketplace=marketplace,
             snapshot_at=snapshot_at,
             require_complete=require_complete,
+        )
+        parsed_pages.append(
+            _ParsedPage(
+                order=order,
+                page_no=_page_no_from_records(result.records, result.rejected_records),
+                records=result.records,
+                rejected_records=result.rejected_records,
+            )
         )
         for record in result.records:
             key = (record.asin, record.snapshot_at)
@@ -55,6 +72,7 @@ def parse_html_files(
             valid_records.append(record)
         rejected_records.extend(result.rejected_records)
 
+    _normalize_batch_organic_ranks(parsed_pages)
     return valid_records, rejected_records
 
 
@@ -131,6 +149,67 @@ def count_rejected_reasons(records: Iterable[AmazonProductRecord]) -> dict[str, 
         for reason in record.reject_reasons:
             counts[reason] = counts.get(reason, 0) + 1
     return dict(sorted(counts.items(), key=lambda item: item[1], reverse=True))
+
+
+def _page_no_from_records(
+    records: list[AmazonProductRecord],
+    rejected_records: list[AmazonProductRecord],
+) -> int | None:
+    for record in [*records, *rejected_records]:
+        if record.page_no is not None:
+            return record.page_no
+    return None
+
+
+def _normalize_batch_organic_ranks(parsed_pages: list[_ParsedPage]) -> None:
+    """Convert page-local organic positions into conservative batch-level ranks.
+
+    `organic_rank` is an estimate, not Amazon's internal ranking. We only continue
+    ranks across pages when the batch starts at page 1 and page numbers are
+    consecutive; otherwise we clear the global rank to avoid false top-10 signals.
+    Raw page-local metadata remains in raw_json via record.to_storage_dict().
+    """
+
+    pages = [page for page in parsed_pages if page.records or page.rejected_records]
+    if not pages:
+        return
+
+    sorted_pages = sorted(
+        pages,
+        key=lambda page: (
+            page.page_no if page.page_no is not None else 1_000_000 + page.order,
+            page.order,
+        ),
+    )
+    expected_page = 1
+    offset = 0
+    continuous = True
+
+    for page in sorted_pages:
+        natural_records = sorted(
+            [
+                record
+                for record in [*page.records, *page.rejected_records]
+                if not record.is_sponsored and record.page_organic_rank is not None
+            ],
+            key=lambda record: (record.page_organic_rank or 1_000_000, record.result_slot or 1_000_000),
+        )
+        if not natural_records:
+            continue
+
+        if continuous and page.page_no == expected_page:
+            confidence = "batch_continuous" if len(sorted_pages) > 1 else "page_first"
+            for record in natural_records:
+                record.organic_rank = offset + int(record.page_organic_rank or 0)
+                record.rank_confidence = confidence
+            offset += max(int(record.page_organic_rank or 0) for record in natural_records)
+            expected_page += 1
+            continue
+
+        continuous = False
+        for record in natural_records:
+            record.organic_rank = None
+            record.rank_confidence = "page_gap"
 
 
 def _apply_product_translation(

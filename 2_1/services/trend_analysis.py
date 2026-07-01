@@ -53,10 +53,10 @@ class TrendAssessment:
 
 
 # 指标定义：key -> (中文名, 好转方向)。好转方向 +1 表示值增大为好转，
-# -1 表示值减小为好转（如自然排名），0 表示中性（不计入好坏）。
+# -1 表示值减小为好转（如自然序位估算），0 表示中性（不计入好坏）。
 _METRICS: tuple[tuple[str, str, int], ...] = (
     ("monthly_bought", "近月购买量", 1),
-    ("organic_rank", "自然排名", -1),
+    ("organic_rank", "自然序位估算", -1),
     ("price", "价格", 0),
     ("rating", "评分", 1),
     ("review_count", "评论数", 0),
@@ -209,7 +209,7 @@ def _is_stable(start: float, delta: float) -> bool:
 
 
 def _growth_score(metrics: list[MetricTrend], confidence_score: float) -> tuple[float, float]:
-    """由月购买量与自然排名的改善程度计算增长分。
+    """由月购买量与自然序位估算的改善程度计算增长分。
 
     返回 (growth_score, raw_growth)。raw_growth ∈ [-1, 1]，
     growth_score = clamp(50 + raw_growth * 50 * confidence_score, 0, 100)。
@@ -224,7 +224,7 @@ def _growth_score(metrics: list[MetricTrend], confidence_score: float) -> tuple[
 
     rank = by_key.get("organic_rank")
     if rank and rank.change_ratio is not None:
-        # 排名相对下降（change_ratio 为负）= 好转，取反号成为正信号。
+        # 自然序位估算相对下降（change_ratio 为负）= 好转，取反号成为正信号。
         signals.append(_clamp_unit(-rank.change_ratio / _GROWTH_FULL_SCALE))
 
     raw_growth = sum(signals) / len(signals) if signals else 0.0
@@ -234,7 +234,7 @@ def _growth_score(metrics: list[MetricTrend], confidence_score: float) -> tuple[
 
 
 def _promo_warning(rows: list[dict[str, Any]], metrics: list[MetricTrend]) -> str | None:
-    """最新快照在促销且短期需求/排名大幅改善时，提示疑似促销拉升。"""
+    """最新快照在促销且短期需求/自然序位大幅改善时，提示疑似促销拉升。"""
     if not rows:
         return None
     if not _truthy(rows[-1].get("is_deal")):
@@ -245,7 +245,7 @@ def _promo_warning(rows: list[dict[str, Any]], metrics: list[MetricTrend]) -> st
     sharp_demand = bool(demand and demand.change_ratio is not None and demand.change_ratio >= 0.30)
     sharp_rank = bool(rank and rank.change_ratio is not None and rank.change_ratio <= -0.30)
     if sharp_demand or sharp_rank:
-        return "最新快照处于促销，且需求/排名短期大幅改善，疑似短期促销拉升，需观察促销结束后是否回落。"
+        return "最新快照处于促销，且需求/自然序位短期大幅改善，疑似短期促销拉升，需观察促销结束后是否回落。"
     return None
 
 

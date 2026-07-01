@@ -83,6 +83,230 @@ function scoreBadge(score) {
 function displayTitle(row, fallback = "—") {
   return row?.title_zh || row?.title || row?.title_original || fallback;
 }
+
+const CLIENT_TRANSLATE_SOURCE_LANG = "en";
+const CLIENT_TRANSLATE_TARGET_LANG = "zh";
+const CLIENT_TRANSLATE_CACHE_KEY = "amazon2.clientTranslateCache.v1";
+const CLIENT_TRANSLATE_MAX_NODES = 80;
+const CLIENT_TRANSLATE_MAX_CHARS = 5000;
+const CLIENT_TRANSLATE_SKIP_SELECTOR = [
+  "button", "input", "textarea", "select", "option", "code", "pre",
+  "script", "style", ".btn", ".chip", ".badge", ".pager", ".table-bar",
+  ".filters", ".actions", ".agent-config-form", ".agent-composer",
+  ".sidebar", ".topbar"
+].join(",");
+
+const clientTranslateState = {
+  enabled: false,
+  busy: false,
+  translator: null,
+  scheduled: null,
+  observer: null,
+  translatedNodes: new Set(),
+  originalText: new WeakMap(),
+  cache: loadClientTranslateCache(),
+};
+
+function loadClientTranslateCache() {
+  try {
+    const raw = localStorage.getItem(CLIENT_TRANSLATE_CACHE_KEY);
+    const rows = raw ? JSON.parse(raw) : [];
+    return new Map(Array.isArray(rows) ? rows : []);
+  } catch {
+    return new Map();
+  }
+}
+
+function saveClientTranslateCache() {
+  try {
+    const rows = Array.from(clientTranslateState.cache.entries()).slice(-500);
+    localStorage.setItem(CLIENT_TRANSLATE_CACHE_KEY, JSON.stringify(rows));
+  } catch {
+    // localStorage may be unavailable in embedded shells.
+  }
+}
+
+function getClientTranslatorApi() {
+  if (window.Translator && typeof window.Translator.create === "function") {
+    return window.Translator;
+  }
+  return null;
+}
+
+async function ensureClientTranslator() {
+  if (clientTranslateState.translator) return clientTranslateState.translator;
+  const api = getClientTranslatorApi();
+  if (!api) {
+    throw new Error("当前浏览器不支持 Chrome 内置 Translator API，请用支持该 API 的桌面 Chrome 打开本页面。");
+  }
+  const opts = {
+    sourceLanguage: CLIENT_TRANSLATE_SOURCE_LANG,
+    targetLanguage: CLIENT_TRANSLATE_TARGET_LANG,
+  };
+  if (typeof api.availability === "function") {
+    const availability = await api.availability(opts);
+    if (availability === "unavailable") {
+      throw new Error("当前 Chrome 暂不可用 en→zh 内置翻译模型。");
+    }
+    if (availability === "downloadable" || availability === "downloading") {
+      notice("首次使用需要下载 Chrome 内置翻译模型，请稍等。");
+    }
+  }
+  clientTranslateState.translator = await api.create({
+    ...opts,
+    monitor(monitor) {
+      if (!monitor?.addEventListener) return;
+      monitor.addEventListener("downloadprogress", (event) => {
+        const percent = Math.round(Number(event.loaded || 0) * 100);
+        notice(`Chrome 翻译模型下载中 ${percent}%`);
+      });
+    },
+  });
+  return clientTranslateState.translator;
+}
+
+function normalizeClientTranslateText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function shouldClientTranslateText(text, parent) {
+  const value = normalizeClientTranslateText(text);
+  if (value.length < 12) return false;
+  if (parent?.closest?.(CLIENT_TRANSLATE_SKIP_SELECTOR)) return false;
+  if (/^https?:\/\//i.test(value)) return false;
+  if (/^B[A-Z0-9]{9}$/i.test(value)) return false;
+  if (!/[A-Za-z][A-Za-z'-]+/.test(value)) return false;
+  const words = value.match(/[A-Za-z][A-Za-z'-]+/g) || [];
+  if (words.length < 2) return false;
+  return true;
+}
+
+function collectClientTranslateNodes(root = content) {
+  const nodes = [];
+  let chars = 0;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!shouldClientTranslateText(node.nodeValue, node.parentElement)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  while (nodes.length < CLIENT_TRANSLATE_MAX_NODES) {
+    const node = walker.nextNode();
+    if (!node) break;
+    const text = normalizeClientTranslateText(node.nodeValue);
+    if (chars + text.length > CLIENT_TRANSLATE_MAX_CHARS) break;
+    chars += text.length;
+    nodes.push(node);
+  }
+  return nodes;
+}
+
+async function translateClientText(text) {
+  const source = normalizeClientTranslateText(text);
+  const key = `${CLIENT_TRANSLATE_SOURCE_LANG}|${CLIENT_TRANSLATE_TARGET_LANG}|${source}`;
+  if (clientTranslateState.cache.has(key)) return clientTranslateState.cache.get(key);
+  const translator = await ensureClientTranslator();
+  const translated = await translator.translate(source);
+  clientTranslateState.cache.set(key, translated);
+  saveClientTranslateCache();
+  return translated;
+}
+
+async function translateCurrentView() {
+  if (!clientTranslateState.enabled || clientTranslateState.busy) return;
+  clientTranslateState.busy = true;
+  setClientTranslateButton("翻译中…", true);
+  try {
+    await ensureClientTranslator();
+    const nodes = collectClientTranslateNodes();
+    if (!nodes.length) {
+      setClientTranslateButton("还原原文", false, true);
+      return;
+    }
+    let changed = 0;
+    for (const node of nodes) {
+      if (!clientTranslateState.originalText.has(node)) {
+        clientTranslateState.originalText.set(node, node.nodeValue);
+      }
+      const translated = await translateClientText(node.nodeValue);
+      if (translated && translated !== node.nodeValue) {
+        node.nodeValue = translated;
+        clientTranslateState.translatedNodes.add(node);
+        changed += 1;
+      }
+    }
+    setClientTranslateButton("还原原文", false, true);
+    if (changed) notice(`已前端翻译 ${changed} 段可见英文内容`);
+  } catch (err) {
+    clientTranslateState.enabled = false;
+    stopClientTranslateObserver();
+    setClientTranslateButton("译中文");
+    notice(err.message || "前端翻译失败", "bad");
+  } finally {
+    clientTranslateState.busy = false;
+  }
+}
+
+function restoreClientTranslations() {
+  for (const node of clientTranslateState.translatedNodes) {
+    if (node.isConnected && clientTranslateState.originalText.has(node)) {
+      node.nodeValue = clientTranslateState.originalText.get(node);
+    }
+  }
+  clientTranslateState.translatedNodes.clear();
+}
+
+function scheduleClientTranslate(delay = 160) {
+  if (!clientTranslateState.enabled) return;
+  clearTimeout(clientTranslateState.scheduled);
+  clientTranslateState.scheduled = setTimeout(() => { translateCurrentView(); }, delay);
+}
+
+function startClientTranslateObserver() {
+  if (clientTranslateState.observer) return;
+  clientTranslateState.observer = new MutationObserver(() => {
+    if (!clientTranslateState.busy) scheduleClientTranslate(260);
+  });
+  clientTranslateState.observer.observe(content, {
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+}
+
+function stopClientTranslateObserver() {
+  if (!clientTranslateState.observer) return;
+  clientTranslateState.observer.disconnect();
+  clientTranslateState.observer = null;
+}
+
+function setClientTranslateButton(label, disabled = false, active = false) {
+  const btn = document.getElementById("client-translate-btn");
+  if (!btn) return;
+  btn.textContent = label;
+  btn.disabled = disabled;
+  btn.classList.toggle("btn-active", active);
+}
+
+function initClientTranslationControls() {
+  const btn = document.getElementById("client-translate-btn");
+  if (!btn) return;
+  btn.onclick = async () => {
+    if (clientTranslateState.enabled) {
+      clientTranslateState.enabled = false;
+      stopClientTranslateObserver();
+      restoreClientTranslations();
+      setClientTranslateButton("译中文");
+      notice("已还原当前页面原文");
+      return;
+    }
+    clientTranslateState.enabled = true;
+    startClientTranslateObserver();
+    await translateCurrentView();
+  };
+}
 function isDeal(v) {
   return v === true || v === 1 || v === "1" || v === "是" || String(v).toLowerCase() === "true";
 }
@@ -286,7 +510,7 @@ async function viewRecommendations() {
           <option value="rating">评分</option>
           <option value="review_count">评论数</option>
           <option value="monthly_bought">近月购买</option>
-          <option value="organic_rank">自然排名</option>
+          <option value="organic_rank">自然序位估算</option>
         </select>
         <select id="rec-dir" class="sel">
           <option value="desc">降序</option>
@@ -452,7 +676,7 @@ async function loadProducts(resetPage = false) {
       { key: "rating", label: "评分", align: "num", numeric: true, render: (r) => fmt.num(r.rating), sortVal: (r) => r.rating },
       { key: "review_count", label: "评论", align: "num", numeric: true, render: (r) => fmt.int(r.review_count), sortVal: (r) => r.review_count },
       { key: "monthly_bought", label: "近月购买", align: "num", numeric: true, render: (r) => fmt.int(r.monthly_bought), sortVal: (r) => r.monthly_bought },
-      { key: "organic_rank", label: "排名", align: "num", numeric: true, render: (r) => fmt.int(r.organic_rank), sortVal: (r) => r.organic_rank },
+      { key: "organic_rank", label: "序位估算", align: "num", numeric: true, render: (r) => fmt.int(r.organic_rank), sortVal: (r) => r.organic_rank },
     ], rows, { rowHash: (r) => `#/product/${encodeURIComponent(r.asin)}`, defaultSort: { key: "total_score", dir: -1 }, exportName: "商品池" });
     pager.innerHTML = renderPager("prod-pager", page, [20, 50, 100]);
     bindPager("prod-pager", productState, page, loadProducts);
@@ -988,7 +1212,7 @@ function confBadge(c) {
   return `<span class="badge ${cls}">置信度 ${escapeHtml(c)}</span>`;
 }
 
-/* 左轴可切换的指标（自然排名固定在右轴，避免不同量纲挤在一起）。 */
+/* 左轴可切换的指标（自然序位估算固定在右轴，避免不同量纲挤在一起）。 */
 const TREND_LEFT_METRICS = [
   { key: "price", label: "价格", color: "#4c8dff" },
   { key: "rating", label: "评分", color: "#3fb950" },
@@ -1029,11 +1253,11 @@ function renderTrendChart(snaps) {
       backgroundColor: "transparent",
       tooltip: {
         trigger: "axis",
-        // 带单位的中文 tooltip：价格 $、评分 1 位小数、排名整数、其余整数。
+        // 带单位的中文 tooltip：价格 $、评分 1 位小数、序位估算整数、其余整数。
         formatter: (params) => {
           if (!params || !params.length) return "";
           const lines = params.map((p) => {
-            const isRank = String(p.seriesName).indexOf("自然排名") === 0;
+            const isRank = String(p.seriesName).indexOf("自然序位估算") === 0;
             const val = isRank ? fmt.int(p.value) : fmtLeft(left.key, p.value);
             return `${p.marker}${escapeHtml(String(p.seriesName))}: ${val}`;
           });
@@ -1046,11 +1270,11 @@ function renderTrendChart(snaps) {
       xAxis: { type: "category", data: x, axisLabel: { color: "#9aa7b4" } },
       yAxis: [
         { type: "value", name: left.label, axisLabel: { color: "#9aa7b4" }, splitLine: { lineStyle: { color: "#29313c" } } },
-        { type: "value", name: "排名", inverse: true, axisLabel: { color: "#9aa7b4" }, splitLine: { show: false } },
+        { type: "value", name: "序位估算", inverse: true, axisLabel: { color: "#9aa7b4" }, splitLine: { show: false } },
       ],
       series: [
         { name: left.label, type: "line", yAxisIndex: 0, smooth: true, showSymbol: true, connectNulls: true, itemStyle: { color: left.color }, data: snaps.map((s) => numOrNull(s[left.key])) },
-        { name: "自然排名（越低越好）", type: "line", yAxisIndex: 1, smooth: true, showSymbol: true, connectNulls: true, itemStyle: { color: "#d29922" }, data: snaps.map((s) => numOrNull(s.organic_rank)) },
+        { name: "自然序位估算（越低越好）", type: "line", yAxisIndex: 1, smooth: true, showSymbol: true, connectNulls: true, itemStyle: { color: "#d29922" }, data: snaps.map((s) => numOrNull(s.organic_rank)) },
       ],
     }, true);
   }
@@ -1061,7 +1285,7 @@ function renderTrendChart(snaps) {
 
 function snapTable(snaps) {
   return tableHtml(
-    ["采集时间", "价格", "评分", "评论", "近月购买", "排名", "促销"],
+    ["采集时间", "价格", "评分", "评论", "近月购买", "序位估算", "促销"],
     snaps.map((s) => ({
       cells: [
         fmt.text(s.snapshot_at),
@@ -1134,7 +1358,7 @@ function renderCompareTable(items) {
     { label: "评分", get: (it) => numOrNull(it.p.rating), render: (it) => fmt.num(it.p.rating), best: "max" },
     { label: "评论数（越低竞争越小）", get: (it) => numOrNull(it.p.review_count), render: (it) => fmt.int(it.p.review_count), best: "min" },
     { label: "近月购买", get: (it) => numOrNull(it.p.monthly_bought), render: (it) => fmt.int(it.p.monthly_bought), best: "max" },
-    { label: "自然排名", get: (it) => numOrNull(it.p.organic_rank), render: (it) => fmt.int(it.p.organic_rank), best: "min" },
+    { label: "自然序位估算", get: (it) => numOrNull(it.p.organic_rank), render: (it) => fmt.int(it.p.organic_rank), best: "min" },
     { label: "趋势置信度", render: (it) => (it.trend ? `${escapeHtml(it.trend.confidence)}（样本 ${it.trend.sample_size}）` : "—") },
     { label: "最近采集", render: (it) => fmt.text(it.p.snapshot_at || it.p.last_seen_at) },
   ];
@@ -1160,6 +1384,21 @@ function renderCompareTable(items) {
 /* ---------- 视图：关键词机会 ---------- */
 async function viewKeywords() {
   content.innerHTML = `
+    <details id="kw-primary-panel" class="panel kw-primary-panel">
+      <summary>一级关键词分组（点击展开）</summary>
+      <p class="kw-primary-tip">把相同中心词的关键词归为一组，如 mini squishy / cow squishy → <b>squishy</b>，gift for man / man → <b>man</b>。基于机会列表前 500 条聚合，一级带组内平均机会分（≥70 标「蓝海赛道」、按机会排序），点一级看二级关键词，再点二级看详情。</p>
+      <div class="kw-primary-controls">
+        <span class="kw-ctrl-label">归类方式</span>
+        <button class="chip kw-mode active" data-mode="tail">词尾</button>
+        <button class="chip kw-mode" data-mode="first">词首</button>
+        <button class="chip kw-mode" data-mode="shared">共享词</button>
+        <span class="queue-spacer"></span>
+        <button class="btn btn-sm" id="kw-custom-group">自定义分组</button>
+        <button class="btn btn-sm" id="kw-semantic-group">语义分组</button>
+      </div>
+      <div id="kw-primary-chips" class="kw-primary-chips"></div>
+      <div id="kw-secondary" class="kw-secondary"></div>
+    </details>
     <div class="filters">
       <input id="kw-filter" placeholder="关键词过滤" />
       <input id="kw-min-products" type="number" placeholder="最少商品数" />
@@ -1170,6 +1409,29 @@ async function viewKeywords() {
     <div id="kw-table"></div>
     <div id="kw-pager-wrap"></div>
     <div id="kw-detail"></div>`;
+  const primaryPanel = document.getElementById("kw-primary-panel");
+  primaryPanel.addEventListener("toggle", () => {
+    if (primaryPanel.open && !primaryPanel.dataset.loaded) {
+      primaryPanel.dataset.loaded = "1";
+      keywordAllRows = null; // 每次进入页面首开重拉，避免陈旧
+      renderKeywordPrimaryGroups();
+    }
+  });
+  primaryPanel.querySelectorAll(".kw-mode").forEach((b) => {
+    b.onclick = () => {
+      keywordGroupMode = b.dataset.mode;
+      primaryPanel.querySelectorAll(".kw-mode").forEach((x) => x.classList.toggle("active", x === b));
+      renderKeywordPrimaryGroups();
+    };
+  });
+  document.getElementById("kw-custom-group").onclick = () => openPlaceholderDialog(
+    "自定义分组",
+    "手动把关键词归入你自定义的品类（可命名、增删、本地持久化复用），不受字符串归类限制——更贴合你的选品逻辑。"
+  );
+  document.getElementById("kw-semantic-group").onclick = () => openPlaceholderDialog(
+    "语义分组",
+    "用语义相似度（embedding / 内置 AI 助手）把含义相近的词聚到一起，如 squishy / stress ball / fidget toy 归为一类，突破纯字符串归类的限制（需联网/调模型）。"
+  );
   document.getElementById("kw-filter").value = keywordState.keyword;
   document.getElementById("kw-min-products").value = keywordState.minProducts;
   document.getElementById("kw-apply").onclick = () => loadKeywords(true);
@@ -1224,13 +1486,139 @@ async function loadKeywords(resetPage = false) {
     { key: "avg_monthly_bought", label: "需求", align: "num", numeric: true, render: (r) => fmt.int(r.avg_monthly_bought), sortVal: (r) => r.avg_monthly_bought },
     { key: "avg_review_count", label: "竞争", align: "num", numeric: true, render: (r) => fmt.int(r.avg_review_count), sortVal: (r) => r.avg_review_count },
     { key: "avg_price", label: "价格带", align: "num", numeric: true, render: (r) => fmt.money(r.avg_price), sortVal: (r) => r.avg_price },
-    { key: "avg_organic_rank", label: "自然排名", align: "num", numeric: true, render: (r) => fmt.num(r.avg_organic_rank, 0), sortVal: (r) => r.avg_organic_rank },
+    { key: "avg_organic_rank", label: "自然序位估算", align: "num", numeric: true, render: (r) => fmt.num(r.avg_organic_rank, 0), sortVal: (r) => r.avg_organic_rank },
   ], rows, { defaultSort: { key: "opportunity_score", dir: -1 }, exportName: "关键词机会", onRowClick: showKeywordDetail });
     pager.innerHTML = renderPager("kw-pager", page, [20, 50, 100]);
     bindPager("kw-pager", keywordState, page, loadKeywords);
   } catch (err) {
     table.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
   }
+}
+
+/* ---------- 一级关键词分组（聚合机会 + 多种归类规则 + 占位入口） ---------- */
+let keywordGroupMode = "tail";   // tail 词尾 / first 词首 / shared 共享词
+let keywordAllRows = null;       // 缓存全量行，切换归类方式不重拉（进入页面首开会清空重拉）
+let keywordPrimaryGroups = new Map();
+
+const KW_STOPWORDS = new Set(["for", "the", "a", "an", "of", "with", "and", "to", "in", "on", "by", "my", "your"]);
+
+function kwTokens(kw) {
+  return String(kw || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+/* 简单单复数归一：去单个尾 s（不动 ss 结尾、长度>3），让 dog/dogs 等并组。 */
+function kwNorm(t) {
+  return (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) ? t.slice(0, -1) : t;
+}
+/* 归类键：词尾 / 词首 / 出现最多的非停用词。 */
+function kwGroupKey(kw, mode, freq) {
+  const toks = kwTokens(kw).map(kwNorm);
+  if (!toks.length) return "";
+  if (mode === "first") return toks[0];
+  if (mode === "shared") {
+    const pool = toks.filter((t) => !KW_STOPWORDS.has(t));
+    const cand = pool.length ? pool : toks;
+    let best = cand[0], bestF = -1;
+    cand.forEach((t) => { const f = freq.get(t) || 0; if (f >= bestF) { bestF = f; best = t; } });
+    return best;
+  }
+  return toks[toks.length - 1]; // tail
+}
+function kwGroupAgg(list) {
+  const opp = list.map((r) => Number(r.opportunity_score) || 0);
+  const avg = opp.length ? opp.reduce((a, b) => a + b, 0) / opp.length : 0;
+  const max = opp.length ? Math.max(...opp) : 0;
+  const products = list.reduce((a, r) => a + (Number(r.product_count) || 0), 0);
+  return { count: list.length, avg, max, products };
+}
+
+async function renderKeywordPrimaryGroups() {
+  const chips = document.getElementById("kw-primary-chips");
+  const sec = document.getElementById("kw-secondary");
+  if (!chips) return;
+  chips.innerHTML = `<div class="state"><div class="spinner"></div>分组中…</div>`;
+  if (sec) sec.innerHTML = "";
+  try {
+    if (!keywordAllRows) {
+      const page = normalizePage(await api(`/api/keywords/opportunities?limit=500&offset=0`), 500);
+      keywordAllRows = page.rows || [];
+    }
+    const rows = keywordAllRows;
+    const freq = new Map();
+    if (keywordGroupMode === "shared") {
+      for (const r of rows) {
+        for (const t of new Set(kwTokens(r.keyword).map(kwNorm))) freq.set(t, (freq.get(t) || 0) + 1);
+      }
+    }
+    const groups = new Map();
+    for (const r of rows) {
+      const p = kwGroupKey(r.keyword, keywordGroupMode, freq);
+      if (!p) continue;
+      if (!groups.has(p)) groups.set(p, []);
+      groups.get(p).push(r);
+    }
+    keywordPrimaryGroups = groups;
+    if (!groups.size) { chips.innerHTML = `<div class="state">暂无关键词数据。</div>`; return; }
+    // 按组平均机会分降序（赛道机会优先），并列按组大小
+    const sorted = [...groups.entries()]
+      .map(([p, list]) => [p, list, kwGroupAgg(list)])
+      .sort((a, b) => b[2].avg - a[2].avg || b[2].count - a[2].count || a[0].localeCompare(b[0]));
+    chips.innerHTML = sorted.map(([p, , agg]) =>
+      `<button class="chip kw-primary-chip" data-primary="${escapeHtml(p)}">` +
+        `${escapeHtml(p)} ${scoreBadge(Math.round(agg.avg))}` +
+        ` <span class="kw-grp-count">${agg.count}词·${fmt.int(agg.products)}品</span>` +
+        (agg.avg >= 70 ? ` <span class="badge badge-good">蓝海</span>` : "") +
+      `</button>`
+    ).join("");
+    chips.querySelectorAll(".kw-primary-chip").forEach((b) => { b.onclick = () => selectPrimary(b.dataset.primary, b); });
+    if (sec) sec.innerHTML = `<div class="state">点击上方一级关键词，查看其下二级关键词。</div>`;
+  } catch (err) {
+    chips.innerHTML = `<div class="state error">分组加载失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function selectPrimary(primary, btn) {
+  document.querySelectorAll(".kw-primary-chip").forEach((b) => b.classList.toggle("active", b === btn));
+  const sec = document.getElementById("kw-secondary");
+  if (!sec) return;
+  const list = (keywordPrimaryGroups.get(primary) || []).slice()
+    .sort((a, b) => Number(b.opportunity_score || 0) - Number(a.opportunity_score || 0));
+  const agg = kwGroupAgg(list);
+  sec.innerHTML =
+    `<div class="kw-secondary-head">一级「${escapeHtml(primary)}」· 平均机会 ${Math.round(agg.avg)} · 最高 ${Math.round(agg.max)} · ${agg.count} 个二级词 · 共 ${fmt.int(agg.products)} 商品</div>` +
+    `<div class="kw-secondary-chips">` + list.map((r) =>
+      `<button class="chip kw-secondary-chip" data-kw="${escapeHtml(r.keyword)}">${escapeHtml(r.keyword)} ${scoreBadge(r.opportunity_score)}</button>`
+    ).join("") + `</div>`;
+  sec.querySelectorAll(".kw-secondary-chip").forEach((b) => {
+    const r = list.find((x) => x.keyword === b.dataset.kw);
+    b.onclick = () => {
+      showKeywordDetail(r);
+      const d = document.getElementById("kw-detail");
+      if (d) d.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+  });
+}
+
+/* 占位功能弹窗（自定义分组 / 语义分组未实现，先展示目标）。 */
+function openPlaceholderDialog(title, goal) {
+  const old = document.getElementById("kw-placeholder-dialog");
+  if (old) old.remove();
+  const m = document.createElement("div");
+  m.id = "kw-placeholder-dialog";
+  m.className = "modal-backdrop";
+  m.innerHTML = `
+    <section class="modal-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+      <div class="modal-head">
+        <h2>${escapeHtml(title)} <span class="badge badge-warn">未实现 · 开发中</span></h2>
+        <button type="button" class="btn btn-sm" data-close>关闭</button>
+      </div>
+      <div class="kw-placeholder-body">
+        <div class="kw-placeholder-label">目标</div>
+        <p>${escapeHtml(goal)}</p>
+      </div>
+    </section>`;
+  m.addEventListener("click", (e) => { if (e.target === m) m.remove(); });
+  document.body.appendChild(m);
+  m.querySelector("[data-close]").onclick = () => m.remove();
 }
 
 /* 关键词机会详情展开：机会原因 / 风险警告 / 进入策略 + 该词下商品下钻。 */
@@ -1254,9 +1642,9 @@ function showKeywordDetail(r) {
         <div><span>竞争分</span>${fmt.num(r.avg_competition_score, 0)}</div>
         <div><span>评分分</span>${fmt.num(r.avg_rating_score, 0)}</div>
         <div><span>价格分</span>${fmt.num(r.avg_price_score, 0)}</div>
-        <div><span>排名分</span>${fmt.num(r.avg_rank_score, 0)}</div>
+        <div><span>序位分</span>${fmt.num(r.avg_rank_score, 0)}</div>
         <div><span>价格区间</span>${fmt.money(r.min_price)}–${fmt.money(r.max_price)}</div>
-        <div><span>前10名</span>${fmt.int(r.top10_count)}</div>
+        <div><span>估算前10</span>${fmt.int(r.top10_count)}</div>
         <div><span>广告位</span>${fmt.int(r.sponsored_count)}</div>
         <div><span>最近快照</span>${fmt.text(r.latest_snapshot_at)}</div>
       </div>
@@ -1305,7 +1693,7 @@ async function loadKeywordProducts() {
       { key: "rating", label: "评分", align: "num", numeric: true, render: (item) => fmt.num(item.rating), sortVal: (item) => item.rating },
       { key: "review_count", label: "评论", align: "num", numeric: true, render: (item) => fmt.int(item.review_count), sortVal: (item) => item.review_count },
       { key: "monthly_bought", label: "近月购买", align: "num", numeric: true, render: (item) => fmt.int(item.monthly_bought), sortVal: (item) => item.monthly_bought },
-      { key: "organic_rank", label: "排名", align: "num", numeric: true, render: (item) => fmt.int(item.organic_rank), sortVal: (item) => item.organic_rank },
+      { key: "organic_rank", label: "序位估算", align: "num", numeric: true, render: (item) => fmt.int(item.organic_rank), sortVal: (item) => item.organic_rank },
     ], rows, { rowHash: (item) => `#/product/${encodeURIComponent(item.asin)}`, defaultSort: { key: "total_score", dir: -1 }, exportName: `关键词-${keyword}-商品` });
     pager.innerHTML = renderPager("kw-products-pager", page, [10, 25, 50]);
     bindPager("kw-products-pager", keywordProductState, page, loadKeywordProducts);
@@ -2091,6 +2479,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
       });
     }
     if (opts.onDraw) opts.onDraw(container, rows);
+    scheduleClientTranslate();
   }
   draw();
 }
@@ -2338,7 +2727,7 @@ const SETTINGS_FIELD_LABELS = {
   "analytics.custom_scoring.weights.competition": "竞争权重",
   "analytics.custom_scoring.weights.rating": "评分权重",
   "analytics.custom_scoring.weights.price": "价格权重",
-  "analytics.custom_scoring.weights.rank": "排名权重",
+  "analytics.custom_scoring.weights.rank": "序位权重",
   "analytics.custom_scoring.weights.growth": "增长权重",
 };
 
@@ -2385,7 +2774,7 @@ function renderSettings(s) {
       </div>
       <div class="set-weights">
         ${["demand", "competition", "rating", "price", "rank", "growth"].map((k) =>
-          `<label>${({demand:"需求权重",competition:"竞争权重",rating:"评分权重",price:"价格权重",rank:"排名权重",growth:"增长权重"})[k]}<input id="set-w-${k}" type="number" min="0" max="1" step="0.05" value="${escapeHtml(w[k])}" /></label>`
+          `<label>${({demand:"需求权重",competition:"竞争权重",rating:"评分权重",price:"价格权重",rank:"序位权重",growth:"增长权重"})[k]}<input id="set-w-${k}" type="number" min="0" max="1" step="0.05" value="${escapeHtml(w[k])}" /></label>`
         ).join("")}
       </div>
       <div class="set-hint">权重范围 0-1；增长权重在趋势第二步接入真实值前建议保持 0。</div>
@@ -2486,8 +2875,10 @@ async function router() {
   });
   try {
     await route.run(m);
+    scheduleClientTranslate();
   } catch (err) {
     errorState(err);
+    scheduleClientTranslate();
   }
 }
 
@@ -2516,6 +2907,7 @@ function initShellControls() {
   document.querySelectorAll(".nav-item").forEach((a) => {
     a.addEventListener("click", closeSidebarIfNarrow);
   });
+  initClientTranslationControls();
   window.addEventListener("resize", syncSidebarForViewport);
   document.addEventListener("keydown", handleGlobalShortcuts);
   syncSidebarForViewport();

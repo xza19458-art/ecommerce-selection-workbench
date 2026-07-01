@@ -60,8 +60,9 @@ def test_readonly_tool_schema_has_eight_tools() -> None:
 
 def test_operation_tool_schema_requires_confirmation() -> None:
     tools = get_operation_tool_definitions()
-    assert len(tools) == 3
+    assert len(tools) == 4
     assert {tool.name for tool in tools} == {
+        "open_amazon_page",
         "create_keyword_tracking",
         "set_keyword_tracking_status",
         "trigger_collection",
@@ -72,8 +73,8 @@ def test_operation_tool_schema_requires_confirmation() -> None:
 
 def test_agent_tool_schema_combines_readonly_and_operations() -> None:
     tools = get_agent_tool_definitions()
-    assert len(tools) == 11
-    assert sum(1 for tool in tools if tool.requires_confirmation) == 3
+    assert len(tools) == 12
+    assert sum(1 for tool in tools if tool.requires_confirmation) == 4
 
 
 def test_query_products_calls_controller_without_business_logic() -> None:
@@ -111,9 +112,10 @@ def test_trigger_collection_ignores_model_execute_flag() -> None:
     captured = {}
     old_runner = keyword_tracking_scheduler.run_keyword_tracking_scheduler
 
-    def fake_runner(*, execute, task_id=None):
+    def fake_runner(*, execute, task_id=None, controller=None):
         captured["execute"] = execute
         captured["task_id"] = task_id
+        captured["controller"] = controller
         return {"executed": execute, "task_id": task_id}
 
     keyword_tracking_scheduler.run_keyword_tracking_scheduler = fake_runner
@@ -124,7 +126,9 @@ def test_trigger_collection_ignores_model_execute_flag() -> None:
         keyword_tracking_scheduler.run_keyword_tracking_scheduler = old_runner
 
     assert result.ok is True
-    assert captured == {"execute": True, "task_id": 7}
+    assert captured["execute"] is True
+    assert captured["task_id"] == 7
+    assert captured["controller"] is executor.controller
 
 
 if __name__ == "__main__":

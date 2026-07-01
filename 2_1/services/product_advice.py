@@ -40,7 +40,7 @@ def selection_conclusion(product: dict, snapshots: list[dict]) -> str:
 
     if high_demand and high_competition:
         return (
-            "该商品需求强、排名靠前"
+            "该商品需求强、自然序位估算靠前"
             f"{'、评分较好' if good_rating else ''}，但评论数很高，头部竞争压力较大。"
             "适合作为对标款和差异化分析对象，不建议直接同质化进入。"
         )
@@ -69,7 +69,7 @@ def risk_text(product: dict, snapshots: list[dict]) -> str:
     if monthly_bought is not None and monthly_bought >= 10000 and review_count is not None and review_count >= 5000:
         risks.append("需求强但头部竞争强，不适合直接复制")
     if rank is not None and rank <= 10:
-        risks.append("自然排名靠前，说明该款已处于强曝光位置")
+        risks.append("自然序位估算靠前，说明该款可能已处于强曝光位置")
     if rating is not None and rating < 4.2:
         risks.append("评分偏低，可能存在质量或预期管理问题")
     if price is not None and price < 12:

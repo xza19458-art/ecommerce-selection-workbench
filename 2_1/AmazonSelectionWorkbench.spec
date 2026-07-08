@@ -35,7 +35,9 @@ hiddenimports = (
     # selenium 用 __getattr__ 懒加载子模块（如 webdriver.chrome.webdriver），静态分析抓不到，全量收。
     + collect_submodules("selenium")
     + collect_submodules("webdriver_manager")
-    + ["webview", "clr_loader", "bottle", "duckdb", "pymysql"]
+    + collect_submodules("pystray")
+    + collect_submodules("PIL")
+    + ["webview", "clr", "clr_loader", "bottle", "duckdb", "pymysql", "pystray", "PIL", "PIL.Image", "PIL.ImageDraw"]
 )
 
 datas = [

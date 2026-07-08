@@ -33,6 +33,7 @@ APP_BACKGROUND_COLOR = "#0b0e13"
 APP_TITLE_BAR_TEXT_COLOR = "#e9eef5"
 APP_TITLE_BAR_BORDER_COLOR = "#20262f"
 APP_ICON_RESOURCE = ("web", "app-icon.ico")
+TRAY_TOOLTIP = "Amazon 选品助手正在后台运行"
 
 logger = logging.getLogger("desktop_app")
 
@@ -143,6 +144,293 @@ def _apply_window_chrome_theme(window) -> None:
         logger.debug("设置 Windows 深色标题栏失败，继续使用系统默认外观。", exc_info=True)
 
 
+def _window_hwnd(window) -> int:
+    native = getattr(window, "native", None)
+    handle = getattr(native, "Handle", None)
+    if handle is None:
+        return 0
+    return int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle.ToInt32())
+
+
+def _winforms_close_choice(window) -> str | None:
+    """Show a small Windows dialog with exact Chinese action labels."""
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import clr
+
+        clr.AddReference("System.Drawing")
+        clr.AddReference("System.Windows.Forms")
+
+        from System.Drawing import Color, Font, FontStyle, Point, Size
+        from System.Windows.Forms import (
+            Button,
+            DialogResult,
+            Form,
+            FormBorderStyle,
+            FormStartPosition,
+            Label,
+        )
+
+        owner = getattr(window, "native", None)
+        form = Form()
+        form.Text = APP_TITLE
+        form.ClientSize = Size(460, 178)
+        form.FormBorderStyle = FormBorderStyle.FixedDialog
+        form.StartPosition = FormStartPosition.CenterParent if owner else FormStartPosition.CenterScreen
+        form.MaximizeBox = False
+        form.MinimizeBox = False
+        form.ControlBox = False
+        form.ShowInTaskbar = False
+        form.TopMost = owner is None
+        form.BackColor = Color.FromArgb(246, 248, 252)
+
+        title = Label()
+        title.Text = "关闭 Amazon 选品助手？"
+        title.AutoSize = False
+        title.Location = Point(24, 22)
+        title.Size = Size(410, 28)
+        title.Font = Font("Microsoft YaHei UI", 11, FontStyle.Bold)
+
+        detail = Label()
+        detail.Text = "隐藏后，后端会继续运行；可从任务托盘恢复窗口或退出程序。"
+        detail.AutoSize = False
+        detail.Location = Point(24, 58)
+        detail.Size = Size(410, 44)
+        detail.Font = Font("Microsoft YaHei UI", 9)
+
+        hide_button = Button()
+        hide_button.Text = "隐藏到任务托盘"
+        hide_button.Location = Point(142, 122)
+        hide_button.Size = Size(132, 34)
+        hide_button.DialogResult = DialogResult.Yes
+
+        exit_button = Button()
+        exit_button.Text = "退出程序"
+        exit_button.Location = Point(292, 122)
+        exit_button.Size = Size(110, 34)
+        exit_button.DialogResult = DialogResult.No
+
+        form.Controls.Add(title)
+        form.Controls.Add(detail)
+        form.Controls.Add(hide_button)
+        form.Controls.Add(exit_button)
+        form.AcceptButton = hide_button
+
+        result = form.ShowDialog(owner) if owner else form.ShowDialog()
+        form.Dispose()
+        if result == DialogResult.Yes:
+            return "hide"
+        if result == DialogResult.No:
+            return "exit"
+        return "hide"
+    except Exception:  # noqa: BLE001
+        logger.debug("WinForms 自定义关闭对话框不可用，尝试 TaskDialog。", exc_info=True)
+        return None
+
+
+def _task_dialog_close_choice(window) -> str | None:
+    """Show a Windows TaskDialog with custom button labels."""
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class TASKDIALOG_BUTTON(ctypes.Structure):
+            _fields_ = [
+                ("nButtonID", ctypes.c_int),
+                ("pszButtonText", wintypes.LPCWSTR),
+            ]
+
+        CALLBACK = ctypes.WINFUNCTYPE(
+            wintypes.HRESULT,
+            wintypes.HWND,
+            ctypes.c_uint,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            ctypes.c_longlong,
+        )
+
+        class TASKDIALOGCONFIG(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("hwndParent", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE),
+                ("dwFlags", ctypes.c_uint),
+                ("dwCommonButtons", ctypes.c_uint),
+                ("pszWindowTitle", wintypes.LPCWSTR),
+                ("hMainIcon", wintypes.HANDLE),
+                ("pszMainInstruction", wintypes.LPCWSTR),
+                ("pszContent", wintypes.LPCWSTR),
+                ("cButtons", ctypes.c_uint),
+                ("pButtons", ctypes.POINTER(TASKDIALOG_BUTTON)),
+                ("nDefaultButton", ctypes.c_int),
+                ("cRadioButtons", ctypes.c_uint),
+                ("pRadioButtons", ctypes.c_void_p),
+                ("nDefaultRadioButton", ctypes.c_int),
+                ("pszVerificationText", wintypes.LPCWSTR),
+                ("pszExpandedInformation", wintypes.LPCWSTR),
+                ("pszExpandedControlText", wintypes.LPCWSTR),
+                ("pszCollapsedControlText", wintypes.LPCWSTR),
+                ("hFooterIcon", wintypes.HANDLE),
+                ("pszFooter", wintypes.LPCWSTR),
+                ("pfCallback", CALLBACK),
+                ("lpCallbackData", ctypes.c_longlong),
+                ("cxWidth", ctypes.c_uint),
+            ]
+
+        hide_id = 1001
+        exit_id = 1002
+        buttons = (TASKDIALOG_BUTTON * 2)(
+            TASKDIALOG_BUTTON(hide_id, "隐藏到任务托盘"),
+            TASKDIALOG_BUTTON(exit_id, "退出程序"),
+        )
+        result = ctypes.c_int(0)
+        config = TASKDIALOGCONFIG()
+        config.cbSize = ctypes.sizeof(TASKDIALOGCONFIG)
+        config.hwndParent = wintypes.HWND(_window_hwnd(window))
+        config.dwFlags = 0x01000000  # size to content
+        config.pszWindowTitle = APP_TITLE
+        config.pszMainInstruction = "关闭 Amazon 选品助手？"
+        config.pszContent = "隐藏后，后端会继续运行；可从任务托盘恢复窗口或退出程序。"
+        config.cButtons = 2
+        config.pButtons = buttons
+        config.nDefaultButton = hide_id
+        hr = ctypes.windll.comctl32.TaskDialogIndirect(
+            ctypes.byref(config),
+            ctypes.byref(result),
+            None,
+            None,
+        )
+        if hr != 0:
+            return None
+        return {hide_id: "hide", exit_id: "exit"}.get(result.value, "hide")
+    except Exception:  # noqa: BLE001
+        logger.debug("TaskDialog 关闭对话框不可用。", exc_info=True)
+        return None
+
+
+def _show_close_choice(window) -> str:
+    if sys.platform != "win32":
+        return "exit"
+    return _winforms_close_choice(window) or _task_dialog_close_choice(window) or "hide"
+
+
+class DesktopShellController:
+    def __init__(self, window, base_url: str, icon_path: Path | None):
+        self.window = window
+        self.base_url = base_url
+        self.icon_path = icon_path
+        self.exiting = False
+        self.hidden_to_tray = False
+        self._tray_icon = None
+        self._tray_lock = threading.Lock()
+
+    def attach(self) -> None:
+        self.window.events.closing += self.on_closing
+
+    def on_closing(self) -> bool:
+        if self.exiting:
+            return True
+
+        choice = _show_close_choice(self.window)
+        if choice == "exit":
+            self.exiting = True
+            return True
+        if choice == "hide":
+            if self.hide_to_tray():
+                return False
+            _message_box_info(self.window, "无法创建任务托盘图标，已取消关闭。请查看 logs/desktop.log。")
+            return False
+        return False
+
+    def hide_to_tray(self) -> bool:
+        try:
+            self._ensure_tray_icon()
+            self.hidden_to_tray = True
+            self.window.hide()
+            self._notify_tray()
+            logger.info("窗口已隐藏到任务托盘。")
+            return True
+        except Exception:  # noqa: BLE001
+            logger.exception("隐藏到任务托盘失败")
+            return False
+
+    def restore_window(self, *_args) -> None:
+        try:
+            self.hidden_to_tray = False
+            self.window.show()
+            logger.info("窗口已从任务托盘恢复。")
+        except Exception:  # noqa: BLE001
+            logger.exception("从任务托盘恢复窗口失败")
+
+    def exit_from_tray(self, *_args) -> None:
+        logger.info("从任务托盘退出程序。")
+        self.exiting = True
+        try:
+            self.window.destroy()
+        except Exception:  # noqa: BLE001
+            logger.exception("从任务托盘退出窗口失败")
+
+    def stop_tray(self) -> None:
+        with self._tray_lock:
+            icon = self._tray_icon
+            self._tray_icon = None
+        if icon:
+            try:
+                icon.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("停止任务托盘图标失败。", exc_info=True)
+
+    def _ensure_tray_icon(self) -> None:
+        with self._tray_lock:
+            if self._tray_icon:
+                return
+
+            import pystray
+            from PIL import Image, ImageDraw
+
+            image = None
+            if self.icon_path and self.icon_path.exists():
+                image = Image.open(self.icon_path).convert("RGBA")
+            if image is None:
+                image = Image.new("RGBA", (64, 64), "#0b0e13")
+                draw = ImageDraw.Draw(image)
+                draw.polygon([(32, 8), (56, 54), (8, 54)], fill="#4d8dff")
+
+            menu = pystray.Menu(
+                pystray.MenuItem("打开窗口", self.restore_window, default=True),
+                pystray.MenuItem("退出程序", self.exit_from_tray),
+            )
+            self._tray_icon = pystray.Icon("amazon_selection_workbench", image, TRAY_TOOLTIP, menu)
+            self._tray_icon.run_detached()
+
+    def _notify_tray(self) -> None:
+        icon = self._tray_icon
+        if not icon:
+            return
+        try:
+            icon.notify("应用已隐藏到任务托盘。", APP_TITLE)
+        except Exception:  # noqa: BLE001
+            logger.debug("任务托盘通知不可用，忽略。", exc_info=True)
+
+
+def _message_box_info(window, text: str) -> None:
+    if sys.platform != "win32":
+        print(text)
+        return
+    import ctypes
+
+    ctypes.windll.user32.MessageBoxW(_window_hwnd(window), text, APP_TITLE, 0x00000040)
+
+
+def _on_window_started(window, controller: DesktopShellController) -> None:
+    _apply_window_chrome_theme(window)
+
+
 def serve_in_thread(port: int):
     """后台线程启动后端服务，返回 (server, thread)。调用方用 server.should_exit=True 停止。"""
     server = _make_server(port)
@@ -232,18 +520,24 @@ def main() -> int:
             min_size=(960, 640),
             background_color=APP_BACKGROUND_COLOR,
         )
+        controller = DesktopShellController(window, base_url, icon_path)
+        controller.attach()
         # 注意：数据相关报错（如 MySQL 未启动）由 Web 页内统一中文提示，不影响窗口启动。
         webview.start(
-            func=_apply_window_chrome_theme,
-            args=(window,),
+            func=_on_window_started,
+            args=(window, controller),
             icon=str(icon_path) if icon_path else None,
         )  # 阻塞直到窗口关闭
 
         logger.info("窗口已关闭，停止后端。")
+        controller.stop_tray()
         server.should_exit = True
         thread.join(timeout=5)
         return 0
     except Exception as exc:  # 兜底：任何启动异常都给中文提示、不裸抛栈
+        controller = locals().get("controller")
+        if controller:
+            controller.stop_tray()
         logger.exception("桌面壳启动失败")
         print(f"启动失败：{exc}（详见 logs/desktop.log）")
         return 1

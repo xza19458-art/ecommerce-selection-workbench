@@ -15,7 +15,7 @@ async function api(path) {
   } catch {
     throw new Error(`后端响应格式异常（HTTP ${resp.status}）`);
   }
-  if (!payload.ok) throw new Error(payload.message || `请求未成功（HTTP ${resp.status}）`);
+  if (!payload.ok) throw new Error(apiErrorMessage(payload, resp.status));
   return payload.data;
 }
 
@@ -31,8 +31,36 @@ async function apiSend(path, method, body) {
   } catch {
     throw new Error(`后端响应格式异常（HTTP ${resp.status}）`);
   }
-  if (!payload.ok) throw new Error(payload.message || `请求未成功（HTTP ${resp.status}）`);
+  if (!payload.ok) throw new Error(apiErrorMessage(payload, resp.status));
   return payload.data;
+}
+
+function apiErrorMessage(payload, status) {
+  if (payload && payload.message) return payload.message;
+  const detail = payload && payload.detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail.map((item) => {
+      const loc = Array.isArray(item.loc) ? item.loc.filter((x) => x !== "body").join(".") : "";
+      return `${loc ? loc + "：" : ""}${item.msg || "参数错误"}`;
+    }).join("；");
+  }
+  if (typeof detail === "string") return detail;
+  return `请求未成功（HTTP ${status}）`;
+}
+
+async function openCurrentPageInBrowser() {
+  const path = `${location.pathname}${location.search}${location.hash || ""}`;
+  try {
+    await apiSend("/api/desktop/open-web", "POST", { path });
+    notice("已在系统浏览器打开当前页面", "ok");
+  } catch (err) {
+    try {
+      window.open(location.href, "_blank", "noopener");
+      notice("已尝试在浏览器打开当前页面", "ok");
+    } catch {
+      notice(err.message, "bad");
+    }
+  }
 }
 
 /* ---------- 轻量提示 ---------- */
@@ -323,14 +351,47 @@ const recommendationState = { limit: 20, offset: 0, sortBy: "total_score", sortD
 const productState = { limit: 50, offset: 0 };
 const keywordState = { limit: 50, offset: 0, keyword: "", minProducts: "" };
 const keywordProductState = { keyword: "", limit: 25, offset: 0 };
+const keywordLibraryRows = new Map();
+const keywordLibrarySelected = new Set();
+const keywordLibraryTreeCollapsed = new Set();
+const keywordLibraryState = {
+  limit: 50,
+  offset: 0,
+  keyword: "",
+  marketplace: "US",
+  snapshotFilter: "all",
+  trackingFilter: "all",
+  sourceFilter: "all",
+  viewMode: "table",
+};
+const keywordWorkshopIdeaRows = new Map();
+const keywordWorkshopState = {
+  limit: 50,
+  offset: 0,
+  keyword: "",
+  status: "candidate",
+  source: "all",
+  selected: new Set(),
+  lastRunId: null,
+  runId: null,
+  runsLimit: 8,
+};
 const taskErrorRows = new Map();
+const taskRows = new Map();
+const taskSelected = new Set();
+const trackingTaskRows = new Map();
+const trackingSelected = new Set();
 const agentState = {
   conversationId: null,
   messages: [],
   pendingAction: null,
   sending: false,
   config: null,
+  lastPageContext: null,
+  contextSuggestions: [],
 };
+let agentSuggestionRegistry = [];
+const AGENT_CONTEXT_STORAGE_KEY = "amazon_agent_recent_business_context";
 const SIDEBAR_NARROW_QUERY = "(max-width: 860px)";
 
 function normalizePage(payload, fallbackLimit = 50) {
@@ -468,6 +529,10 @@ function handleGlobalShortcuts(event) {
   const key = event.key;
   const typing = isTypingTarget(document.activeElement);
   if (key === "Escape") {
+    if (closeKeywordIdeaDialog()) {
+      event.preventDefault();
+      return;
+    }
     if (closeTaskLogDialog()) {
       event.preventDefault();
       return;
@@ -577,7 +642,7 @@ async function loadRecommendations() {
       return;
     }
     box.innerHTML = `<div class="cards">${rows.map((r) => `
-      <div class="card" onclick="navHash('#/product/${encodeURIComponent(r.asin)}')">
+      <div class="card" onclick="window.navHash('#/product/${encodeURIComponent(r.asin)}')">
         <h3>${escapeHtml(displayTitle(r, r.asin))}</h3>
         <div class="row"><span>综合得分</span> <b>${scoreBadge(r.total_score)}</b></div>
         <div class="row" title="占位值，趋势第二步接入真实增长分前未计入综合得分"><span>增长分（占位）</span> <b>${fmt.num(r.growth_score, 0)}</b></div>
@@ -631,6 +696,7 @@ async function viewProducts() {
     productCompareSelection.clear();
     updateProductCompareBar();
     document.querySelectorAll(".prod-check").forEach((c) => { c.checked = false; });
+    rememberAgentBusinessContext();
   };
   content.querySelectorAll(".filters input").forEach((inp) => {
     inp.addEventListener("keydown", (e) => { if (e.key === "Enter") loadProducts(true); });
@@ -689,7 +755,7 @@ async function loadProducts(resetPage = false) {
 function productCompareCheckbox(row) {
   const asin = String(row.asin || "");
   const checked = productCompareSelection.has(asin) ? " checked" : "";
-  return `<input type="checkbox" class="prod-check" value="${escapeHtml(asin)}"${checked} onclick="event.stopPropagation()" onchange="productCompareToggle(this)" />`;
+  return `<input type="checkbox" class="prod-check" value="${escapeHtml(asin)}"${checked} onclick="event.stopPropagation()" onchange="window.productCompareToggle(this)" />`;
 }
 
 window.productCompareToggle = (input) => {
@@ -706,6 +772,7 @@ window.productCompareToggle = (input) => {
     productCompareSelection.delete(asin);
   }
   updateProductCompareBar();
+  rememberAgentBusinessContext();
 };
 
 function updateProductCompareBar() {
@@ -727,6 +794,7 @@ function compareSelectedProducts() {
 
 /* ---------- 视图：AI 助手（Agent M2） ---------- */
 function viewAgent() {
+  agentState.contextSuggestions = [];
   content.innerHTML = `
     <div class="agent-shell">
       <section class="agent-main">
@@ -746,7 +814,9 @@ function viewAgent() {
       <aside class="agent-side">
         <div class="agent-side-title">常用问题</div>
         <button class="chip agent-prompt" data-prompt="帮我找综合得分高、评论数相对低的商品">高分低竞争商品</button>
+        <button class="chip agent-prompt" data-prompt="先做一次应用全局体检：推荐榜、关键词机会、评论洞察、追踪任务和任务中心分别有什么重点？">全局体检</button>
         <button class="chip agent-prompt" data-prompt="看看当前关键词机会里哪些更适合差异化进入">关键词机会判断</button>
+        <button class="chip agent-prompt" data-prompt="按一级关键词分组分析当前关键词机会，帮我找更值得观察的赛道">一级关键词分组</button>
         <button class="chip agent-prompt" data-prompt="总结最近任务中心和关键词追踪任务状态">任务状态摘要</button>
         <div class="agent-side-title">模型配置</div>
         <div id="agent-config" class="agent-config">
@@ -761,7 +831,9 @@ function viewAgent() {
     agentState.conversationId = null;
     agentState.messages = [];
     agentState.pendingAction = null;
+    agentState.contextSuggestions = [];
     renderAgentMessages();
+    loadAgentContextSuggestions();
     document.getElementById("agent-input").focus();
   };
   document.getElementById("agent-form").onsubmit = (event) => {
@@ -782,6 +854,7 @@ function viewAgent() {
   });
   loadAgentConfig();
   renderAgentMessages();
+  loadAgentContextSuggestions();
   // P2-1 轻量打磨：进入页面即聚焦输入框，省一次点击。
   const input = document.getElementById("agent-input");
   if (input) input.focus();
@@ -790,17 +863,21 @@ function viewAgent() {
 function renderAgentMessages() {
   const box = document.getElementById("agent-messages");
   if (!box) return;
+  agentSuggestionRegistry = [];
   if (!agentState.messages.length) {
+    const suggestionBlock = renderAgentActionSuggestions(agentState.contextSuggestions || []);
     box.innerHTML = `
       <div class="agent-empty">
         <b>从一个具体问题开始</b>
         <span>例如商品筛选、ASIN 趋势、关键词机会、评论痛点或任务状态。</span>
+        ${suggestionBlock ? `<div class="agent-empty-actions">${suggestionBlock}</div>` : ""}
       </div>`;
     return;
   }
   box.innerHTML = agentState.messages.map((message) => {
     const toolBlock = renderAgentToolCalls(message.toolCalls || []);
     const actionBlock = message.pendingAction ? renderAgentPendingAction(message.pendingAction) : "";
+    const suggestionBlock = renderAgentActionSuggestions(message.actionSuggestions || []);
     const cls = `agent-msg agent-msg-${message.role}`;
     const label = message.role === "user" ? "你" : message.role === "error" ? "错误" : "助手";
     return `
@@ -809,6 +886,7 @@ function renderAgentMessages() {
         <div class="agent-bubble">${message.pending ? `<span class="mini-spinner"></span>` : ""}${escapeHtml(message.content)}</div>
         ${toolBlock}
         ${actionBlock}
+        ${suggestionBlock}
       </div>`;
   }).join("");
   box.scrollTop = box.scrollHeight;
@@ -829,14 +907,18 @@ function renderAgentToolCalls(toolCalls) {
 
 function agentToolLabel(name) {
   const labels = {
+    query_app_overview: "应用概览",
     query_recommendations: "推荐榜",
     query_products: "商品池",
     query_product_detail: "商品详情",
     query_product_trend: "趋势",
     query_keyword_opportunities: "关键词机会",
+    query_keyword_groups: "关键词分组",
+    query_keyword_ideas: "关键词创意",
     query_review_insights: "评论洞察",
     query_tracking_tasks: "追踪任务",
     query_tasks: "任务中心",
+    open_amazon_page: "预开启 Amazon",
     create_keyword_tracking: "创建追踪",
     set_keyword_tracking_status: "修改追踪状态",
     trigger_collection: "触发采集",
@@ -848,6 +930,159 @@ function formatAgentToolInput(input) {
   const entries = Object.entries(input || {}).filter(([, value]) => value != null && value !== "");
   if (!entries.length) return "默认参数";
   return entries.map(([key, value]) => `${key}=${value}`).join(" · ");
+}
+
+function agentInputValue(id) {
+  const el = document.getElementById(id);
+  return el ? String(el.value || "").trim() : "";
+}
+
+function agentCleanContext(value) {
+  if (value == null || value === "" || (Array.isArray(value) && !value.length)) return undefined;
+  if (Array.isArray(value)) return value.map(agentCleanContext).filter((item) => item !== undefined);
+  if (typeof value === "object") {
+    const obj = {};
+    Object.entries(value).forEach(([key, item]) => {
+      const cleaned = agentCleanContext(item);
+      if (cleaned !== undefined) obj[key] = cleaned;
+    });
+    return Object.keys(obj).length ? obj : undefined;
+  }
+  return value;
+}
+
+function collectAgentVisibleSummary() {
+  return Array.from(content.querySelectorAll(".result-meta, .detail-head .meta, .kw-secondary-head, .state"))
+    .map((el) => String(el.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
+function collectAgentLiveContext() {
+  const hash = location.hash || "#/recommendations";
+  const ctx = {
+    hash,
+    title: viewTitle?.textContent || document.title || "",
+    visible_summary: collectAgentVisibleSummary(),
+  };
+  const productMatch = hash.match(/^#\/product\/(.+)$/);
+  const compareMatch = hash.match(/^#\/compare(?:\/(.+))?$/);
+  if (productMatch) {
+    ctx.current_asin = decodeURIComponent(productMatch[1]);
+  } else if (compareMatch && compareMatch[1]) {
+    ctx.compare_asins = parseAsins(decodeURIComponent(compareMatch[1]));
+  } else if (hash === "#/recommendations") {
+    ctx.recommendation_filters = {
+      sort_by: recommendationState.sortBy,
+      sort_dir: recommendationState.sortDir,
+      blue_only: recommendationState.blueOnly,
+      limit: recommendationState.limit,
+      offset: recommendationState.offset,
+    };
+  } else if (hash === "#/products") {
+    ctx.product_filters = {
+      keyword: agentInputValue("f-keyword"),
+      min_score: agentInputValue("f-min-score"),
+      min_price: agentInputValue("f-min-price"),
+      max_price: agentInputValue("f-max-price"),
+      max_reviews: agentInputValue("f-max-reviews"),
+      selected_asins: [...productCompareSelection],
+      limit: productState.limit,
+      offset: productState.offset,
+    };
+  } else if (hash === "#/keywords") {
+    ctx.keyword_filters = {
+      keyword: keywordState.keyword,
+      min_products: keywordState.minProducts,
+      selected_primary: document.querySelector(".kw-primary-chip.active")?.dataset.primary || "",
+      selected_keyword: keywordProductState.keyword,
+      group_mode: keywordGroupMode,
+      limit: keywordState.limit,
+      offset: keywordState.offset,
+    };
+  } else if (hash === "#/keyword-library") {
+    ctx.keyword_library_filters = {
+      keyword: keywordLibraryState.keyword,
+      marketplace: keywordLibraryState.marketplace,
+      snapshot_filter: keywordLibraryState.snapshotFilter,
+      tracking_filter: keywordLibraryState.trackingFilter,
+      source_filter: keywordLibraryState.sourceFilter,
+      view_mode: keywordLibraryState.viewMode,
+      selected_keyword_ids: keywordLibrarySelectedIds(),
+      selected_keywords: keywordLibrarySelectedRows(),
+      limit: keywordLibraryState.limit,
+      offset: keywordLibraryState.offset,
+    };
+  } else if (hash === "#/keyword-workshop") {
+    ctx.keyword_workshop_filters = {
+      keyword: keywordWorkshopState.keyword,
+      status: keywordWorkshopState.status,
+      source: keywordWorkshopState.source,
+      run_id: keywordWorkshopState.runId,
+      selected_idea_ids: keywordWorkshopSelectedIds(),
+      limit: keywordWorkshopState.limit,
+      offset: keywordWorkshopState.offset,
+    };
+  } else if (hash === "#/tracking") {
+    ctx.tracking_filters = {
+      selected_task_ids: trackingSelectedIds(),
+      selected_tasks: trackingSelectedTasks(),
+    };
+    ctx.module_hint = "关键词追踪任务页，可查询 active/paused/completed/error 任务。";
+  } else if (hash === "#/tasks") {
+    ctx.task_filters = {
+      selected_task_ids: taskSelectedRowIds(),
+      selected_tasks: taskSelectedRows(),
+    };
+    ctx.module_hint = "任务中心页，可查询最近爬取/入库任务及错误日志。";
+  } else if (hash === "#/reviews") {
+    ctx.module_hint = "评论痛点页，仅代表已导入或已解析评论证据。";
+  } else if (hash === "#/crawl") {
+    ctx.module_hint = "手动采集页；联网采集前建议预开启 Amazon 页面并由用户处理地址/登录/验证码。";
+  }
+  return agentCleanContext(ctx) || {};
+}
+
+function storeAgentBusinessContext(context) {
+  try {
+    sessionStorage.setItem(AGENT_CONTEXT_STORAGE_KEY, JSON.stringify(context || {}));
+  } catch {
+    // 会话存储不可用时退回内存上下文。
+  }
+}
+
+function readStoredAgentBusinessContext() {
+  try {
+    const raw = sessionStorage.getItem(AGENT_CONTEXT_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === "object" && parsed.hash !== "#/agent") return parsed;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function rememberAgentBusinessContext() {
+  if ((location.hash || "") === "#/agent") return;
+  const context = collectAgentLiveContext();
+  agentState.lastPageContext = context;
+  storeAgentBusinessContext(context);
+}
+
+function getAgentClientContext() {
+  const live = collectAgentLiveContext();
+  const recent = agentState.lastPageContext || readStoredAgentBusinessContext();
+  const context = {
+    current_page: live,
+    pending_action: agentState.pendingAction ? {
+      tool: agentState.pendingAction.tool,
+      input: agentState.pendingAction.input || {},
+    } : null,
+  };
+  if ((live.hash || "") === "#/agent" && recent) {
+    context.recent_business_page = recent;
+  }
+  return agentCleanContext(context) || {};
 }
 
 async function sendAgentMessage() {
@@ -864,6 +1099,7 @@ async function sendAgentMessage() {
     return;
   }
   input.value = "";
+  agentState.contextSuggestions = [];
   agentState.messages.push({ role: "user", content: text });
   const pending = { role: "assistant", content: "分析中…", pending: true, toolCalls: [] };
   agentState.messages.push(pending);
@@ -875,6 +1111,7 @@ async function sendAgentMessage() {
       conversation_id: agentState.conversationId,
       message: text,
       confirm: null,
+      client_context: getAgentClientContext(),
     });
     applyAgentResponse(data, pending);
   } catch (err) {
@@ -893,10 +1130,25 @@ async function sendAgentMessage() {
 function applyAgentResponse(data, message) {
   agentState.conversationId = data.conversation_id || agentState.conversationId;
   agentState.pendingAction = data.pending_action || null;
+  agentState.contextSuggestions = [];
   message.content = data.reply || "暂无返回内容。";
   message.pending = false;
   message.toolCalls = data.tool_calls || [];
   message.pendingAction = data.pending_action || null;
+  message.actionSuggestions = data.action_suggestions || [];
+}
+
+async function loadAgentContextSuggestions() {
+  if (agentState.messages.length || agentState.pendingAction) return;
+  try {
+    const data = await apiSend("/api/agent/suggestions", "POST", {
+      client_context: getAgentClientContext(),
+    });
+    agentState.contextSuggestions = data.action_suggestions || [];
+  } catch {
+    agentState.contextSuggestions = [];
+  }
+  renderAgentMessages();
 }
 
 function renderAgentPendingAction(action) {
@@ -907,10 +1159,225 @@ function renderAgentPendingAction(action) {
         <code>${escapeHtml(formatAgentToolInput(action.input || {}))}</code>
       </div>
       <div class="agent-action-buttons">
-        <button class="btn btn-sm btn-warn" onclick="confirmAgentAction(true)">确认执行</button>
-        <button class="btn btn-sm" onclick="confirmAgentAction(false)">取消</button>
+        <button class="btn btn-sm btn-warn" onclick="window.confirmAgentAction(true)">确认执行</button>
+        <button class="btn btn-sm" onclick="window.confirmAgentAction(false)">取消</button>
       </div>
     </div>`;
+}
+
+function renderAgentActionSuggestions(suggestions) {
+  const items = Array.isArray(suggestions) ? suggestions : [];
+  if (!items.length) return "";
+  return `
+    <div class="agent-suggestions">
+      ${items.map((item) => {
+        const index = agentSuggestionRegistry.push(item) - 1;
+        return `
+          <button type="button" class="agent-suggestion-card" onclick="window.runAgentActionSuggestion(${index})">
+            <b>${escapeHtml(item.label || "执行建议")}</b>
+            <span>${escapeHtml(item.description || "需要你确认后执行。")}</span>
+            ${item.risk ? `<em>${escapeHtml(item.risk)}</em>` : ""}
+          </button>`;
+      }).join("")}
+    </div>`;
+}
+
+window.runAgentActionSuggestion = async (index) => {
+  if (agentState.sending) return;
+  if (agentState.pendingAction) {
+    notice("请先处理当前待确认操作", "bad");
+    return;
+  }
+  const suggestion = agentSuggestionRegistry[Number(index)];
+  if (!suggestion) {
+    notice("建议已过期，请重新询问 AI 助手", "bad");
+    return;
+  }
+  const confirmText = suggestion.confirm_text || `确认执行「${suggestion.label || "建议"}」？`;
+  const risk = suggestion.risk ? `\n${suggestion.risk}` : "";
+  if (suggestion.requires_confirmation !== false && !confirm(`${confirmText}${risk}`)) return;
+
+  agentState.messages.push({ role: "user", content: `执行建议：${suggestion.label || "建议"}` });
+  const pending = { role: "assistant", content: "执行建议中…", pending: true, toolCalls: [], actionSuggestions: [] };
+  agentState.messages.push(pending);
+  agentState.sending = true;
+  renderAgentMessages();
+  try {
+    const result = await executeAgentActionSuggestion(suggestion);
+    pending.pending = false;
+    pending.content = summarizeAgentSuggestionResult(suggestion, result);
+    await refreshAfterAgentSuggestion(suggestion);
+    notice("建议执行完成", "ok");
+  } catch (err) {
+    pending.role = "error";
+    pending.pending = false;
+    pending.content = err.message || "建议执行失败。";
+    notice(pending.content, "bad");
+  } finally {
+    agentState.sending = false;
+    renderAgentMessages();
+  }
+};
+
+async function executeAgentActionSuggestion(suggestion) {
+  if (suggestion.kind === "product_pool") {
+    return executeProductPoolSuggestion(suggestion);
+  }
+  if (suggestion.kind === "tracking") {
+    return executeTrackingSuggestion(suggestion);
+  }
+  if (suggestion.kind === "task_center") {
+    return executeTaskCenterSuggestion(suggestion);
+  }
+  if (suggestion.kind !== "keyword_workshop") {
+    throw new Error("暂不支持该建议类型。");
+  }
+  const ids = Array.isArray(suggestion.ids) ? suggestion.ids.map(Number).filter(Boolean) : [];
+  if (!ids.length) {
+    throw new Error("建议缺少候选词 ID，请重新选择候选。");
+  }
+  const marketplace = suggestion.marketplace || "US";
+  if (suggestion.operation === "promote") {
+    return apiSend("/api/keyword-workshop/ideas/promote", "POST", { ids, marketplace });
+  }
+  if (suggestion.operation === "create_tracking") {
+    const body = {
+      ids,
+      marketplace,
+      target_snapshots: Number(suggestion.target_snapshots || 3),
+    };
+    if (suggestion.pages_per_keyword) body.pages_per_keyword = Number(suggestion.pages_per_keyword);
+    return apiSend("/api/keyword-workshop/ideas/create-tracking", "POST", body);
+  }
+  if (suggestion.operation === "set_status") {
+    return apiSend("/api/keyword-workshop/ideas/status", "POST", {
+      ids,
+      marketplace,
+      status: suggestion.status || "ignored",
+    });
+  }
+  throw new Error("暂不支持该建议操作。");
+}
+
+function executeProductPoolSuggestion(suggestion) {
+  if (suggestion.operation === "compare") {
+    const asins = Array.isArray(suggestion.asins)
+      ? suggestion.asins.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 5)
+      : [];
+    if (asins.length < 2) throw new Error("至少需要 2 个商品才能打开对比。");
+    location.hash = `#/compare/${encodeURIComponent(asins.join(","))}`;
+    return { navigated: true, asins };
+  }
+  if (suggestion.operation === "view_detail") {
+    const asin = String(suggestion.asin || "").trim();
+    if (!asin) throw new Error("建议缺少 ASIN。");
+    location.hash = `#/product/${encodeURIComponent(asin)}`;
+    return { navigated: true, asin };
+  }
+  throw new Error("暂不支持该商品池建议。");
+}
+
+async function executeTrackingSuggestion(suggestion) {
+  const taskIds = Array.isArray(suggestion.task_ids)
+    ? suggestion.task_ids.map(Number).filter(Boolean).slice(0, 5)
+    : [];
+  if (suggestion.operation === "check") {
+    if (!taskIds.length) throw new Error("建议缺少追踪任务 ID。");
+    const results = [];
+    for (const taskId of taskIds) {
+      const result = await apiSend("/api/tracking/check", "POST", { execute: false, task_id: taskId });
+      results.push({ task_id: taskId, result });
+    }
+    return { checked: results.length, results };
+  }
+  if (suggestion.operation === "set_status") {
+    if (!taskIds.length) throw new Error("建议缺少追踪任务 ID。");
+    const status = suggestion.status || "paused";
+    const results = [];
+    for (const taskId of taskIds) {
+      const result = await apiSend(`/api/tracking/tasks/${encodeURIComponent(taskId)}/status`, "POST", { status });
+      results.push({ task_id: taskId, result });
+    }
+    return { updated: results.length, status, results };
+  }
+  if (suggestion.operation === "collect") {
+    const taskId = Number(suggestion.task_id || 0);
+    if (!taskId) throw new Error("建议缺少追踪任务 ID。");
+    const result = await apiSend("/api/tracking/check", "POST", { execute: true, task_id: taskId });
+    return { task_id: taskId, result };
+  }
+  throw new Error("暂不支持该追踪建议。");
+}
+
+function executeTaskCenterSuggestion(suggestion) {
+  if (suggestion.operation === "show_error") {
+    const rowId = String(suggestion.row_id || "");
+    if (!rowId) throw new Error("建议缺少任务行 ID。");
+    showTaskError(rowId);
+    return { row_id: rowId };
+  }
+  if (suggestion.operation === "navigate") {
+    const route = String(suggestion.route || "");
+    if (!route.startsWith("#/")) throw new Error("建议缺少有效跳转目标。");
+    location.hash = route;
+    return { route };
+  }
+  throw new Error("暂不支持该任务中心建议。");
+}
+
+function summarizeAgentSuggestionResult(suggestion, result) {
+  const label = suggestion.label || "建议";
+  if (suggestion.kind === "product_pool" && suggestion.operation === "compare") {
+    return `已打开商品对比页：${(result?.asins || []).join("、")}。`;
+  }
+  if (suggestion.kind === "product_pool" && suggestion.operation === "view_detail") {
+    return `已打开商品详情页：${result?.asin || "已选商品"}。`;
+  }
+  if (suggestion.kind === "tracking" && suggestion.operation === "check") {
+    const first = Array.isArray(result?.results) && result.results[0] ? `\n首个结果：${summarizeCheck(result.results[0].result)}` : "";
+    return `已完成「${label}」：检查 ${fmt.int(result?.checked)} 个任务（未联网）。${first}`;
+  }
+  if (suggestion.kind === "tracking" && suggestion.operation === "set_status") {
+    const statusText = result?.status === "active" ? "恢复为 active" : result?.status === "paused" ? "暂停" : result?.status;
+    return `已完成「${label}」：${statusText} ${fmt.int(result?.updated)} 个追踪任务。`;
+  }
+  if (suggestion.kind === "tracking" && suggestion.operation === "collect") {
+    return `已完成「${label}」：任务 #${fmt.int(result?.task_id)}，${summarizeCheck(result?.result)}。`;
+  }
+  if (suggestion.kind === "task_center" && suggestion.operation === "show_error") {
+    return `已打开任务错误日志：${result?.row_id || "已选任务"}。`;
+  }
+  if (suggestion.kind === "task_center" && suggestion.operation === "navigate") {
+    return `已跳转：${result?.route || "目标页面"}。`;
+  }
+  if (suggestion.operation === "promote") {
+    return `已完成「${label}」：更新 ${fmt.int(result?.updated)} 个候选词。`;
+  }
+  if (suggestion.operation === "create_tracking") {
+    const warnings = Array.isArray(result?.warnings) && result.warnings.length
+      ? `\n提示：${result.warnings.slice(0, 3).join("；")}`
+      : "";
+    return `已完成「${label}」：创建或复用 ${fmt.int(result?.created_or_existing)} 个追踪任务。${warnings}`;
+  }
+  if (suggestion.operation === "set_status") {
+    return `已完成「${label}」：更新 ${fmt.int(result?.updated)} 个候选词。`;
+  }
+  return `已完成「${label}」。`;
+}
+
+async function refreshAfterAgentSuggestion(suggestion) {
+  if (suggestion.kind === "task_center") return;
+  if (suggestion.kind === "tracking") {
+    if (location.hash === "#/tracking") await viewTracking();
+    return;
+  }
+  if (suggestion.kind !== "keyword_workshop") return;
+  const ids = Array.isArray(suggestion.ids) ? suggestion.ids.map(Number).filter(Boolean) : [];
+  ids.forEach((id) => keywordWorkshopState.selected.delete(Number(id)));
+  if (location.hash === "#/keyword-workshop") {
+    await loadKeywordRuns();
+    await loadKeywordIdeas();
+  }
 }
 
 window.confirmAgentAction = async (approved) => {
@@ -937,6 +1404,7 @@ window.confirmAgentAction = async (approved) => {
         tool_call_id: action.tool_call_id,
         approved: !!approved,
       },
+      client_context: getAgentClientContext(),
     });
     applyAgentResponse(data, pending);
   } catch (err) {
@@ -1102,7 +1570,7 @@ async function viewProductDetail(asin) {
       ${p.image_url ? `<figure class="product-hero">
         <img class="product-hero__img" loading="lazy" alt="商品主图" title="点击放大看细节"
              src="/api/products/${encodeURIComponent(asin)}/image"
-             onclick="openImageZoom('${encodeURIComponent(asin)}')"
+             onclick="window.openImageZoom('${encodeURIComponent(asin)}')"
              onerror="this.closest('.product-hero').classList.add('product-hero--failed')" />
         <figcaption class="product-hero__cap">商品图 · 点击放大看细节</figcaption>
       </figure>` : ""}
@@ -1380,6 +1848,976 @@ function renderCompareTable(items) {
   }).join("");
   return wrapTable(`<table class="compare"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`);
 }
+
+/* ---------- 视图：关键词资产库 ---------- */
+async function viewKeywordLibrary() {
+  content.innerHTML = `
+    <div class="panel">
+      <div class="table-toolbar">
+        <h2 style="margin:0;font-size:14px">关键词资产库</h2>
+        <div class="actions">
+          <button class="btn btn-sm" id="klib-view-table">表格</button>
+          <button class="btn btn-sm" id="klib-view-tree">树结构</button>
+          <span id="klib-selected" class="selected-count">已选 0 个</span>
+          <button class="btn btn-sm" id="klib-track">创建追踪</button>
+          <button class="btn btn-sm" id="klib-clear">清空选择</button>
+        </div>
+      </div>
+      <div id="klib-summary" class="keyword-library-summary"></div>
+      <div class="filters">
+        <input id="klib-keyword" placeholder="关键词过滤" />
+        <input id="klib-marketplace" placeholder="站点" value="US" style="width:82px" />
+        <select id="klib-snapshot" class="sel">
+          <option value="all">全部快照</option>
+          <option value="with">已有快照</option>
+          <option value="without">暂无快照</option>
+        </select>
+        <select id="klib-tracking" class="sel">
+          <option value="all">全部追踪</option>
+          <option value="active">追踪中</option>
+          <option value="paused">已暂停</option>
+          <option value="completed">已完成</option>
+          <option value="error">异常</option>
+          <option value="any">有追踪</option>
+          <option value="none">无追踪</option>
+        </select>
+        <select id="klib-source" class="sel">
+          <option value="all">全部来源</option>
+          <option value="workshop">来自创意工坊</option>
+          <option value="non_workshop">非创意工坊</option>
+        </select>
+        <button class="btn" id="klib-apply">筛选</button>
+        <button class="btn" id="klib-reset">重置</button>
+      </div>
+      <div id="klib-meta" class="result-meta"></div>
+      <div id="klib-table"></div>
+      <div id="klib-pager-wrap"></div>
+    </div>
+    <div id="klib-detail"></div>`;
+
+  document.getElementById("klib-keyword").value = keywordLibraryState.keyword;
+  document.getElementById("klib-marketplace").value = keywordLibraryState.marketplace;
+  document.getElementById("klib-snapshot").value = keywordLibraryState.snapshotFilter;
+  document.getElementById("klib-tracking").value = keywordLibraryState.trackingFilter;
+  document.getElementById("klib-source").value = keywordLibraryState.sourceFilter;
+  document.getElementById("klib-view-table").onclick = () => setKeywordLibraryViewMode("table");
+  document.getElementById("klib-view-tree").onclick = () => setKeywordLibraryViewMode("tree");
+  document.getElementById("klib-apply").onclick = () => loadKeywordLibrary(true);
+  document.getElementById("klib-reset").onclick = () => {
+    keywordLibraryState.keyword = "";
+    keywordLibraryState.marketplace = "US";
+    keywordLibraryState.snapshotFilter = "all";
+    keywordLibraryState.trackingFilter = "all";
+    keywordLibraryState.sourceFilter = "all";
+    keywordLibrarySelected.clear();
+    document.getElementById("klib-keyword").value = "";
+    document.getElementById("klib-marketplace").value = "US";
+    document.getElementById("klib-snapshot").value = "all";
+    document.getElementById("klib-tracking").value = "all";
+    document.getElementById("klib-source").value = "all";
+    document.getElementById("klib-detail").innerHTML = "";
+    loadKeywordLibrary(true);
+  };
+  document.getElementById("klib-track").onclick = createTrackingFromKeywordLibrary;
+  document.getElementById("klib-clear").onclick = () => {
+    keywordLibrarySelected.clear();
+    document.querySelectorAll(".klib-check").forEach((check) => { check.checked = false; });
+    updateKeywordLibrarySelected();
+    rememberAgentBusinessContext();
+  };
+  content.querySelectorAll(".filters input, .filters select").forEach((inp) => {
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") loadKeywordLibrary(true); });
+  });
+  await loadKeywordLibrary();
+}
+
+function setKeywordLibraryViewMode(mode) {
+  if (!["table", "tree"].includes(mode) || keywordLibraryState.viewMode === mode) return;
+  keywordLibraryState.viewMode = mode;
+  keywordLibraryState.offset = 0;
+  keywordLibrarySelected.clear();
+  const detail = document.getElementById("klib-detail");
+  if (detail) detail.innerHTML = "";
+  loadKeywordLibrary();
+}
+
+function updateKeywordLibraryViewModeButtons() {
+  const table = document.getElementById("klib-view-table");
+  const tree = document.getElementById("klib-view-tree");
+  if (table) table.classList.toggle("btn-active", keywordLibraryState.viewMode === "table");
+  if (tree) tree.classList.toggle("btn-active", keywordLibraryState.viewMode === "tree");
+}
+
+async function loadKeywordLibrary(resetPage = false) {
+  if (resetPage) {
+    keywordLibraryState.offset = 0;
+    keywordLibraryState.keyword = document.getElementById("klib-keyword").value.trim();
+    keywordLibraryState.marketplace = (document.getElementById("klib-marketplace").value.trim() || "US").toUpperCase();
+    keywordLibraryState.snapshotFilter = document.getElementById("klib-snapshot").value;
+    keywordLibraryState.trackingFilter = document.getElementById("klib-tracking").value;
+    keywordLibraryState.sourceFilter = document.getElementById("klib-source").value;
+    keywordLibrarySelected.clear();
+    keywordLibraryTreeCollapsed.clear();
+    document.getElementById("klib-detail").innerHTML = "";
+  }
+  const table = document.getElementById("klib-table");
+  const meta = document.getElementById("klib-meta");
+  const pager = document.getElementById("klib-pager-wrap");
+  if (!table) return;
+  table.innerHTML = `<div class="state"><div class="spinner"></div>加载关键词资产…</div>`;
+  meta.textContent = "";
+  pager.innerHTML = "";
+  updateKeywordLibraryViewModeButtons();
+  updateKeywordLibrarySelected();
+  if (keywordLibraryState.viewMode === "tree") {
+    await loadKeywordLibraryTree();
+    return;
+  }
+  const q = new URLSearchParams({
+    limit: String(keywordLibraryState.limit),
+    offset: String(keywordLibraryState.offset),
+    marketplace: keywordLibraryState.marketplace || "US",
+    snapshot_filter: keywordLibraryState.snapshotFilter,
+    tracking_filter: keywordLibraryState.trackingFilter,
+    source_filter: keywordLibraryState.sourceFilter,
+  });
+  if (keywordLibraryState.keyword) q.set("keyword", keywordLibraryState.keyword);
+  try {
+    const page = normalizePage(await api(`/api/keyword-library/keywords?${q.toString()}`), keywordLibraryState.limit);
+    const rows = page.rows || [];
+    renderKeywordLibrarySummary(page.summary || {});
+    meta.textContent = pageSummary(page, "关键词资产") + " · 资产库包含已入库但暂无快照的关键词";
+    keywordLibraryRows.clear();
+    rows.forEach((row) => keywordLibraryRows.set(String(row.keyword_id), row));
+    const visibleIds = new Set(rows.map((row) => Number(row.keyword_id)));
+    keywordLibrarySelected.forEach((id) => { if (!visibleIds.has(Number(id))) keywordLibrarySelected.delete(id); });
+    if (!rows.length) {
+      table.innerHTML = `<div class="state">暂无关键词资产。可先从本地 HTML 入库、关键词创意工坊或追踪任务创建关键词。</div>`;
+      pager.innerHTML = renderPager("klib-pager", page, [20, 50, 100]);
+      bindPager("klib-pager", keywordLibraryState, page, loadKeywordLibrary);
+      updateKeywordLibrarySelected();
+      return;
+    }
+    renderSortableTable(table, [
+      { key: "select", label: `<input type="checkbox" id="klib-check-all" onclick="window.keywordLibraryToggleAll(this)" />`, align: "check", sortable: false, csv: false,
+        render: (r) => `<input type="checkbox" class="klib-check" value="${escapeHtml(r.keyword_id)}"${keywordLibrarySelected.has(Number(r.keyword_id)) ? " checked" : ""} onclick="event.stopPropagation()" onchange="window.keywordLibraryToggle(this)" />` },
+      { key: "keyword", label: "关键词", render: (r) => `<b>${escapeHtml(r.keyword)}</b>`, sortVal: (r) => r.keyword },
+      { key: "product_count", label: "关联商品", align: "num", numeric: true, render: (r) => fmt.int(r.product_count), sortVal: (r) => r.product_count },
+      { key: "snapshot_time_count", label: "快照时间点", align: "num", numeric: true, render: (r) => keywordLibrarySnapshotBadge(r), sortVal: (r) => r.snapshot_time_count },
+      { key: "latest_snapshot_at", label: "最近采集", render: (r) => fmt.text(r.latest_snapshot_at), sortVal: (r) => r.latest_snapshot_at || "" },
+      { key: "avg_total_score", label: "机会信号", align: "num", numeric: true, render: (r) => scoreBadge(r.avg_total_score), sortVal: (r) => r.avg_total_score },
+      { key: "avg_organic_rank", label: "自然序位估算", align: "num", numeric: true, render: (r) => fmt.num(r.avg_organic_rank, 0), sortVal: (r) => r.avg_organic_rank },
+      { key: "source_types", label: "来源", render: (r) => keywordLibrarySourceBadges(r), csv: (r) => keywordLibrarySourceText(r) },
+      { key: "tracking_status", label: "追踪", render: (r) => keywordLibraryTrackingBadge(r.tracking_status), sortVal: (r) => r.tracking_status },
+      { key: "actions", label: "操作", sortable: false, csv: false, render: (r) => keywordLibraryActions(r) },
+    ], rows, { defaultSort: { key: "latest_snapshot_at", dir: -1 }, exportName: "关键词资产库", onRowClick: showKeywordLibraryDetail });
+    pager.innerHTML = renderPager("klib-pager", page, [20, 50, 100]);
+    bindPager("klib-pager", keywordLibraryState, page, loadKeywordLibrary);
+    updateKeywordLibrarySelected();
+  } catch (err) {
+    table.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function loadKeywordLibraryTree() {
+  const table = document.getElementById("klib-table");
+  const meta = document.getElementById("klib-meta");
+  const pager = document.getElementById("klib-pager-wrap");
+  if (!table) return;
+  const q = new URLSearchParams({
+    marketplace: keywordLibraryState.marketplace || "US",
+    snapshot_filter: keywordLibraryState.snapshotFilter,
+    tracking_filter: keywordLibraryState.trackingFilter,
+    source_filter: keywordLibraryState.sourceFilter,
+    max_keywords: "500",
+  });
+  if (keywordLibraryState.keyword) q.set("keyword", keywordLibraryState.keyword);
+  try {
+    const tree = await api(`/api/keyword-library/tree?${q.toString()}`);
+    const roots = Array.isArray(tree.roots) ? tree.roots : [];
+    renderKeywordLibrarySummary(tree.summary || {});
+    keywordLibraryRows.clear();
+    flattenKeywordLibraryTree(roots).forEach((row) => keywordLibraryRows.set(String(row.keyword_id), row));
+    const visibleIds = new Set([...keywordLibraryRows.keys()].map((id) => Number(id)));
+    keywordLibrarySelected.forEach((id) => { if (!visibleIds.has(Number(id))) keywordLibrarySelected.delete(id); });
+    const cut = tree.truncated ? ` · 已截断为前 ${fmt.int(tree.node_count)} 个` : "";
+    meta.textContent = `共 ${fmt.int(tree.total)} 个关键词资产 · 一级 ${fmt.int(tree.root_count)} 个 · 最大层级 ${fmt.int(tree.max_depth)}${cut} · 树结构为自动推断`;
+    pager.innerHTML = "";
+    if (!roots.length) {
+      table.innerHTML = `<div class="state">暂无可归类关键词。可调整筛选，或先从本地 HTML 入库、关键词创意工坊创建关键词。</div>`;
+      updateKeywordLibrarySelected();
+      return;
+    }
+    table.innerHTML = `
+      <div class="keyword-tree-head">
+        <label class="check-inline"><input type="checkbox" id="klib-check-all" onclick="window.keywordLibraryToggleAll(this)" /> 全选当前树</label>
+        <span>自动按词组包含关系归类；没有明确上级的关键词作为一级词。</span>
+      </div>
+      <div class="keyword-tree">
+        ${roots.map((node) => renderKeywordLibraryTreeNode(node)).join("")}
+      </div>`;
+    updateKeywordLibrarySelected();
+  } catch (err) {
+    table.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function flattenKeywordLibraryTree(nodes) {
+  const result = [];
+  const visit = (node) => {
+    result.push(node);
+    (node.children || []).forEach(visit);
+  };
+  (nodes || []).forEach(visit);
+  return result;
+}
+
+function renderKeywordLibraryTreeNode(node) {
+  const id = Number(node.keyword_id);
+  const isVirtual = node.virtual || id <= 0;
+  const children = node.children || [];
+  const hasChildren = children.length > 0;
+  const collapsed = keywordLibraryTreeCollapsed.has(id);
+  const depth = Math.max(1, Number(node.depth || 1));
+  const indent = 10 + (depth - 1) * 24;
+  const checked = keywordLibrarySelected.has(id) ? " checked" : "";
+  const toggle = hasChildren
+    ? `<button class="keyword-tree-toggle" onclick="event.stopPropagation();window.keywordLibraryTreeToggle(${id})">${collapsed ? "+" : "-"}</button>`
+    : `<span class="keyword-tree-toggle keyword-tree-toggle-empty"></span>`;
+  const selector = isVirtual
+    ? `<span class="keyword-tree-virtual-dot"></span>`
+    : `<input type="checkbox" class="klib-check" value="${escapeHtml(id)}"${checked} onclick="event.stopPropagation()" onchange="window.keywordLibraryToggle(this)" />`;
+  const title = isVirtual
+    ? `<span class="keyword-tree-title keyword-tree-title-virtual">${escapeHtml(node.keyword)}</span>`
+    : `<button class="keyword-tree-title" onclick="event.stopPropagation();window.keywordLibraryDetail(${id})">${escapeHtml(node.keyword)}</button>`;
+  const relation = isVirtual ? "自动分类" : (node.parent_keyword ? `上级：${escapeHtml(node.parent_keyword)}` : "一级关键词");
+  const childText = hasChildren ? ` · 子词 ${fmt.int(children.length)} / 后代 ${fmt.int(node.descendant_count)}` : "";
+  const actions = isVirtual ? `<span class="badge badge-dim">分类节点</span>` : keywordLibraryActions(node);
+  return `
+    <div class="keyword-tree-node">
+      <div class="keyword-tree-row" style="--tree-indent:${indent}px">
+        ${selector}
+        ${toggle}
+        ${title}
+        <div class="keyword-tree-stats">
+          <span>${relation}${childText}</span>
+          <span>商品 ${fmt.int(node.product_count)}</span>
+          <span>快照 ${fmt.int(node.snapshot_time_count)}</span>
+          <span>机会 ${scoreBadge(node.avg_total_score)}</span>
+          <span>${keywordLibraryTrackingBadge(node.tracking_status)}</span>
+        </div>
+        <div class="keyword-tree-actions">${actions}</div>
+      </div>
+      ${hasChildren && !collapsed ? `<div class="keyword-tree-children">${children.map((child) => renderKeywordLibraryTreeNode(child)).join("")}</div>` : ""}
+    </div>`;
+}
+
+window.keywordLibraryTreeToggle = (keywordId) => {
+  const id = Number(keywordId);
+  if (!id) return;
+  if (keywordLibraryTreeCollapsed.has(id)) keywordLibraryTreeCollapsed.delete(id);
+  else keywordLibraryTreeCollapsed.add(id);
+  loadKeywordLibraryTree();
+};
+
+function renderKeywordLibrarySummary(summary) {
+  const box = document.getElementById("klib-summary");
+  if (!box) return;
+  box.innerHTML = `
+    <div><span>关键词总数</span><b>${fmt.int(summary.total_keywords)}</b></div>
+    <div><span>已有快照</span><b>${fmt.int(summary.with_snapshots)}</b></div>
+    <div><span>追踪中</span><b>${fmt.int(summary.active_tracking)}</b></div>
+    <div><span>创意入库</span><b>${fmt.int(summary.workshop_keywords)}</b></div>
+    <div><span>最近采集</span><b>${fmt.text(summary.latest_snapshot_at)}</b></div>`;
+}
+
+function keywordLibrarySnapshotBadge(row) {
+  const count = Number(row.snapshot_time_count || 0);
+  if (!count) return `<span class="badge badge-dim">暂无快照</span>`;
+  return `<span class="badge badge-good">${fmt.int(count)}</span>`;
+}
+
+function keywordLibraryTrackingBadge(status) {
+  const map = {
+    active: ["追踪中", "badge-good"],
+    paused: ["已暂停", "badge-warn"],
+    completed: ["已完成", "badge-dim"],
+    error: ["异常", "badge-bad"],
+    other: ["有追踪", "badge-dim"],
+    none: ["未追踪", "badge-dim"],
+  };
+  const item = map[status] || [status || "未追踪", "badge-dim"];
+  return `<span class="badge ${item[1]}">${escapeHtml(item[0])}</span>`;
+}
+
+function keywordLibrarySourceText(row) {
+  const items = [];
+  if (row.has_workshop_idea) items.push((row.source_types || []).map(keywordIdeaSourceLabel).join(" / ") || "创意工坊");
+  if (!items.length) items.push("采集/入库");
+  return items.join(" / ");
+}
+
+function keywordLibrarySourceBadges(row) {
+  if (row.has_workshop_idea) {
+    const sources = (row.source_types || []).map((source) => `<span class="badge badge-dim">${escapeHtml(keywordIdeaSourceLabel(source))}</span>`).join(" ");
+    const score = row.idea_score != null ? ` ${scoreBadge(row.idea_score)}` : "";
+    return `${sources || `<span class="badge badge-dim">创意工坊</span>`}${score}`;
+  }
+  return `<span class="badge badge-dim">采集/入库</span>`;
+}
+
+function keywordLibraryActions(row) {
+  const id = Number(row.keyword_id);
+  return `<div class="actions">
+    <button class="btn btn-sm" onclick="event.stopPropagation();window.keywordLibraryDetail(${id})">详情</button>
+    <button class="btn btn-sm" onclick="event.stopPropagation();window.keywordLibraryOpportunity(${id})">看机会</button>
+    <button class="btn btn-sm" onclick="event.stopPropagation();window.keywordLibraryCopy(${id})">复制</button>
+  </div>`;
+}
+
+window.keywordLibraryToggle = (checkbox) => {
+  const id = Number(checkbox.value);
+  if (!id) return;
+  if (checkbox.checked) keywordLibrarySelected.add(id);
+  else keywordLibrarySelected.delete(id);
+  updateKeywordLibrarySelected();
+  rememberAgentBusinessContext();
+};
+
+window.keywordLibraryToggleAll = (checkbox) => {
+  document.querySelectorAll(".klib-check").forEach((cb) => {
+    cb.checked = checkbox.checked;
+    const id = Number(cb.value);
+    if (checkbox.checked) keywordLibrarySelected.add(id);
+    else keywordLibrarySelected.delete(id);
+  });
+  updateKeywordLibrarySelected();
+  rememberAgentBusinessContext();
+};
+
+function updateKeywordLibrarySelected() {
+  const el = document.getElementById("klib-selected");
+  if (el) el.textContent = `已选 ${keywordLibrarySelected.size} 个`;
+  const all = document.getElementById("klib-check-all");
+  if (all) {
+    const checks = [...document.querySelectorAll(".klib-check")];
+    all.checked = checks.length > 0 && checks.every((cb) => cb.checked);
+  }
+}
+
+function keywordLibrarySelectedIds() {
+  return [...keywordLibrarySelected].map((id) => Number(id)).filter(Boolean).slice(0, 100);
+}
+
+function keywordLibrarySelectedRows() {
+  return keywordLibrarySelectedIds().map((id) => {
+    const row = keywordLibraryRows.get(String(id)) || {};
+    return { keyword_id: id, keyword: row.keyword || "", marketplace: row.marketplace || "" };
+  }).filter((row) => row.keyword);
+}
+
+async function createTrackingFromKeywordLibrary() {
+  const ids = keywordLibrarySelectedIds();
+  if (!ids.length) return notice("请先勾选关键词", "bad");
+  if (!confirm(`确认给 ${ids.length} 个关键词创建追踪任务？\n已有 active 追踪任务的关键词不会重复创建；不会立即联网采集。`)) return;
+  try {
+    const result = await apiSend("/api/keyword-library/keywords/create-tracking", "POST", {
+      ids,
+      marketplace: keywordLibraryState.marketplace || "US",
+      target_snapshots: 3,
+    });
+    keywordLibrarySelected.clear();
+    await loadKeywordLibrary();
+    const warning = (result.warnings || [])[0];
+    notice(`追踪任务处理完成：${fmt.int(result.created_or_existing)} 个${warning ? `；${warning}` : ""}`, warning ? "bad" : "ok");
+  } catch (err) {
+    notice(err.message, "bad");
+  }
+}
+
+window.keywordLibraryDetail = (keywordId) => {
+  const row = keywordLibraryRows.get(String(keywordId));
+  if (row) showKeywordLibraryDetail(row);
+};
+
+window.keywordLibraryOpportunity = (keywordId) => {
+  const row = keywordLibraryRows.get(String(keywordId));
+  if (!row) return;
+  keywordState.keyword = row.keyword || "";
+  keywordState.minProducts = "";
+  keywordState.offset = 0;
+  location.hash = "#/keywords";
+};
+
+window.keywordLibraryCopy = async (keywordId) => {
+  const row = keywordLibraryRows.get(String(keywordId));
+  if (!row) return;
+  try {
+    await navigator.clipboard.writeText(row.keyword || "");
+    notice("关键词已复制", "ok");
+  } catch {
+    notice(`关键词：${row.keyword || ""}`, "ok");
+  }
+};
+
+async function showKeywordLibraryDetail(row) {
+  const box = document.getElementById("klib-detail");
+  if (!box) return;
+  box.innerHTML = `<div class="panel"><div class="state"><div class="spinner"></div>加载关键词详情…</div></div>`;
+  try {
+    const detail = await api(`/api/keyword-library/keywords/${encodeURIComponent(row.keyword_id)}`);
+    const asset = detail.asset || row;
+    const products = detail.products || [];
+    box.innerHTML = `
+      <div class="panel">
+        <div class="table-toolbar">
+          <h2 style="margin:0;font-size:14px">关键词「${escapeHtml(asset.keyword)}」资产详情</h2>
+          <div class="actions">
+            <button class="btn btn-sm" onclick="window.keywordLibraryOpportunity(${Number(asset.keyword_id)})">看机会</button>
+            <button class="btn btn-sm" onclick="window.keywordLibraryCopy(${Number(asset.keyword_id)})">复制关键词</button>
+          </div>
+        </div>
+        <div class="kv">
+          <div><span>站点</span>${escapeHtml(asset.marketplace || "—")}</div>
+          <div><span>关联商品</span>${fmt.int(asset.product_count)}</div>
+          <div><span>快照时间点</span>${fmt.int(asset.snapshot_time_count)}</div>
+          <div><span>最近采集</span>${fmt.text(asset.latest_snapshot_at)}</div>
+          <div><span>机会信号</span>${scoreBadge(asset.avg_total_score)}</div>
+          <div><span>自然序位估算</span>${fmt.num(asset.avg_organic_rank, 0)}</div>
+          <div><span>来源</span>${keywordLibrarySourceBadges(asset)}</div>
+          <div><span>追踪状态</span>${keywordLibraryTrackingBadge(asset.tracking_status)}</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2 style="margin:0 0 10px;font-size:14px">相关商品（最新快照）</h2>
+        <div id="klib-products"></div>
+      </div>`;
+    renderKeywordLibraryProducts(products);
+    box.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    box.innerHTML = `<div class="panel"><div class="state error">⚠ ${escapeHtml(err.message)}</div></div>`;
+  }
+}
+
+function renderKeywordLibraryProducts(products) {
+  const box = document.getElementById("klib-products");
+  if (!box) return;
+  if (!products.length) {
+    box.innerHTML = `<div class="state">该关键词暂无商品快照。可先创建追踪任务，后续采集仍需单独确认。</div>`;
+    return;
+  }
+  renderSortableTable(box, [
+    { key: "title", label: "标题", render: (item) => escapeHtml(truncate(displayTitle(item, item.asin), 68)), sortVal: (item) => displayTitle(item, item.asin) },
+    { key: "total_score", label: "得分", align: "num", numeric: true, render: (item) => scoreBadge(item.total_score), sortVal: (item) => item.total_score },
+    { key: "price", label: "价格", align: "num", numeric: true, render: (item) => fmt.money(item.price), sortVal: (item) => item.price },
+    { key: "rating", label: "评分", align: "num", numeric: true, render: (item) => fmt.num(item.rating), sortVal: (item) => item.rating },
+    { key: "review_count", label: "评论", align: "num", numeric: true, render: (item) => fmt.int(item.review_count), sortVal: (item) => item.review_count },
+    { key: "monthly_bought", label: "近月购买", align: "num", numeric: true, render: (item) => fmt.int(item.monthly_bought), sortVal: (item) => item.monthly_bought },
+    { key: "organic_rank", label: "序位估算", align: "num", numeric: true, render: (item) => fmt.int(item.organic_rank), sortVal: (item) => item.organic_rank },
+  ], products, { rowHash: (item) => `#/product/${encodeURIComponent(item.asin)}`, defaultSort: { key: "total_score", dir: -1 }, exportName: "关键词资产相关商品" });
+}
+
+/* ---------- 视图：关键词创意工坊 ---------- */
+async function viewKeywordWorkshop() {
+  content.innerHTML = `
+    <div class="panel kw-workshop-run">
+      <div class="table-toolbar">
+        <h2 style="margin:0;font-size:14px">生成候选关键词</h2>
+        <div class="actions">
+          <button class="btn" id="kws-run">生成候选</button>
+          <button class="btn" id="kws-refresh">刷新候选池</button>
+        </div>
+      </div>
+      <div class="kw-workshop-form">
+        <label class="kw-workshop-seeds">种子词
+          <textarea id="kws-seeds" rows="4" placeholder="例如：squishy&#10;fidget toys"></textarea>
+        </label>
+        <div class="kw-workshop-options">
+          <label class="check-inline"><input id="kws-use-suggest" type="checkbox" checked /> Amazon 联想</label>
+          <label class="check-inline"><input id="kws-use-titles" type="checkbox" checked /> 标题抽词</label>
+          <label class="check-inline"><input id="kws-expand" type="checkbox" checked /> a-z / 0-9 扩展</label>
+          <label>单种子联想请求上限<input id="kws-max-query" type="number" min="1" max="37" value="16" /></label>
+          <label>标题样本上限<input id="kws-title-rows" type="number" min="20" max="2000" value="300" /></label>
+        </div>
+      </div>
+      <div id="kws-run-result"></div>
+    </div>
+    <details class="panel kw-runs-panel" open>
+      <summary>最近生成批次</summary>
+      <div class="kw-runs-head">
+        <span id="kws-run-filter-label" class="result-meta">未按批次筛选</span>
+        <span class="queue-spacer"></span>
+        <button class="btn btn-sm" id="kws-clear-run">清除批次筛选</button>
+        <button class="btn btn-sm" id="kws-runs-refresh">刷新批次</button>
+      </div>
+      <div id="kws-runs"></div>
+    </details>
+    <div class="panel kw-workshop-results">
+      <div class="table-toolbar">
+        <h2 style="margin:0;font-size:14px">候选池</h2>
+        <span id="kws-selected" class="result-meta">已选 0 个</span>
+      </div>
+      <div class="filters">
+        <input id="kws-filter" placeholder="候选词过滤" />
+        <select id="kws-status" class="sel">
+          <option value="all">全部状态</option>
+          <option value="candidate">候选</option>
+          <option value="promoted">已入库</option>
+          <option value="tracking">追踪中</option>
+          <option value="ignored">已忽略</option>
+        </select>
+        <select id="kws-source" class="sel">
+          <option value="all">全部来源</option>
+          <option value="amazon_suggest">Amazon 联想</option>
+          <option value="title_ngram">标题抽词</option>
+          <option value="existing_keyword">已有数据</option>
+        </select>
+        <button class="btn" id="kws-apply">筛选</button>
+        <button class="btn" id="kws-reset">重置</button>
+      </div>
+      <div class="queue-bar">
+        <button class="btn btn-sm" id="kws-promote">加入关键词库</button>
+        <button class="btn btn-sm" id="kws-track">创建追踪</button>
+        <button class="btn btn-sm" id="kws-ignore">忽略</button>
+        <button class="btn btn-sm" id="kws-restore">恢复候选</button>
+      </div>
+      <div id="kws-meta" class="result-meta"></div>
+      <div id="kws-table"></div>
+      <div id="kws-pager-wrap"></div>
+    </div>`;
+
+  document.getElementById("kws-filter").value = keywordWorkshopState.keyword;
+  document.getElementById("kws-status").value = keywordWorkshopState.status;
+  document.getElementById("kws-source").value = keywordWorkshopState.source;
+  document.getElementById("kws-run").onclick = runKeywordWorkshop;
+  document.getElementById("kws-refresh").onclick = () => loadKeywordIdeas();
+  document.getElementById("kws-runs-refresh").onclick = () => loadKeywordRuns();
+  document.getElementById("kws-clear-run").onclick = () => keywordWorkshopSelectRun(null);
+  document.getElementById("kws-apply").onclick = () => loadKeywordIdeas(true);
+  document.getElementById("kws-reset").onclick = async () => {
+    keywordWorkshopState.keyword = "";
+    keywordWorkshopState.status = "candidate";
+    keywordWorkshopState.source = "all";
+    keywordWorkshopState.runId = null;
+    keywordWorkshopState.selected.clear();
+    document.getElementById("kws-filter").value = "";
+    document.getElementById("kws-status").value = "candidate";
+    document.getElementById("kws-source").value = "all";
+    await loadKeywordRuns();
+    await loadKeywordIdeas(true);
+  };
+  document.getElementById("kws-promote").onclick = () => keywordWorkshopBulk("promote");
+  document.getElementById("kws-track").onclick = () => keywordWorkshopBulk("track");
+  document.getElementById("kws-ignore").onclick = () => keywordWorkshopBulk("ignored");
+  document.getElementById("kws-restore").onclick = () => keywordWorkshopBulk("candidate");
+  content.querySelectorAll(".filters input, .filters select").forEach((inp) => {
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") loadKeywordIdeas(true); });
+  });
+  await loadKeywordRuns();
+  await loadKeywordIdeas();
+}
+
+async function runKeywordWorkshop() {
+  const box = document.getElementById("kws-run-result");
+  const btn = document.getElementById("kws-run");
+  const seedText = document.getElementById("kws-seeds").value.trim();
+  const useSuggest = document.getElementById("kws-use-suggest").checked;
+  const useTitles = document.getElementById("kws-use-titles").checked;
+  if (!seedText) return notice("请填写至少一个种子词", "bad");
+  if (!useSuggest && !useTitles) return notice("请至少选择一个来源", "bad");
+  if (useSuggest && !confirm("将访问 Amazon Suggest 获取搜索联想，不会打开商品页或自动采集。继续？")) return;
+  btn.disabled = true;
+  box.innerHTML = `<div class="state"><div class="spinner"></div>正在生成候选…</div>`;
+  try {
+    const result = await apiSend("/api/keyword-workshop/runs", "POST", {
+      seed_text: seedText,
+      marketplace: "US",
+      use_suggest: useSuggest,
+      use_titles: useTitles,
+      expand_suggest: document.getElementById("kws-expand").checked,
+      max_suggest_queries_per_seed: Number(document.getElementById("kws-max-query").value || 16),
+      max_title_rows: Number(document.getElementById("kws-title-rows").value || 300),
+    });
+    keywordWorkshopState.lastRunId = result.run_id;
+    box.innerHTML = renderKeywordWorkshopRunResult(result);
+    keywordWorkshopState.offset = 0;
+    keywordWorkshopState.status = "candidate";
+    keywordWorkshopState.runId = result.run_id;
+    keywordWorkshopState.selected.clear();
+    const status = document.getElementById("kws-status");
+    if (status) status.value = "candidate";
+    await loadKeywordRuns();
+    await loadKeywordIdeas();
+    notice(`候选生成完成，保存/合并 ${fmt.int(result.total_saved)} 个`, "ok");
+  } catch (err) {
+    box.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
+    notice(err.message, "bad");
+  } finally {
+    const b = document.getElementById("kws-run");
+    if (b) b.disabled = false;
+  }
+}
+
+function renderKeywordWorkshopRunResult(result) {
+  const warnings = (result.warnings || []).slice(0, 3).map((w) => `<div class="sample">${escapeHtml(w)}</div>`).join("");
+  return `<div class="kw-run-summary">
+    <span>运行 #${escapeHtml(result.run_id)}</span>
+    <span>种子 ${fmt.int((result.seed_keywords || []).length)}</span>
+    <span>原始候选 ${fmt.int(result.total_found)}</span>
+    <span>保存/合并 ${fmt.int(result.total_saved)}</span>
+    <button class="btn btn-sm" type="button" onclick="window.keywordWorkshopRunStatus(${Number(result.run_id)}, 'ignored')">忽略本轮候选</button>
+    <button class="btn btn-sm" type="button" onclick="window.keywordWorkshopRunStatus(${Number(result.run_id)}, 'candidate')">恢复本轮候选</button>
+    ${warnings ? `<div class="kw-run-warnings">${warnings}</div>` : ""}
+  </div>`;
+}
+
+async function loadKeywordIdeas(resetPage = false) {
+  if (resetPage) {
+    keywordWorkshopState.offset = 0;
+    keywordWorkshopState.keyword = document.getElementById("kws-filter").value.trim();
+    keywordWorkshopState.status = document.getElementById("kws-status").value;
+    keywordWorkshopState.source = document.getElementById("kws-source").value;
+    keywordWorkshopState.selected.clear();
+  }
+  const table = document.getElementById("kws-table");
+  const meta = document.getElementById("kws-meta");
+  const pager = document.getElementById("kws-pager-wrap");
+  if (!table) return;
+  table.innerHTML = `<div class="state"><div class="spinner"></div>加载中…</div>`;
+  meta.textContent = "";
+  pager.innerHTML = "";
+  updateKeywordWorkshopSelected();
+  const q = new URLSearchParams({
+    limit: String(keywordWorkshopState.limit),
+    offset: String(keywordWorkshopState.offset),
+    marketplace: "US",
+  });
+  if (keywordWorkshopState.keyword) q.set("keyword", keywordWorkshopState.keyword);
+  if (keywordWorkshopState.status && keywordWorkshopState.status !== "all") q.set("status", keywordWorkshopState.status);
+  if (keywordWorkshopState.source && keywordWorkshopState.source !== "all") q.set("source", keywordWorkshopState.source);
+  if (keywordWorkshopState.runId) q.set("run_id", String(keywordWorkshopState.runId));
+  try {
+    const page = normalizePage(await api(`/api/keyword-workshop/ideas?${q.toString()}`), keywordWorkshopState.limit);
+    const rows = page.rows || [];
+    meta.textContent = pageSummary(page, "候选词")
+      + (keywordWorkshopState.runId ? ` · 当前批次 #${keywordWorkshopState.runId}` : "")
+      + " · 创意分是早期参考分，不替代关键词机会分";
+    if (!rows.length) {
+      keywordWorkshopIdeaRows.clear();
+      table.innerHTML = `<div class="state">暂无关键词创意候选。</div>`;
+      pager.innerHTML = renderPager("kws-pager", page, [20, 50, 100]);
+      bindPager("kws-pager", keywordWorkshopState, page, loadKeywordIdeas);
+      updateKeywordWorkshopSelected();
+      return;
+    }
+    keywordWorkshopIdeaRows.clear();
+    rows.forEach((row) => keywordWorkshopIdeaRows.set(String(row.id), row));
+    const visibleIds = new Set(rows.map((r) => Number(r.id)));
+    keywordWorkshopState.selected = new Set([...keywordWorkshopState.selected].filter((id) => visibleIds.has(id)));
+    renderSortableTable(table, [
+      { key: "select", label: `<input type="checkbox" id="kws-check-all" onclick="window.keywordWorkshopToggleAll(this)" />`, align: "check", sortable: false, csv: false,
+        render: (r) => `<input type="checkbox" class="kw-idea-check" value="${escapeHtml(r.id)}"${keywordWorkshopState.selected.has(Number(r.id)) ? " checked" : ""} onclick="event.stopPropagation()" onchange="window.keywordWorkshopToggle(this)" />` },
+      { key: "keyword", label: "候选关键词", render: (r) => escapeHtml(r.keyword), sortVal: (r) => r.keyword },
+      { key: "recommendation_level", label: "建议", render: (r) => keywordIdeaLevelBadge(r.recommendation_level), sortVal: (r) => r.recommendation_level },
+      { key: "idea_score", label: "创意分", align: "num", numeric: true, render: (r) => scoreBadge(r.idea_score), sortVal: (r) => r.idea_score },
+      { key: "confidence_score", label: "置信度", align: "num", numeric: true, render: (r) => scoreBadge(r.confidence_score), sortVal: (r) => r.confidence_score },
+      { key: "source_types", label: "来源", render: (r) => keywordIdeaSources(r.source_types), csv: (r) => (r.source_types || []).map(keywordIdeaSourceLabel).join(" / ") },
+      { key: "status", label: "状态", render: (r) => keywordIdeaStatusBadge(r.status), sortVal: (r) => r.status },
+      { key: "occurrence_count", label: "当前证据量", align: "num", numeric: true, render: (r) => fmt.int(r.occurrence_count), sortVal: (r) => r.occurrence_count },
+      { key: "reason", label: "原因", render: (r) => `<span class="kw-reason" title="${escapeHtml(r.reason || "—")}">${escapeHtml(truncate(r.reason || "—", 42))}</span>`, csv: (r) => r.reason || "" },
+      { key: "evidence", label: "证据", sortable: false, csv: false,
+        render: (r) => `<button type="button" class="btn btn-sm" onclick="event.stopPropagation();window.openKeywordIdeaEvidence('${escapeHtml(r.id)}')">查看</button>` },
+      { key: "updated_at", label: "更新时间", render: (r) => fmt.text(r.updated_at), sortVal: (r) => r.updated_at },
+    ], rows, { defaultSort: { key: "idea_score", dir: -1 }, exportName: "关键词创意候选" });
+    pager.innerHTML = renderPager("kws-pager", page, [20, 50, 100]);
+    bindPager("kws-pager", keywordWorkshopState, page, loadKeywordIdeas);
+    updateKeywordWorkshopSelected();
+  } catch (err) {
+    keywordWorkshopIdeaRows.clear();
+    table.innerHTML = `<div class="state error">⚠ ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function loadKeywordRuns() {
+  const box = document.getElementById("kws-runs");
+  const label = document.getElementById("kws-run-filter-label");
+  if (!box) return;
+  if (label) label.textContent = keywordWorkshopState.runId ? `正在查看批次 #${keywordWorkshopState.runId}` : "未按批次筛选";
+  box.innerHTML = `<div class="state"><div class="spinner"></div>加载批次…</div>`;
+  const q = new URLSearchParams({ limit: String(keywordWorkshopState.runsLimit), offset: "0", marketplace: "US" });
+  try {
+    const page = normalizePage(await api(`/api/keyword-workshop/runs?${q.toString()}`), keywordWorkshopState.runsLimit);
+    const rows = page.rows || [];
+    if (!rows.length) {
+      box.innerHTML = `<div class="state">暂无生成批次。</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="kw-runs-list">${rows.map(renderKeywordRunItem).join("")}</div>`;
+    box.querySelectorAll("[data-run-action]").forEach((btn) => {
+      btn.onclick = () => {
+        const action = btn.dataset.runAction;
+        const runId = Number(btn.dataset.runId);
+        if (action === "view") keywordWorkshopSelectRun(runId);
+        else if (action === "ignored" || action === "candidate") keywordWorkshopRunStatus(runId, action);
+      };
+    });
+  } catch (err) {
+    box.innerHTML = `<div class="state error">批次加载失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderKeywordRunItem(run) {
+  const active = Number(keywordWorkshopState.runId) === Number(run.id) ? " active" : "";
+  const seeds = Array.isArray(run.seed_keywords) ? run.seed_keywords.join("、") : "—";
+  const sources = keywordRunSources(run.sources);
+  const warning = run.warning_message ? `<div class="kw-run-warning">${escapeHtml(truncate(run.warning_message, 90))}</div>` : "";
+  return `<div class="kw-run-item${active}">
+    <div class="kw-run-main">
+      <button type="button" class="chip kw-run-id" data-run-action="view" data-run-id="${escapeHtml(run.id)}">#${escapeHtml(run.id)}</button>
+      <b title="${escapeHtml(seeds)}">${escapeHtml(truncate(seeds, 36))}</b>
+      <span>${escapeHtml(fmt.text(run.created_at))}</span>
+      <span>${sources}</span>
+    </div>
+    <div class="kw-run-stats">
+      <span>保存 ${fmt.int(run.total_saved)}</span>
+      <span>候选 ${fmt.int(run.candidate_count)}</span>
+      <span>忽略 ${fmt.int(run.ignored_count)}</span>
+      <span>入库 ${fmt.int(run.promoted_count)}</span>
+      <span>追踪 ${fmt.int(run.tracking_count)}</span>
+    </div>
+    <div class="kw-run-actions">
+      <button type="button" class="btn btn-sm" data-run-action="view" data-run-id="${escapeHtml(run.id)}">查看本轮</button>
+      <button type="button" class="btn btn-sm" data-run-action="ignored" data-run-id="${escapeHtml(run.id)}">忽略候选</button>
+      <button type="button" class="btn btn-sm" data-run-action="candidate" data-run-id="${escapeHtml(run.id)}">恢复候选</button>
+    </div>
+    ${warning}
+  </div>`;
+}
+
+function keywordRunSources(sources) {
+  const data = sources || {};
+  const labels = [];
+  if (data.amazon_suggest) labels.push("Amazon 联想");
+  if (data.title_ngram) labels.push("标题抽词");
+  return labels.length ? labels.join(" / ") : "—";
+}
+
+async function keywordWorkshopSelectRun(runId) {
+  keywordWorkshopState.runId = runId ? Number(runId) : null;
+  keywordWorkshopState.offset = 0;
+  keywordWorkshopState.selected.clear();
+  await loadKeywordRuns();
+  await loadKeywordIdeas();
+}
+
+function keywordIdeaSourceLabel(source) {
+  return ({ amazon_suggest: "Amazon 联想", title_ngram: "标题抽词", existing_keyword: "已有数据" })[source] || source || "—";
+}
+function keywordIdeaSources(sources) {
+  const items = Array.isArray(sources) ? sources : [];
+  return items.length ? items.map((s) => `<span class="badge badge-dim">${escapeHtml(keywordIdeaSourceLabel(s))}</span>`).join(" ") : "—";
+}
+
+window.openKeywordIdeaEvidence = (ideaId) => {
+  const idea = keywordWorkshopIdeaRows.get(String(ideaId));
+  if (!idea) {
+    notice("当前页没有找到这条候选证据，请刷新候选池后再试", "bad");
+    return;
+  }
+  openKeywordIdeaDialog(idea);
+};
+
+function openKeywordIdeaDialog(idea) {
+  closeKeywordIdeaDialog();
+  const modal = document.createElement("div");
+  modal.id = "keyword-idea-dialog";
+  modal.className = "modal-backdrop";
+  modal.innerHTML = `
+    <section class="modal-panel keyword-idea-modal" role="dialog" aria-modal="true" aria-label="候选关键词证据">
+      <div class="modal-head">
+        <h2>${escapeHtml(idea.keyword || "候选关键词")} <span class="badge badge-dim">#${escapeHtml(idea.id)}</span></h2>
+        <button type="button" class="btn btn-sm" data-close-idea>关闭</button>
+      </div>
+      ${renderKeywordIdeaEvidence(idea)}
+    </section>`;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeKeywordIdeaDialog();
+  });
+  document.body.appendChild(modal);
+  const closeButton = modal.querySelector("[data-close-idea]");
+  if (closeButton) closeButton.onclick = closeKeywordIdeaDialog;
+  const body = modal.querySelector(".kw-evidence-body");
+  if (body) body.focus();
+}
+
+function closeKeywordIdeaDialog() {
+  const modal = document.getElementById("keyword-idea-dialog");
+  if (!modal) return false;
+  modal.remove();
+  return true;
+}
+
+function renderKeywordIdeaEvidence(idea) {
+  const evidence = idea.evidence || {};
+  const sourceCards = renderKeywordIdeaEvidenceSources(evidence.sources || {});
+  const seedText = Array.isArray(idea.seed_keywords) && idea.seed_keywords.length
+    ? idea.seed_keywords.join("、")
+    : (Array.isArray(evidence.seeds) ? evidence.seeds.join("、") : "—");
+  return `<div class="kw-evidence-body" tabindex="0">
+    <div class="kw-evidence-summary">
+      <span>状态 ${keywordIdeaStatusBadge(idea.status)}</span>
+      <span>建议 ${keywordIdeaLevelBadge(idea.recommendation_level)}</span>
+      <span>创意分 ${scoreBadge(idea.idea_score)}</span>
+      <span>置信度 ${scoreBadge(idea.confidence_score)}</span>
+      <span>当前证据量 ${fmt.int(idea.occurrence_count)}</span>
+      <span>来源 ${keywordIdeaSources(idea.source_types)}</span>
+    </div>
+    <div class="kw-evidence-reason">
+      <h3>推荐理由</h3>
+      <p>${escapeHtml(idea.reason || "暂无推荐理由。")}</p>
+    </div>
+    <div class="kw-evidence-meta">
+      <div><span>种子词</span><b>${escapeHtml(seedText || "—")}</b></div>
+      <div><span>最近批次</span><b>${fmt.text(idea.last_run_id ? `#${idea.last_run_id}` : "")}</b></div>
+      <div><span>更新时间</span><b>${escapeHtml(fmt.text(idea.updated_at))}</b></div>
+    </div>
+    <h3>来源证据</h3>
+    <div class="kw-evidence-grid">${sourceCards || `<div class="kw-evidence-card">暂无来源明细。</div>`}</div>
+  </div>`;
+}
+
+function renderKeywordIdeaEvidenceSources(sources) {
+  const cards = [];
+  const suggest = sources.amazon_suggest;
+  if (suggest) {
+    const queries = Array.isArray(suggest.queries) ? suggest.queries : [];
+    cards.push(`<div class="kw-evidence-card">
+      <h4>Amazon 联想</h4>
+      <div class="kw-evidence-line"><span>最高位置</span><b>${fmt.text(suggest.best_rank ? `第 ${suggest.best_rank} 位` : "")}</b></div>
+      <div class="kw-evidence-line"><span>触发查询</span><b>${escapeHtml(queries.slice(0, 8).join("、") || "—")}</b></div>
+    </div>`);
+  }
+  const title = sources.title_ngram;
+  if (title) {
+    const examples = Array.isArray(title.examples) ? title.examples : [];
+    cards.push(`<div class="kw-evidence-card">
+      <h4>标题抽词</h4>
+      <div class="kw-evidence-line"><span>出现次数</span><b>${fmt.int(title.count)}</b></div>
+      ${renderKeywordIdeaExamples(examples)}
+    </div>`);
+  }
+  const existing = sources.existing_keyword;
+  if (existing) {
+    cards.push(`<div class="kw-evidence-card">
+      <h4>已有数据</h4>
+      <div class="kw-evidence-line"><span>关键词 ID</span><b>${fmt.text(existing.keyword_id)}</b></div>
+      <div class="kw-evidence-line"><span>关联商品</span><b>${fmt.int(existing.product_count)}</b></div>
+      <div class="kw-evidence-line"><span>快照数</span><b>${fmt.int(existing.snapshot_count)}</b></div>
+      <div class="kw-evidence-line"><span>机会均分</span><b>${fmt.num(existing.avg_total_score, 1)}</b></div>
+    </div>`);
+  }
+  Object.entries(sources).forEach(([key, value]) => {
+    if (["amazon_suggest", "title_ngram", "existing_keyword"].includes(key)) return;
+    cards.push(`<div class="kw-evidence-card">
+      <h4>${escapeHtml(keywordIdeaSourceLabel(key))}</h4>
+      <pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>
+    </div>`);
+  });
+  return cards.join("");
+}
+
+function renderKeywordIdeaExamples(examples) {
+  if (!examples.length) return `<div class="kw-evidence-empty">暂无标题样例。</div>`;
+  return `<ul class="kw-evidence-list">${
+    examples.slice(0, 6).map((item) => `<li>${escapeHtml(item)}</li>`).join("")
+  }</ul>`;
+}
+
+function keywordIdeaStatusBadge(status) {
+  const map = {
+    candidate: ["候选", "badge-warn"],
+    promoted: ["已入库", "badge-good"],
+    tracking: ["追踪中", "badge-good"],
+    ignored: ["已忽略", "badge-dim"],
+  };
+  const item = map[status] || [status || "—", "badge-dim"];
+  return `<span class="badge ${item[1]}">${escapeHtml(item[0])}</span>`;
+}
+function keywordIdeaLevelBadge(level) {
+  const cls = level === "优先验证" ? "badge-good" : level === "可观察" ? "badge-warn" : level === "暂不建议" ? "badge-bad" : "badge-dim";
+  return `<span class="badge ${cls}">${escapeHtml(level || "仅作灵感")}</span>`;
+}
+function keywordWorkshopSelectedIds() {
+  return [...keywordWorkshopState.selected].map((id) => Number(id)).filter(Boolean);
+}
+function updateKeywordWorkshopSelected() {
+  const el = document.getElementById("kws-selected");
+  if (el) el.textContent = `已选 ${keywordWorkshopState.selected.size} 个`;
+  const all = document.getElementById("kws-check-all");
+  if (all) {
+    const checks = [...document.querySelectorAll(".kw-idea-check")];
+    all.checked = checks.length > 0 && checks.every((cb) => cb.checked);
+  }
+}
+window.keywordWorkshopToggle = (checkbox) => {
+  const id = Number(checkbox.value);
+  if (!id) return;
+  if (checkbox.checked) keywordWorkshopState.selected.add(id);
+  else keywordWorkshopState.selected.delete(id);
+  updateKeywordWorkshopSelected();
+  rememberAgentBusinessContext();
+};
+window.keywordWorkshopToggleAll = (checkbox) => {
+  document.querySelectorAll(".kw-idea-check").forEach((cb) => {
+    cb.checked = checkbox.checked;
+    const id = Number(cb.value);
+    if (checkbox.checked) keywordWorkshopState.selected.add(id);
+    else keywordWorkshopState.selected.delete(id);
+  });
+  updateKeywordWorkshopSelected();
+  rememberAgentBusinessContext();
+};
+async function keywordWorkshopBulk(action) {
+  const ids = keywordWorkshopSelectedIds();
+  if (!ids.length) return notice("请先勾选候选词", "bad");
+  const labels = { promote: "加入关键词库", track: "创建追踪任务", ignored: "忽略", candidate: "恢复为候选" };
+  if (!confirm(`确认对 ${ids.length} 个候选词执行「${labels[action] || action}」？`)) return;
+  try {
+    if (action === "promote") {
+      await apiSend("/api/keyword-workshop/ideas/promote", "POST", { ids, marketplace: "US" });
+    } else if (action === "track") {
+      await apiSend("/api/keyword-workshop/ideas/create-tracking", "POST", { ids, marketplace: "US", target_snapshots: 3 });
+    } else {
+      await apiSend("/api/keyword-workshop/ideas/status", "POST", { ids, marketplace: "US", status: action });
+    }
+    keywordWorkshopState.selected.clear();
+    await loadKeywordRuns();
+    await loadKeywordIdeas();
+    notice("操作完成", "ok");
+  } catch (err) {
+    notice(err.message, "bad");
+  }
+}
+
+window.keywordWorkshopRunStatus = async (runId, status) => {
+  const labels = { ignored: "忽略本轮候选", candidate: "恢复本轮候选" };
+  const detail = status === "ignored"
+    ? "只会把本轮仍处于“候选”的记录标记为已忽略；已入库、追踪中的候选不会受影响。"
+    : "只会把本轮“已忽略”的记录恢复为候选。";
+  if (!confirm(`确认执行「${labels[status] || status}」？\n${detail}`)) return;
+  try {
+    const result = await apiSend(`/api/keyword-workshop/runs/${encodeURIComponent(runId)}/ideas/status`, "POST", {
+      marketplace: "US",
+      status,
+    });
+    keywordWorkshopState.selected.clear();
+    await loadKeywordRuns();
+    await loadKeywordIdeas();
+    notice(`${labels[status] || "操作"}完成：更新 ${fmt.int(result.updated)} 条`, "ok");
+  } catch (err) {
+    notice(err.message, "bad");
+  }
+};
 
 /* ---------- 视图：关键词机会 ---------- */
 async function viewKeywords() {
@@ -1740,11 +3178,35 @@ async function viewTasks() {
   loading();
   const rawRows = await api("/api/tasks?limit=100");
   const rows = (rawRows || []).map((row, index) => ({ ...row, _taskRowId: String(row.id ?? index) }));
-  if (!rows || !rows.length) return emptyState("暂无采集或写入任务记录。");
   taskErrorRows.clear();
-  rows.forEach((row) => taskErrorRows.set(row._taskRowId, row));
-  content.innerHTML = `<div class="result-meta">共 ${rows.length} 条 · 点列头排序</div><div id="task-table"></div>`;
+  taskRows.clear();
+  if (!rows || !rows.length) {
+    taskSelected.clear();
+    return emptyState("暂无采集或写入任务记录。");
+  }
+  rows.forEach((row) => {
+    taskErrorRows.set(row._taskRowId, row);
+    taskRows.set(row._taskRowId, row);
+  });
+  const visibleIds = new Set(rows.map((row) => row._taskRowId));
+  [...taskSelected].forEach((id) => { if (!visibleIds.has(String(id))) taskSelected.delete(id); });
+  content.innerHTML = `
+    <div class="table-toolbar">
+      <div class="result-meta" style="margin:0">共 ${rows.length} 条 · 点列头排序</div>
+      <div class="actions">
+        <span id="task-selected" class="selected-count">已选 0 个</span>
+        <button class="btn btn-sm" id="task-clear-selected">清空选择</button>
+      </div>
+    </div>
+    <div id="task-table"></div>`;
+  document.getElementById("task-clear-selected").onclick = () => {
+    taskSelected.clear();
+    document.querySelectorAll(".task-check").forEach((check) => { check.checked = false; });
+    updateTaskSelected();
+    rememberAgentBusinessContext();
+  };
   renderSortableTable(document.getElementById("task-table"), [
+    { key: "select", label: "", sortable: false, csv: false, align: "check", render: renderTaskCheckbox },
     { key: "time", label: "时间", render: (r) => fmt.text(r.created_at || r.started_at), sortVal: (r) => r.created_at || r.started_at || "" },
     { key: "type", label: "类型", render: (r) => escapeHtml(taskDisplayType(r)), sortVal: (r) => taskDisplayType(r) },
     { key: "keyword", label: "关键词", render: (r) => escapeHtml(r.keyword || "—"), sortVal: (r) => r.keyword || "" },
@@ -1757,6 +3219,7 @@ async function viewTasks() {
     exportName: "任务记录",
     onDraw: bindTaskErrorButtons,
   });
+  updateTaskSelected();
 }
 
 function taskDisplayType(row) {
@@ -1769,6 +3232,48 @@ function taskDisplayType(row) {
 
 function isImportTask(row) {
   return taskDisplayType(row) === "入库";
+}
+
+function renderTaskCheckbox(row) {
+  const rowId = String(row._taskRowId || "");
+  const checked = taskSelected.has(rowId) ? " checked" : "";
+  return `<input type="checkbox" class="prod-check task-check" value="${escapeHtml(rowId)}"${checked} onclick="event.stopPropagation()" onchange="window.taskToggle(this)" />`;
+}
+
+window.taskToggle = (checkbox) => {
+  const rowId = String(checkbox.value || "");
+  if (!rowId) return;
+  if (checkbox.checked) taskSelected.add(rowId);
+  else taskSelected.delete(rowId);
+  updateTaskSelected();
+  rememberAgentBusinessContext();
+};
+
+function updateTaskSelected() {
+  const el = document.getElementById("task-selected");
+  if (el) el.textContent = `已选 ${taskSelected.size} 个`;
+}
+
+function taskSelectedRowIds() {
+  return [...taskSelected].map((id) => String(id || "").trim()).filter(Boolean).slice(0, 5);
+}
+
+function taskSelectedRows() {
+  return taskSelectedRowIds().map((rowId) => {
+    const row = taskRows.get(rowId) || {};
+    return {
+      row_id: rowId,
+      id: row.id ?? null,
+      type: taskDisplayType(row),
+      status: row.status || "",
+      keyword: row.keyword || "",
+      has_error: !!taskErrorText(row),
+      ingested_count: taskMetricValue(row, "ingested") ?? 0,
+      valid_count: taskMetricValue(row, "valid") ?? 0,
+      started_at: row.started_at || row.created_at || "",
+      finished_at: row.finished_at || "",
+    };
+  });
 }
 
 function taskMetricValue(row, kind) {
@@ -2080,7 +3585,7 @@ function renderQueueList() {
       <td class="num">${it.pages}</td>
       <td>${queueStatusBadge(it.status)}${it.reason ? ` <span style="color:var(--text-dim);font-size:12px">${escapeHtml(it.reason)}</span>` : ""}</td>
       <td>${it.collected_at ? escapeHtml(fmt.text(it.collected_at)) : '<span style="color:var(--text-dim)">未采集</span>'}</td>
-      <td><button class="btn btn-sm btn-bad" onclick="queueRemove(${i})" ${crawlQueueRunning ? "disabled" : ""}>移除</button></td>
+      <td><button class="btn btn-sm btn-bad" onclick="window.queueRemove(${i})" ${crawlQueueRunning ? "disabled" : ""}>移除</button></td>
     </tr>`).join("");
   box.innerHTML = `<div class="table-wrap"><table>
     <thead><tr><th>关键词</th><th class="num">页数</th><th>状态</th><th>上次采集</th><th>操作</th></tr></thead>
@@ -2265,6 +3770,10 @@ function renderCrawlResult(result) {
 async function viewTracking() {
   loading();
   const tasks = await api("/api/tracking/tasks?limit=100");
+  const visibleIds = new Set((tasks || []).map((task) => Number(task.id)).filter(Boolean));
+  trackingTaskRows.clear();
+  (tasks || []).forEach((task) => trackingTaskRows.set(String(task.id), task));
+  [...trackingSelected].forEach((id) => { if (!visibleIds.has(Number(id))) trackingSelected.delete(id); });
   content.innerHTML = `
     <div class="panel">
       <h2>新建追踪任务</h2>
@@ -2281,23 +3790,37 @@ async function viewTracking() {
       </p>
     </div>
     <div class="panel">
-      <h2>追踪任务（${tasks.length}）</h2>
+      <div class="table-toolbar">
+        <h2 style="margin:0;font-size:14px">追踪任务（${tasks.length}）</h2>
+        <div class="actions">
+          <span id="t-selected" class="selected-count">已选 0 个</span>
+          <button class="btn btn-sm" id="t-clear-selected">清空选择</button>
+        </div>
+      </div>
       <div id="t-list">${trackingTable(tasks)}</div>
     </div>`;
   document.getElementById("t-create").onclick = createTracking;
+  document.getElementById("t-clear-selected").onclick = () => {
+    trackingSelected.clear();
+    document.querySelectorAll(".track-check").forEach((check) => { check.checked = false; });
+    updateTrackingSelected();
+    rememberAgentBusinessContext();
+  };
+  updateTrackingSelected();
 }
 
 function trackingTable(tasks) {
   if (!tasks || !tasks.length) return `<div class="state">暂无追踪任务，先在上方创建。</div>`;
   return tableHtml(
-    ["关键词", "站点", "进度", "状态", "最近采集", "最近检查", "操作"],
+    ["", "关键词", "站点", "进度", "状态", "最近采集", "最近检查", "操作"],
     tasks.map((t) => {
       const cur = t.current_snapshots ?? t.achieved_snapshots ?? 0;
       const done = Number(cur) >= Number(t.target_snapshots);
       const toggle = t.status === "active"
-        ? `<button class="btn btn-sm" onclick="trackToggle(${t.id},'paused')">暂停</button>`
-        : `<button class="btn btn-sm" onclick="trackToggle(${t.id},'active')">恢复</button>`;
+        ? `<button class="btn btn-sm" onclick="window.trackToggle(${t.id},'paused')">暂停</button>`
+        : `<button class="btn btn-sm" onclick="window.trackToggle(${t.id},'active')">恢复</button>`;
       return { cells: [
+        trackingCheckbox(t),
         escapeHtml(t.keyword),
         escapeHtml(t.marketplace),
         `<span class="badge ${done ? "badge-good" : "badge-dim"}">${cur} / ${escapeHtml(t.target_snapshots)}</span>`,
@@ -2305,14 +3828,53 @@ function trackingTable(tasks) {
         fmt.text(t.last_collected_at),
         fmt.text(t.last_checked_at),
         `<div class="actions">
-          <button class="btn btn-sm" onclick="trackPreview(${t.id})">检查</button>
-          <button class="btn btn-sm btn-warn" onclick="trackCollect(${t.id})">执行采集</button>
+          <button class="btn btn-sm" onclick="window.trackPreview(${t.id})">检查</button>
+          <button class="btn btn-sm btn-warn" onclick="window.trackCollect(${t.id})">执行采集</button>
           ${toggle}
-          <button class="btn btn-sm btn-bad" onclick="trackDelete(${t.id})">删除</button>
+          <button class="btn btn-sm btn-bad" onclick="window.trackDelete(${t.id})">删除</button>
         </div>`,
       ] };
     })
   );
+}
+
+function trackingCheckbox(task) {
+  const id = Number(task.id);
+  const checked = trackingSelected.has(id) ? " checked" : "";
+  return `<input type="checkbox" class="prod-check track-check" value="${escapeHtml(id)}"${checked} onclick="event.stopPropagation()" onchange="window.trackingToggle(this)" />`;
+}
+
+window.trackingToggle = (checkbox) => {
+  const id = Number(checkbox.value);
+  if (!id) return;
+  if (checkbox.checked) trackingSelected.add(id);
+  else trackingSelected.delete(id);
+  updateTrackingSelected();
+  rememberAgentBusinessContext();
+};
+
+function updateTrackingSelected() {
+  const el = document.getElementById("t-selected");
+  if (el) el.textContent = `已选 ${trackingSelected.size} 个`;
+}
+
+function trackingSelectedIds() {
+  return [...trackingSelected].map((id) => Number(id)).filter(Boolean).slice(0, 5);
+}
+
+function trackingSelectedTasks() {
+  return trackingSelectedIds().map((id) => {
+    const task = trackingTaskRows.get(String(id)) || {};
+    return {
+      id,
+      keyword: task.keyword || "",
+      status: task.status || "",
+      current_snapshots: task.current_snapshots ?? task.achieved_snapshots ?? null,
+      target_snapshots: task.target_snapshots ?? null,
+      last_collected_at: task.last_collected_at || "",
+      last_checked_at: task.last_checked_at || "",
+    };
+  });
 }
 
 async function createTracking() {
@@ -2450,7 +4012,7 @@ function renderSortableTable(container, columns, data, opts = {}) {
         const cls = c.align === "num" ? "num" : c.align === "check" ? "check-cell" : "";
         return `<td${cls ? ` class="${cls}"` : ""}>${v}</td>`;
       }).join("");
-      const click = opts.rowHash ? ` onclick="navHash('${opts.rowHash(item)}')"` : "";
+      const click = opts.rowHash ? ` onclick="window.navHash('${opts.rowHash(item)}')"` : "";
       return `<tr${click}>${tds}</tr>`;
     }).join("");
     const bar = opts.exportName
@@ -2853,6 +4415,8 @@ const routes = [
   { re: /^#\/products$/, title: "商品池 · 筛选", run: viewProducts },
   { re: /^#\/compare(?:\/(.+))?$/, title: "商品对比", run: (m) => viewCompare(m[1] ? decodeURIComponent(m[1]) : "") },
   { re: /^#\/product\/(.+)$/, title: "商品详情 · 趋势", run: (m) => viewProductDetail(decodeURIComponent(m[1])) },
+  { re: /^#\/keyword-workshop$/, title: "关键词创意工坊", run: viewKeywordWorkshop },
+  { re: /^#\/keyword-library$/, title: "关键词资产库", run: viewKeywordLibrary },
   { re: /^#\/keywords$/, title: "关键词机会", run: viewKeywords },
   { re: /^#\/reviews$/, title: "评论痛点", run: viewReviews },
   { re: /^#\/agent$/, title: "AI 助手", run: viewAgent },
@@ -2875,6 +4439,7 @@ async function router() {
   });
   try {
     await route.run(m);
+    if (hash !== "#/agent") rememberAgentBusinessContext();
     scheduleClientTranslate();
   } catch (err) {
     errorState(err);
@@ -2915,6 +4480,7 @@ function initShellControls() {
 
 document.getElementById("refresh-btn").onclick = router;
 document.getElementById("back-btn").onclick = () => history.back();
+document.getElementById("open-web-btn").onclick = openCurrentPageInBrowser;
 window.addEventListener("hashchange", router);
 window.addEventListener("DOMContentLoaded", () => { initShellControls(); pingHealth(); router(); });
 if (document.readyState !== "loading") { initShellControls(); pingHealth(); router(); }

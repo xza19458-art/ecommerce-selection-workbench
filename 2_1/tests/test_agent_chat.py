@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from api import app as api_app
-from services.agent_chat import AgentChatService, AgentConversationStore
+from services.agent_chat import AgentChatService, AgentConversationStore, CONTEXT_SYSTEM_PREFIX, SYSTEM_PROMPT
 from services.agent_tools import AgentToolExecutor, AgentToolResult, get_agent_tool_definitions
 from services.llm_provider import LLMResponse, ToolCall
 
@@ -73,6 +73,15 @@ class MockProvider:
         return LLMResponse(reply="Found one example product.", finished=True)
 
 
+class ContextProvider:
+    def __init__(self) -> None:
+        self.messages_seen: list[list[dict]] = []
+
+    def chat(self, messages, tools):
+        self.messages_seen.append([dict(message) for message in messages])
+        return LLMResponse(reply="ok", finished=True)
+
+
 class OperationProvider:
     def __init__(self, tool_name="create_keyword_tracking", tool_input=None) -> None:
         self.calls = 0
@@ -114,6 +123,181 @@ def test_agent_chat_executes_readonly_tool_then_returns_final_reply() -> None:
     assert result["pending_action"] is None
     assert result["tool_calls"][0]["name"] == "query_products"
     assert result["tool_calls"][0]["executed"] is True
+
+
+def test_system_prompt_guides_overview_and_keyword_group_tools() -> None:
+    assert "query_app_overview" in SYSTEM_PROMPT
+    assert "query_keyword_groups" in SYSTEM_PROMPT
+    assert "query_keyword_ideas" in SYSTEM_PROMPT
+    assert "一级关键词分组" in SYSTEM_PROMPT
+    assert "当前应用上下文" in SYSTEM_PROMPT
+
+
+def test_client_context_is_hidden_system_message_and_replaced() -> None:
+    provider = ContextProvider()
+    service = AgentChatService(provider, controller=FakeController(), store=AgentConversationStore())
+
+    first = service.chat(
+        conversation_id=None,
+        message="分析这个商品",
+        confirm=None,
+        client_context={"current_page": {"hash": "#/product/B0FIRST", "current_asin": "B0FIRST"}},
+    )
+    service.chat(
+        conversation_id=first["conversation_id"],
+        message="继续看当前关键词",
+        confirm=None,
+        client_context={"current_page": {"hash": "#/keywords", "keyword_filters": {"selected_keyword": "squishy"}}},
+    )
+
+    first_contexts = [
+        message for message in provider.messages_seen[0]
+        if str(message.get("content") or "").startswith(CONTEXT_SYSTEM_PREFIX)
+    ]
+    second_contexts = [
+        message for message in provider.messages_seen[-1]
+        if str(message.get("content") or "").startswith(CONTEXT_SYSTEM_PREFIX)
+    ]
+    assert len(first_contexts) == 1
+    assert "B0FIRST" in first_contexts[0]["content"]
+    assert len(second_contexts) == 1
+    assert "squishy" in second_contexts[0]["content"]
+    assert "B0FIRST" not in second_contexts[0]["content"]
+
+
+def test_keyword_workshop_context_returns_safe_action_suggestions() -> None:
+    provider = ContextProvider()
+    service = AgentChatService(provider, controller=FakeController(), store=AgentConversationStore())
+
+    result = service.chat(
+        conversation_id=None,
+        message="这些候选下一步怎么处理",
+        confirm=None,
+        client_context={
+            "current_page": {
+                "hash": "#/keyword-workshop",
+                "keyword_workshop_filters": {
+                    "status": "candidate",
+                    "selected_idea_ids": [11, "12", "bad", 11, 0],
+                },
+            }
+        },
+    )
+
+    suggestions = result["action_suggestions"]
+    assert [item["operation"] for item in suggestions] == ["promote", "create_tracking", "set_status"]
+    assert suggestions[0]["ids"] == [11, 12]
+    assert suggestions[0]["requires_confirmation"] is True
+    assert suggestions[1]["target_snapshots"] == 3
+    assert suggestions[2]["status"] == "ignored"
+
+
+def test_product_pool_context_returns_navigation_suggestions() -> None:
+    provider = ContextProvider()
+    service = AgentChatService(provider, controller=FakeController(), store=AgentConversationStore())
+
+    result = service.chat(
+        conversation_id=None,
+        message="这几个商品怎么比较",
+        confirm=None,
+        client_context={
+            "current_page": {
+                "hash": "#/products",
+                "product_filters": {
+                    "selected_asins": ["B0ABCDEF12", "bad", "B0ABCDEF12", "B0ZZZZZZ99"],
+                },
+            }
+        },
+    )
+
+    suggestions = result["action_suggestions"]
+    assert [item["operation"] for item in suggestions] == ["compare", "view_detail"]
+    assert suggestions[0]["asins"] == ["B0ABCDEF12", "B0ZZZZZZ99"]
+    assert suggestions[0]["requires_confirmation"] is False
+    assert suggestions[1]["asin"] == "B0ABCDEF12"
+
+
+def test_tracking_context_returns_bounded_action_suggestions() -> None:
+    provider = ContextProvider()
+    service = AgentChatService(provider, controller=FakeController(), store=AgentConversationStore())
+
+    result = service.chat(
+        conversation_id=None,
+        message="这些追踪任务下一步怎么处理",
+        confirm=None,
+        client_context={
+            "current_page": {
+                "hash": "#/tracking",
+                "tracking_filters": {
+                    "selected_tasks": [
+                        {"id": 7, "keyword": "stress ball", "status": "active"},
+                        {"id": "8", "keyword": "squishy toy", "status": "paused"},
+                        {"id": "bad", "status": "active"},
+                        {"id": 7, "status": "active"},
+                    ],
+                },
+            }
+        },
+    )
+
+    suggestions = result["action_suggestions"]
+    assert [item["operation"] for item in suggestions] == ["check", "set_status", "collect", "set_status"]
+    assert suggestions[0]["task_ids"] == [7, 8]
+    assert suggestions[0]["requires_confirmation"] is True
+    assert "检查时间" in suggestions[0]["confirm_text"]
+    assert suggestions[1]["status"] == "paused"
+    assert suggestions[1]["task_ids"] == [7]
+    assert suggestions[2]["task_id"] == 7
+    assert suggestions[2]["requires_confirmation"] is True
+    assert "联网" in suggestions[2]["risk"]
+    assert suggestions[3]["status"] == "active"
+    assert suggestions[3]["task_ids"] == [8]
+
+
+def test_task_center_context_returns_diagnostic_navigation_suggestions() -> None:
+    provider = ContextProvider()
+    service = AgentChatService(provider, controller=FakeController(), store=AgentConversationStore())
+
+    result = service.chat(
+        conversation_id=None,
+        message="这些任务下一步怎么处理",
+        confirm=None,
+        client_context={
+            "current_page": {
+                "hash": "#/tasks",
+                "task_filters": {
+                    "selected_tasks": [
+                        {
+                            "row_id": "crawl-7",
+                            "id": 7,
+                            "type": "爬取",
+                            "status": "异常停止",
+                            "keyword": "stress ball",
+                            "has_error": True,
+                            "ingested_count": 0,
+                        },
+                        {
+                            "row_id": "import-8",
+                            "id": 8,
+                            "type": "入库",
+                            "status": "完成",
+                            "keyword": "stress ball",
+                            "has_error": False,
+                            "ingested_count": 24,
+                        },
+                    ],
+                },
+            }
+        },
+    )
+
+    suggestions = result["action_suggestions"]
+    assert [item["operation"] for item in suggestions] == ["show_error", "navigate", "navigate", "navigate"]
+    assert suggestions[0]["row_id"] == "crawl-7"
+    assert suggestions[1]["route"] == "#/import"
+    assert suggestions[2]["route"] == "#/crawl"
+    assert suggestions[3]["route"] == "#/warehouse"
+    assert all(item["requires_confirmation"] is False for item in suggestions)
 
 
 def test_confirm_without_pending_action_returns_safe_message() -> None:
@@ -297,7 +481,12 @@ def test_api_agent_chat_uses_mock_provider_without_real_key() -> None:
         api_app._build_agent_provider = lambda: provider
         api_app._agent_store = AgentConversationStore()
         api_app._controller = FakeController()
-        response = api_app.agent_chat(api_app.AgentChatIn(message="query products"))
+        response = api_app.agent_chat(
+            api_app.AgentChatIn(
+                message="query products",
+                client_context={"current_page": {"hash": "#/products"}},
+            )
+        )
     finally:
         api_app._build_agent_provider = old_builder
         api_app._agent_store = old_store
@@ -306,6 +495,26 @@ def test_api_agent_chat_uses_mock_provider_without_real_key() -> None:
     assert response["ok"] is True
     assert response["data"]["reply"] == "Found one example product."
     assert response["data"]["tool_calls"][0]["ok"] is True
+
+
+def test_api_agent_suggestions_does_not_require_model_config() -> None:
+    response = api_app.agent_suggestions(
+        api_app.AgentSuggestionsIn(
+            client_context={
+                "current_page": {
+                    "hash": "#/products",
+                    "product_filters": {
+                        "selected_asins": ["B0ABCDEF12", "B0ZZZZZZ99"],
+                    },
+                }
+            }
+        )
+    )
+
+    assert response["ok"] is True
+    suggestions = response["data"]["action_suggestions"]
+    assert suggestions[0]["operation"] == "compare"
+    assert suggestions[0]["asins"] == ["B0ABCDEF12", "B0ZZZZZZ99"]
 
 
 def test_api_agent_config_endpoints_are_thin_wrappers() -> None:
@@ -348,6 +557,12 @@ def test_api_agent_config_endpoints_are_thin_wrappers() -> None:
 if __name__ == "__main__":
     tests = [
         test_agent_chat_executes_readonly_tool_then_returns_final_reply,
+        test_system_prompt_guides_overview_and_keyword_group_tools,
+        test_client_context_is_hidden_system_message_and_replaced,
+        test_keyword_workshop_context_returns_safe_action_suggestions,
+        test_product_pool_context_returns_navigation_suggestions,
+        test_tracking_context_returns_bounded_action_suggestions,
+        test_task_center_context_returns_diagnostic_navigation_suggestions,
         test_confirm_without_pending_action_returns_safe_message,
         test_operation_tool_returns_pending_action_without_execution,
         test_open_amazon_page_is_confirmation_operation,
@@ -357,6 +572,7 @@ if __name__ == "__main__":
         test_confirm_approved_executes_pending_action_and_continues,
         test_confirm_cancel_does_not_execute_pending_action,
         test_api_agent_chat_uses_mock_provider_without_real_key,
+        test_api_agent_suggestions_does_not_require_model_config,
         test_api_agent_config_endpoints_are_thin_wrappers,
     ]
     for test in tests:

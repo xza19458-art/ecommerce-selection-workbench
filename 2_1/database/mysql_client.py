@@ -76,6 +76,62 @@ CREATE TABLE IF NOT EXISTS keyword_tracking_tasks (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Keyword long-term tracking tasks'
 """
 
+KEYWORD_IDEA_RUNS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS keyword_idea_runs (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'Keyword idea run ID',
+  marketplace VARCHAR(16) NOT NULL DEFAULT 'US' COMMENT 'Marketplace',
+  seed_keywords_json JSON NOT NULL COMMENT 'Seed keywords used for this run',
+  sources_json JSON NOT NULL COMMENT 'Enabled idea sources',
+  expansion_mode VARCHAR(32) NOT NULL DEFAULT 'suggest_alpha_num' COMMENT 'Expansion mode',
+  status VARCHAR(32) NOT NULL DEFAULT 'running' COMMENT 'running/completed/error',
+  total_found INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Raw candidate count',
+  total_saved INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Saved or merged idea count',
+  warning_message TEXT NULL COMMENT 'Non-blocking warning details',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Created time',
+  finished_at DATETIME NULL COMMENT 'Finished time',
+  PRIMARY KEY (id),
+  KEY idx_keyword_idea_runs_created (created_at),
+  KEY idx_keyword_idea_runs_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Keyword workshop generation runs'
+"""
+
+KEYWORD_IDEAS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS keyword_ideas (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'Keyword idea ID',
+  marketplace VARCHAR(16) NOT NULL DEFAULT 'US' COMMENT 'Marketplace',
+  keyword VARCHAR(255) NOT NULL COMMENT 'Display keyword',
+  normalized_keyword VARCHAR(255) NOT NULL COMMENT 'Normalized keyword for de-duplication',
+  status VARCHAR(32) NOT NULL DEFAULT 'candidate' COMMENT 'candidate/promoted/tracking/ignored',
+  source_types VARCHAR(255) NOT NULL COMMENT 'Comma-separated source types',
+  seed_keywords_json JSON NOT NULL COMMENT 'Seed keywords that discovered this idea',
+  evidence_json JSON NULL COMMENT 'Source evidence and scoring signals',
+  idea_score DECIMAL(6,2) NOT NULL DEFAULT 0 COMMENT 'Early idea score',
+  confidence_score DECIMAL(6,2) NOT NULL DEFAULT 0 COMMENT 'Evidence confidence score',
+  recommendation_level VARCHAR(32) NOT NULL DEFAULT '仅作灵感' COMMENT 'Chinese recommendation label',
+  reason TEXT NOT NULL COMMENT 'Chinese scoring reason',
+  occurrence_count INT UNSIGNED NOT NULL DEFAULT 1 COMMENT 'Current evidence strength count',
+  last_run_id BIGINT UNSIGNED NULL COMMENT 'Latest keyword idea run ID',
+  promoted_keyword_id BIGINT UNSIGNED NULL COMMENT 'Promoted keyword ID',
+  tracking_task_id BIGINT UNSIGNED NULL COMMENT 'Created tracking task ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Created time',
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Updated time',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_keyword_idea_market_norm (marketplace, normalized_keyword),
+  KEY idx_keyword_idea_status_score (status, idea_score),
+  KEY idx_keyword_idea_updated (updated_at),
+  KEY idx_keyword_idea_source (source_types),
+  CONSTRAINT fk_keyword_ideas_last_run
+    FOREIGN KEY (last_run_id) REFERENCES keyword_idea_runs(id)
+    ON DELETE SET NULL,
+  CONSTRAINT fk_keyword_ideas_keyword
+    FOREIGN KEY (promoted_keyword_id) REFERENCES keywords(id)
+    ON DELETE SET NULL,
+  CONSTRAINT fk_keyword_ideas_tracking
+    FOREIGN KEY (tracking_task_id) REFERENCES keyword_tracking_tasks(id)
+    ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Keyword workshop candidate ideas'
+"""
+
 
 class DatabaseConfigError(RuntimeError):
     """Raised when MySQL configuration or dependency is missing."""
@@ -225,6 +281,11 @@ class MySQLClient:
 
     def ensure_keyword_tracking_table(self, cursor: Any) -> None:
         cursor.execute(KEYWORD_TRACKING_TASKS_TABLE_SQL)
+
+    def ensure_keyword_workshop_tables(self, cursor: Any) -> None:
+        cursor.execute(KEYWORD_TRACKING_TASKS_TABLE_SQL)
+        cursor.execute(KEYWORD_IDEA_RUNS_TABLE_SQL)
+        cursor.execute(KEYWORD_IDEAS_TABLE_SQL)
 
     def has_columns(self, cursor: Any, table: str, columns: list[str] | tuple[str, ...]) -> bool:
         existing = self._fetch_existing_columns(cursor, table)

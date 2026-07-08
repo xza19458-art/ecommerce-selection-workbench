@@ -20,14 +20,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.controller import AppController
-from services.agent_chat import AgentChatService, AgentConversationStore
+from services.agent_chat import AgentChatService, AgentConversationStore, build_agent_action_suggestions
 from services.llm_provider import (
     LLMProviderError,
     build_provider_from_config,
@@ -49,6 +49,14 @@ _controller = AppController()
 _agent_store = AgentConversationStore()
 
 
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: dict[str, Any]):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 def _ok(data: Any) -> dict[str, Any]:
     return {"ok": True, "data": jsonable_encoder(data), "message": ""}
 
@@ -59,9 +67,69 @@ async def _handle_all(_request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"ok": False, "data": None, "message": str(exc)})
 
 
+class KeywordWorkshopRunIn(BaseModel):
+    seed_text: str | None = None
+    seed_keywords: list[str] = Field(default_factory=list)
+    marketplace: str = "US"
+    use_suggest: bool = True
+    use_titles: bool = True
+    expand_suggest: bool = True
+    max_suggest_queries_per_seed: int = 16
+    max_title_rows: int = 300
+
+
+class KeywordIdeaIdsIn(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    marketplace: str = "US"
+
+
+class KeywordIdeaTrackingIn(KeywordIdeaIdsIn):
+    target_snapshots: int = 3
+    pages_per_keyword: int | None = None
+
+
+class KeywordIdeaStatusIn(KeywordIdeaIdsIn):
+    status: str
+
+
+class KeywordRunStatusIn(BaseModel):
+    status: str
+    marketplace: str = "US"
+
+
+class KeywordLibraryTrackingIn(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    marketplace: str = "US"
+    target_snapshots: int = 3
+    pages_per_keyword: int | None = None
+
+
+class DesktopOpenWebIn(BaseModel):
+    path: str = "/"
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return _ok({"status": "ok"})
+
+
+@app.post("/api/desktop/open-web")
+def desktop_open_web(body: DesktopOpenWebIn, request: Request) -> dict[str, Any]:
+    import webbrowser
+
+    path = (body.path or "/").strip().replace("\\", "/")
+    if "://" in path or path.startswith("//"):
+        raise HTTPException(status_code=400, detail="只允许打开当前本地应用页面")
+    if not path.startswith("/"):
+        path = "/" + path
+
+    base_url = str(request.base_url).rstrip("/")
+    if not (base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:")):
+        raise HTTPException(status_code=400, detail="只允许打开本地应用页面")
+
+    url = f"{base_url}{path}"
+    webbrowser.open(url, new=2)
+    return _ok({"url": url})
 
 
 @app.get("/api/recommendations")
@@ -165,6 +233,163 @@ def keyword_opportunities(
     )
 
 
+# ---------- 关键词资产库：已入库关键词统一查看 ----------
+
+@app.get("/api/keyword-library/keywords")
+def keyword_library_keywords(
+    limit: int = 100,
+    offset: int = 0,
+    marketplace: str = "US",
+    keyword: str | None = None,
+    snapshot_filter: str = "all",
+    tracking_filter: str = "all",
+    source_filter: str = "all",
+) -> dict[str, Any]:
+    from services.keyword_library import fetch_keyword_assets_page
+
+    return _ok(
+        fetch_keyword_assets_page(
+            limit=limit,
+            offset=offset,
+            marketplace=marketplace,
+            keyword=keyword,
+            snapshot_filter=snapshot_filter,
+            tracking_filter=tracking_filter,
+            source_filter=source_filter,
+        )
+    )
+
+
+@app.get("/api/keyword-library/tree")
+def keyword_library_tree(
+    marketplace: str = "US",
+    keyword: str | None = None,
+    snapshot_filter: str = "all",
+    tracking_filter: str = "all",
+    source_filter: str = "all",
+    max_keywords: int = 500,
+) -> dict[str, Any]:
+    from services.keyword_library import fetch_keyword_asset_tree
+
+    return _ok(
+        fetch_keyword_asset_tree(
+            marketplace=marketplace,
+            keyword=keyword,
+            snapshot_filter=snapshot_filter,
+            tracking_filter=tracking_filter,
+            source_filter=source_filter,
+            max_keywords=max_keywords,
+        )
+    )
+
+
+@app.get("/api/keyword-library/keywords/{keyword_id}")
+def keyword_library_detail(keyword_id: int) -> dict[str, Any]:
+    from services.keyword_library import fetch_keyword_asset_detail
+
+    return _ok(fetch_keyword_asset_detail(keyword_id))
+
+
+@app.post("/api/keyword-library/keywords/create-tracking")
+def keyword_library_create_tracking(body: KeywordLibraryTrackingIn) -> dict[str, Any]:
+    from services.keyword_library import create_tracking_for_keywords
+
+    return _ok(
+        create_tracking_for_keywords(
+            body.ids,
+            marketplace=body.marketplace,
+            target_snapshots=body.target_snapshots,
+            pages_per_keyword=body.pages_per_keyword,
+        )
+    )
+
+
+# ---------- 关键词创意工坊：生成候选、人工推广、复用追踪任务 ----------
+
+@app.post("/api/keyword-workshop/runs")
+def keyword_workshop_run(body: KeywordWorkshopRunIn) -> dict[str, Any]:
+    from services.keyword_workshop import run_keyword_workshop
+
+    seeds: list[str] | str = body.seed_keywords or (body.seed_text or "")
+    result = run_keyword_workshop(
+        seed_keywords=seeds,
+        marketplace=body.marketplace,
+        use_suggest=body.use_suggest,
+        use_titles=body.use_titles,
+        expand_suggest=body.expand_suggest,
+        max_suggest_queries_per_seed=body.max_suggest_queries_per_seed,
+        max_title_rows=body.max_title_rows,
+    )
+    return _ok(result.to_dict())
+
+
+@app.get("/api/keyword-workshop/runs")
+def keyword_workshop_runs(limit: int = 20, offset: int = 0, marketplace: str = "US") -> dict[str, Any]:
+    from services.keyword_workshop import fetch_keyword_idea_runs_page
+
+    return _ok(fetch_keyword_idea_runs_page(limit=limit, offset=offset, marketplace=marketplace))
+
+
+@app.get("/api/keyword-workshop/ideas")
+def keyword_workshop_ideas(
+    limit: int = 100,
+    offset: int = 0,
+    marketplace: str = "US",
+    status: str | None = None,
+    keyword: str | None = None,
+    source: str | None = None,
+    run_id: int | None = None,
+) -> dict[str, Any]:
+    from services.keyword_workshop import fetch_keyword_ideas_page
+
+    return _ok(
+        fetch_keyword_ideas_page(
+            limit=limit,
+            offset=offset,
+            marketplace=marketplace,
+            status=status,
+            keyword=keyword,
+            source=source,
+            run_id=run_id,
+        )
+    )
+
+
+@app.post("/api/keyword-workshop/ideas/promote")
+def keyword_workshop_promote(body: KeywordIdeaIdsIn) -> dict[str, Any]:
+    from services.keyword_workshop import promote_keyword_ideas
+
+    return _ok(promote_keyword_ideas(body.ids, marketplace=body.marketplace))
+
+
+@app.post("/api/keyword-workshop/ideas/create-tracking")
+def keyword_workshop_create_tracking(body: KeywordIdeaTrackingIn) -> dict[str, Any]:
+    from services.keyword_workshop import create_tracking_from_keyword_ideas
+
+    return _ok(
+        create_tracking_from_keyword_ideas(
+            body.ids,
+            marketplace=body.marketplace,
+            target_snapshots=body.target_snapshots,
+            pages_per_keyword=body.pages_per_keyword,
+        )
+    )
+
+
+@app.post("/api/keyword-workshop/ideas/status")
+def keyword_workshop_set_status(body: KeywordIdeaStatusIn) -> dict[str, Any]:
+    from services.keyword_workshop import update_keyword_idea_status
+
+    return _ok(update_keyword_idea_status(body.ids, body.status, marketplace=body.marketplace))
+
+
+@app.post("/api/keyword-workshop/runs/{run_id}/ideas/status")
+def keyword_workshop_set_run_status(run_id: int, body: KeywordRunStatusIn) -> dict[str, Any]:
+    from services.keyword_workshop import update_keyword_idea_status_by_run
+
+    return _ok(update_keyword_idea_status_by_run(run_id, body.status, marketplace=body.marketplace))
+
+
 @app.get("/api/reviews/insights")
 def review_insights(limit: int = 100, keyword: str | None = None) -> dict[str, Any]:
     return _ok(_controller.get_review_insights(limit=limit, keyword=keyword))
@@ -210,6 +435,11 @@ class AgentChatIn(BaseModel):
     conversation_id: str | None = None
     message: str | None = None
     confirm: dict[str, Any] | None = None
+    client_context: dict[str, Any] | None = None
+
+
+class AgentSuggestionsIn(BaseModel):
+    client_context: dict[str, Any] | None = None
 
 
 class AgentConfigIn(BaseModel):
@@ -508,13 +738,19 @@ def agent_chat(body: AgentChatIn) -> dict[str, Any]:
             conversation_id=body.conversation_id,
             message=body.message,
             confirm=body.confirm,
+            client_context=body.client_context,
         )
     except LLMProviderError as exc:
         return {"ok": False, "data": None, "message": str(exc)}
     return _ok(data)
 
 
+@app.post("/api/agent/suggestions")
+def agent_suggestions(body: AgentSuggestionsIn) -> dict[str, Any]:
+    return _ok({"action_suggestions": build_agent_action_suggestions(body.client_context)})
+
+
 # 静态前端挂在最后：所有 /api/* 显式路由优先匹配，其余路径回落到 web/。
 # html=True 让 "/" 返回 index.html，支持前端 hash 路由刷新。
 if _WEB_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
+    app.mount("/", NoCacheStaticFiles(directory=str(_WEB_DIR), html=True), name="web")

@@ -49,11 +49,14 @@ class AgentToolExecutor:
     def __init__(self, controller: AppController | None = None) -> None:
         self.controller = controller or AppController()
         self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
+            "query_app_overview": self._query_app_overview,
             "query_recommendations": self._query_recommendations,
             "query_products": self._query_products,
             "query_product_detail": self._query_product_detail,
             "query_product_trend": self._query_product_trend,
             "query_keyword_opportunities": self._query_keyword_opportunities,
+            "query_keyword_groups": self._query_keyword_groups,
+            "query_keyword_ideas": self._query_keyword_ideas,
             "query_review_insights": self._query_review_insights,
             "query_tracking_tasks": self._query_tracking_tasks,
             "query_tasks": self._query_tasks,
@@ -86,6 +89,38 @@ class AgentToolExecutor:
     def _query_recommendations(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         return self.controller.get_top_recommendations(limit=_int(data.get("limit"), 50, 1, 200))
 
+    def _query_app_overview(self, data: dict[str, Any]) -> dict[str, Any]:
+        limit = _int(data.get("limit"), 5, 1, 20)
+        keyword = _optional_str(data.get("keyword"))
+        keyword_section = _safe_call(lambda: self.controller.get_keyword_opportunities(limit=limit * 3, keyword=keyword))
+        keyword_rows = keyword_section.get("data") if keyword_section.get("ok") else []
+        overview = {
+            "推荐榜": _safe_call(lambda: self.controller.get_top_recommendations(limit=limit)),
+            "关键词机会": {
+                **keyword_section,
+                "data": (keyword_rows or [])[:limit] if keyword_section.get("ok") else None,
+            },
+            "关键词一级分组": _safe_call(
+                lambda: _build_keyword_groups(
+                    keyword_rows or [],
+                    mode="tail",
+                    max_groups=limit,
+                    keywords_per_group=5,
+                )
+            ),
+            "关键词创意候选": _safe_call(lambda: self._query_keyword_ideas({"limit": limit, "status": "candidate"})),
+            "评论洞察": _safe_call(lambda: self.controller.get_review_insights(limit=limit, keyword=keyword)),
+            "追踪任务": _safe_call(lambda: self._tracking_tasks(limit=limit)),
+            "任务中心": _safe_call(lambda: self.controller.get_task_jobs(limit=limit)),
+        }
+        overview["使用建议"] = [
+            "回答全局问题时，先看推荐榜和关键词机会，再结合任务中心判断数据是否新鲜。",
+            "如果评论洞察为空或证据很少，需要说明评论数据不足，不能编造低分痛点。",
+            "如果商品历史快照少于 2 条，不能下趋势结论；少于 3 条时趋势置信度仍偏低。",
+            "触发采集前建议先预开启 Amazon 页面并让用户处理地址、登录或验证码。",
+        ]
+        return overview
+
     def _query_products(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         return self.controller.get_product_pool(
             limit=_int(data.get("limit"), 100, 1, 500),
@@ -113,6 +148,38 @@ class AgentToolExecutor:
             min_products=_optional_int(data.get("min_products")),
         )
 
+    def _query_keyword_groups(self, data: dict[str, Any]) -> dict[str, Any]:
+        rows = self.controller.get_keyword_opportunities(
+            limit=_int(data.get("limit"), 500, 1, 500),
+            keyword=_optional_str(data.get("keyword")),
+            min_products=_optional_int(data.get("min_products")),
+        )
+        mode = _optional_str(data.get("mode")) or "tail"
+        groups = _build_keyword_groups(
+            rows,
+            mode=mode,
+            max_groups=_int(data.get("max_groups"), 20, 1, 100),
+            keywords_per_group=_int(data.get("keywords_per_group"), 8, 1, 30),
+        )
+        return {
+            "mode": mode if mode in {"tail", "first", "shared"} else "tail",
+            "total_keywords": len(rows),
+            "groups": groups,
+        }
+
+    def _query_keyword_ideas(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        from services.keyword_workshop import fetch_keyword_ideas_page
+
+        page = fetch_keyword_ideas_page(
+            limit=_int(data.get("limit"), 100, 1, 500),
+            offset=0,
+            marketplace=_optional_str(data.get("marketplace")) or "US",
+            status=_optional_str(data.get("status")),
+            keyword=_optional_str(data.get("keyword")),
+            source=_optional_str(data.get("source")),
+        )
+        return page["rows"]
+
     def _query_review_insights(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         return self.controller.get_review_insights(
             limit=_int(data.get("limit"), 100, 1, 500),
@@ -120,11 +187,20 @@ class AgentToolExecutor:
         )
 
     def _query_tracking_tasks(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._tracking_tasks(
+            status=_optional_str(data.get("status")),
+            limit=_int(data.get("limit"), 50, 1, 500),
+        )
+
+    def _tracking_tasks(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        controller_method = getattr(self.controller, "get_tracking_tasks", None)
+        if callable(controller_method):
+            return controller_method(status=status, limit=limit)
         from services.keyword_tracking import list_tracking_tasks
 
         tasks = list_tracking_tasks(
-            status=_optional_str(data.get("status")),
-            limit=_int(data.get("limit"), 50, 1, 500),
+            status=status,
+            limit=limit,
         )
         return [task.to_dict() for task in tasks]
 
@@ -172,6 +248,19 @@ class AgentToolExecutor:
 def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
     return [
         AgentToolDefinition(
+            name="query_app_overview",
+            description=(
+                "查询应用全局概览：推荐榜、关键词机会、一级关键词分组、关键词创意候选、评论洞察、"
+                "追踪任务和任务中心。适合回答“现在系统情况/下一步/哪些机会值得看”。"
+            ),
+            parameters=_schema(
+                {
+                    "limit": _integer("每个模块返回数量，默认 5，最大 20。", default=5, minimum=1, maximum=20),
+                    "keyword": _string("可选关键词，用于过滤关键词机会和评论洞察。"),
+                }
+            ),
+        ),
+        AgentToolDefinition(
             name="query_recommendations",
             description="查询当前推荐榜商品，适合回答哪些商品值得优先关注。",
             parameters=_schema(
@@ -212,6 +301,48 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
                     "limit": _integer("返回数量，默认 100。", default=100, minimum=1, maximum=500),
                     "keyword": _string("关键词过滤，可为空。"),
                     "min_products": _integer("最少关联商品数。", minimum=0),
+                }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_keyword_groups",
+            description=(
+                "按一级关键词聚合关键词机会，支持词尾、词首、共享词三种模式；"
+                "适合分析赛道/中心词，而不是只看单个关键词。"
+            ),
+            parameters=_schema(
+                {
+                    "mode": {
+                        "type": "string",
+                        "description": "分组方式：tail=词尾，first=词首，shared=共享词。",
+                        "enum": ["tail", "first", "shared"],
+                    },
+                    "limit": _integer("用于分组的关键词数量，默认 500，最大 500。", default=500, minimum=1, maximum=500),
+                    "keyword": _string("关键词过滤，可为空。"),
+                    "min_products": _integer("最少关联商品数。", minimum=0),
+                    "max_groups": _integer("返回一级分组数，默认 20。", default=20, minimum=1, maximum=100),
+                    "keywords_per_group": _integer("每组返回二级关键词数，默认 8。", default=8, minimum=1, maximum=30),
+                }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_keyword_ideas",
+            description="查询关键词创意工坊候选池，适合查看种子词扩展、来源证据、创意分和候选状态。",
+            parameters=_schema(
+                {
+                    "limit": _integer("返回数量，默认 100。", default=100, minimum=1, maximum=500),
+                    "marketplace": _string("站点，默认 US。"),
+                    "status": {
+                        "type": "string",
+                        "description": "候选状态，可为空。",
+                        "enum": ["candidate", "promoted", "tracking", "ignored"],
+                    },
+                    "keyword": _string("关键词过滤，可为空。"),
+                    "source": {
+                        "type": "string",
+                        "description": "来源过滤，可为空。",
+                        "enum": ["amazon_suggest", "title_ngram", "existing_keyword"],
+                    },
                 }
             ),
         ),
@@ -401,6 +532,109 @@ def _int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         number = default
     return max(minimum, min(number, maximum))
+
+
+def _safe_call(fn: Callable[[], Any]) -> dict[str, Any]:
+    try:
+        return {"ok": True, "data": _json_safe(fn())}
+    except Exception as exc:
+        return {"ok": False, "data": None, "message": str(exc)}
+
+
+_KW_STOPWORDS = {"for", "the", "a", "an", "of", "with", "and", "to", "in", "on", "by", "my", "your"}
+
+
+def _keyword_tokens(keyword: Any) -> list[str]:
+    return [part for part in str(keyword or "").lower().strip().split() if part]
+
+
+def _keyword_norm(token: str) -> str:
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _keyword_group_key(keyword: Any, mode: str, freq: dict[str, int]) -> str:
+    tokens = [_keyword_norm(token) for token in _keyword_tokens(keyword)]
+    if not tokens:
+        return ""
+    if mode == "first":
+        return tokens[0]
+    if mode == "shared":
+        candidates = [token for token in tokens if token not in _KW_STOPWORDS] or tokens
+        return max(candidates, key=lambda token: (freq.get(token, 0), token))
+    return tokens[-1]
+
+
+def _build_keyword_groups(
+    rows: list[dict[str, Any]],
+    *,
+    mode: str,
+    max_groups: int,
+    keywords_per_group: int,
+) -> list[dict[str, Any]]:
+    effective_mode = mode if mode in {"tail", "first", "shared"} else "tail"
+    freq: dict[str, int] = {}
+    if effective_mode == "shared":
+        for row in rows:
+            for token in set(_keyword_norm(token) for token in _keyword_tokens(row.get("keyword"))):
+                freq[token] = freq.get(token, 0) + 1
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = _keyword_group_key(row.get("keyword"), effective_mode, freq)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(row)
+
+    result: list[dict[str, Any]] = []
+    for primary, items in groups.items():
+        scores = [_float_value(item.get("opportunity_score")) for item in items]
+        product_count = sum(_int_value(item.get("product_count")) for item in items)
+        sorted_items = sorted(items, key=lambda item: _float_value(item.get("opportunity_score")), reverse=True)
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        max_score = max(scores) if scores else 0.0
+        result.append(
+            {
+                "primary": primary,
+                "keyword_count": len(items),
+                "product_count": product_count,
+                "avg_opportunity_score": round(avg_score, 2),
+                "max_opportunity_score": round(max_score, 2),
+                "level": "蓝海赛道" if avg_score >= 70 else "可观察",
+                "keywords": [
+                    {
+                        "keyword": item.get("keyword"),
+                        "opportunity_score": item.get("opportunity_score"),
+                        "product_count": item.get("product_count"),
+                    }
+                    for item in sorted_items[:keywords_per_group]
+                ],
+            }
+        )
+    return sorted(
+        result,
+        key=lambda group: (
+            _float_value(group.get("avg_opportunity_score")),
+            _int_value(group.get("keyword_count")),
+            _int_value(group.get("product_count")),
+        ),
+        reverse=True,
+    )[:max_groups]
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _json_safe(value: Any) -> Any:

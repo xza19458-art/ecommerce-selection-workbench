@@ -33,7 +33,12 @@ class FakeController:
         }
 
     def get_keyword_opportunities(self, **kwargs):
-        return [{"keyword": "test", "args": kwargs}]
+        return [
+            {"keyword": "mini squishy", "opportunity_score": 72, "product_count": 12, "args": kwargs},
+            {"keyword": "cow squishy", "opportunity_score": 68, "product_count": 8, "args": kwargs},
+            {"keyword": "gift for man", "opportunity_score": 61, "product_count": 30, "args": kwargs},
+            {"keyword": "man", "opportunity_score": 59, "product_count": 20, "args": kwargs},
+        ]
 
     def get_review_insights(self, **kwargs):
         return [{"asin": "B000000003", "pain_points": ["packaging"], "args": kwargs}]
@@ -41,16 +46,22 @@ class FakeController:
     def get_task_jobs(self, **kwargs):
         return [{"id": 1, "status": kwargs.get("status") or "done"}]
 
+    def get_tracking_tasks(self, **kwargs):
+        return [{"id": 7, "keyword": "squishy", "status": kwargs.get("status") or "active"}]
 
-def test_readonly_tool_schema_has_eight_tools() -> None:
+
+def test_readonly_tool_schema_has_eleven_tools() -> None:
     tools = get_readonly_tool_definitions()
-    assert len(tools) == 8
+    assert len(tools) == 11
     assert {tool.name for tool in tools} == {
+        "query_app_overview",
         "query_recommendations",
         "query_products",
         "query_product_detail",
         "query_product_trend",
         "query_keyword_opportunities",
+        "query_keyword_groups",
+        "query_keyword_ideas",
         "query_review_insights",
         "query_tracking_tasks",
         "query_tasks",
@@ -73,8 +84,39 @@ def test_operation_tool_schema_requires_confirmation() -> None:
 
 def test_agent_tool_schema_combines_readonly_and_operations() -> None:
     tools = get_agent_tool_definitions()
-    assert len(tools) == 12
+    assert len(tools) == 15
     assert sum(1 for tool in tools if tool.requires_confirmation) == 4
+
+
+def test_query_app_overview_returns_cross_module_snapshot() -> None:
+    executor = AgentToolExecutor(controller=FakeController())
+    result = executor.execute("query_app_overview", {"limit": 2})
+
+    assert result.ok is True
+    data = result.to_dict()["data"]
+    assert data["推荐榜"]["ok"] is True
+    assert data["关键词机会"]["ok"] is True
+    assert data["关键词一级分组"]["data"][0]["primary"] == "squishy"
+    assert data["追踪任务"]["data"][0]["id"] == 7
+    assert "触发采集前" in data["使用建议"][-1]
+
+
+def test_query_keyword_groups_groups_by_tail_and_shared_words() -> None:
+    executor = AgentToolExecutor(controller=FakeController())
+
+    tail = executor.execute("query_keyword_groups", {"mode": "tail", "max_groups": 3})
+    shared = executor.execute("query_keyword_groups", {"mode": "shared", "max_groups": 3})
+
+    assert tail.ok is True
+    tail_groups = tail.to_dict()["data"]["groups"]
+    squishy = next(group for group in tail_groups if group["primary"] == "squishy")
+    assert squishy["keyword_count"] == 2
+    assert squishy["avg_opportunity_score"] == 70.0
+    assert squishy["level"] == "蓝海赛道"
+
+    assert shared.ok is True
+    shared_groups = shared.to_dict()["data"]["groups"]
+    assert any(group["primary"] == "squishy" for group in shared_groups)
 
 
 def test_query_products_calls_controller_without_business_logic() -> None:
@@ -133,9 +175,11 @@ def test_trigger_collection_ignores_model_execute_flag() -> None:
 
 if __name__ == "__main__":
     tests = [
-        test_readonly_tool_schema_has_eight_tools,
+        test_readonly_tool_schema_has_eleven_tools,
         test_operation_tool_schema_requires_confirmation,
         test_agent_tool_schema_combines_readonly_and_operations,
+        test_query_app_overview_returns_cross_module_snapshot,
+        test_query_keyword_groups_groups_by_tail_and_shared_words,
         test_query_products_calls_controller_without_business_logic,
         test_query_product_trend_returns_json_safe_dataclass,
         test_unknown_tool_is_structured_error,

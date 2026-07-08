@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Amazon 选品助手</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=20260704-agent" />
   <!-- 轻量图表库（决策 §3 允许 ECharts/Chart.js，不引入 React 重型栈） -->
   <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
@@ -35,6 +35,8 @@
         <div class="nav-group">
           <div class="nav-group-title">洞察与决策</div>
           <a class="nav-item" href="#/recommendations">推荐 · 蓝海</a>
+          <a class="nav-item" href="#/keyword-workshop">关键词创意工坊</a>
+          <a class="nav-item" href="#/keyword-library">关键词资产库</a>
           <a class="nav-item" href="#/keywords">关键词机会</a>
           <a class="nav-item" href="#/reviews">评论痛点</a>
           <a class="nav-item" href="#/agent">AI 助手</a>
@@ -58,6 +60,7 @@
         <div class="topbar-actions">
           <button id="back-btn" class="btn" title="返回上一页（[ 或 Alt+←）">← 返回</button>
           <button id="client-translate-btn" class="btn" title="Chrome Translator API">译中文</button>
+          <button id="open-web-btn" class="btn" title="在系统浏览器打开当前页面">↗ Web</button>
           <button id="refresh-btn" class="btn" title="刷新当前页（R）">↻ 刷新</button>
         </div>
       </header>
@@ -65,6 +68,6 @@
     </main>
   </div>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=20260704-agent"></script>
 </body>
 </html>

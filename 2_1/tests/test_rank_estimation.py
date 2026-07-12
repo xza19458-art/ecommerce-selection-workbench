@@ -24,6 +24,7 @@ def _item(
     *,
     data_index: int,
     sponsored: bool = False,
+    extra_html: str = "",
 ) -> str:
     sponsored_text = "<span>Sponsored</span>" if sponsored else ""
     return f"""
@@ -35,6 +36,7 @@ def _item(
       <span class="a-icon-alt">4.7 out of 5 stars</span>
       <a href="/dp/{asin}#customerReviews"><span class="a-size-base">1,234</span></a>
       <span class="a-size-base a-color-secondary">1K+ bought in past month</span>
+      {extra_html}
     </div>
     """
 
@@ -133,12 +135,58 @@ def test_scoring_treats_low_confidence_rank_as_neutral() -> None:
     assert "置信度不足" in score.reason
 
 
+def test_parser_extracts_structured_product_size() -> None:
+    html = _page(
+        1,
+        [
+            _item(
+                "B000000005",
+                "Wipes Product",
+                data_index=1,
+                extra_html='<span class="a-size-base a-color-secondary">Size: 6 Pack (288 Count)</span>',
+            )
+        ],
+    )
+
+    result = parse_amazon_search_content(html, snapshot_at=SNAPSHOT_AT)
+
+    assert result.records[0].product_size == "6 Pack (288 Count)"
+
+
+def test_parser_falls_back_to_title_product_size() -> None:
+    html = _page(
+        1,
+        [
+            _item(
+                "B000000006",
+                "DUDE Wipes Unscented Flushable Wipes - 6 Pack (288 Count)",
+                data_index=1,
+            )
+        ],
+    )
+
+    result = parse_amazon_search_content(html, snapshot_at=SNAPSHOT_AT)
+
+    assert result.records[0].product_size == "6 Pack (288 Count)"
+
+
+def test_parser_does_not_treat_monthly_bought_as_product_size() -> None:
+    html = _page(1, [_item("B000000007", "Plain Product", data_index=1)])
+
+    result = parse_amazon_search_content(html, snapshot_at=SNAPSHOT_AT)
+
+    assert result.records[0].product_size is None
+
+
 if __name__ == "__main__":
     tests = [
         test_parser_uses_non_sponsored_dom_order_for_page_rank,
         test_ingestion_continues_estimated_rank_across_consecutive_pages,
         test_ingestion_does_not_create_global_rank_when_page_one_is_missing,
         test_scoring_treats_low_confidence_rank_as_neutral,
+        test_parser_extracts_structured_product_size,
+        test_parser_falls_back_to_title_product_size,
+        test_parser_does_not_treat_monthly_bought_as_product_size,
     ]
     for test in tests:
         test()

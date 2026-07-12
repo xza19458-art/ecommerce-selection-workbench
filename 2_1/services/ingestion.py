@@ -101,6 +101,7 @@ def ingest_html_files_to_mysql(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
+            db.ensure_product_attribute_columns(cursor)
             db.ensure_translation_columns(cursor)
             if translation_config.enabled and translation_config.use_cache:
                 db.ensure_translation_cache_table(cursor)

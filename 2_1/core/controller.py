@@ -7,12 +7,19 @@ import re
 import time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import random
 from typing import Callable
 
+from core.browser_runtime import (
+    ChromeDriverRepairRequiredError,
+    ChromeLaunchError,
+    resolve_browser_runtime,
+)
 from main import parse_amazon_page
 
 
@@ -29,13 +36,11 @@ class AppController:
     def _get_browser(self) -> webdriver.Chrome:
         """获取浏览器实例"""
         if not self._browser:
+            runtime = resolve_browser_runtime()
             options = Options()
 
-            # 使用本地Chrome浏览器
-            chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-            import os
-            if os.path.exists(chrome_path):
-                options.binary_location = chrome_path
+            # 只复用已安装的本机 Chrome 程序；采集仍使用隔离的临时用户目录。
+            options.binary_location = str(runtime.chrome.path)
 
             # 伪装成正常用户
             options.add_argument("--disable-blink-features=AutomationControlled")
@@ -64,12 +69,26 @@ class AppController:
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option("useAutomationExtension", False)
 
-            # 使用Selenium的自动驱动管理
-            from selenium.webdriver.chrome.service import Service
-            from webdriver_manager.chrome import ChromeDriverManager
-
-            service = Service(ChromeDriverManager().install())
-            self._browser = webdriver.Chrome(service=service, options=options)
+            # 显式传入已验证的本地驱动，禁止 Selenium 在此处静默联网下载。
+            service = Service(executable_path=str(runtime.driver.path))
+            try:
+                self._browser = webdriver.Chrome(service=service, options=options)
+            except WebDriverException as exc:
+                message = str(exc).lower()
+                repair_markers = (
+                    "only supports chrome version",
+                    "current browser version",
+                    "unexpectedly exited",
+                    "not a valid win32 application",
+                    "winerror 193",
+                    "wrong permissions",
+                )
+                if any(marker in message for marker in repair_markers):
+                    raise ChromeDriverRepairRequiredError(runtime) from exc
+                raise ChromeLaunchError(
+                    "已找到本机 Chrome 和匹配驱动，但浏览器启动失败。请关闭残留的采集窗口后重试，并检查安全软件是否拦截 ChromeDriver。",
+                    runtime,
+                ) from exc
 
             # 设置超时时间
             self._browser.set_page_load_timeout(30)
@@ -696,6 +715,8 @@ class AppController:
         min_price: float | None = None,
         max_price: float | None = None,
         max_reviews: int | None = None,
+        sort_by: str = "total_score",
+        sort_dir: str = "desc",
     ) -> list[dict]:
         """Fetch product pool rows from MySQL."""
         from services.product_pool import fetch_product_pool
@@ -708,6 +729,8 @@ class AppController:
             min_price=min_price,
             max_price=max_price,
             max_reviews=max_reviews,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
 
     def get_product_pool_page(
@@ -720,6 +743,8 @@ class AppController:
         min_price: float | None = None,
         max_price: float | None = None,
         max_reviews: int | None = None,
+        sort_by: str = "total_score",
+        sort_dir: str = "desc",
     ) -> dict:
         """Fetch paged product pool rows from MySQL."""
         from services.product_pool import fetch_product_pool_page
@@ -733,6 +758,8 @@ class AppController:
             min_price=min_price,
             max_price=max_price,
             max_reviews=max_reviews,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
 
     def get_product_history(self, asin: str) -> dict:
@@ -743,6 +770,12 @@ class AppController:
         detail = fetch_product_history(asin)
         detail["review_insight"] = fetch_product_review_insight(asin)
         return detail
+
+    def collect_product_detail(self, asin: str) -> dict:
+        """Collect one Amazon detail page using the shared browser session."""
+        from services.product_detail_collection import collect_product_detail
+
+        return collect_product_detail(asin, self._get_browser())
 
     def get_product_advice(self, asin: str) -> dict:
         """Selection conclusion / risk / entry-strategy for one product (shared with GUI)."""
@@ -780,6 +813,8 @@ class AppController:
         offset: int = 0,
         keyword: str | None = None,
         min_products: int | None = None,
+        sort_by: str = "opportunity_score",
+        sort_dir: str = "desc",
     ) -> dict:
         """Fetch paged keyword-level opportunity aggregates."""
         from services.keyword_opportunities import fetch_keyword_opportunities_page
@@ -789,6 +824,8 @@ class AppController:
             offset=offset,
             keyword=keyword,
             min_products=min_products,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
 
     def preview_review_import(self, file_path: str, default_asin: str | None = None) -> dict:

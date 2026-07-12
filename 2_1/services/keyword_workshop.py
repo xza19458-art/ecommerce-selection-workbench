@@ -559,6 +559,8 @@ def fetch_keyword_ideas_page(
     keyword: str | None = None,
     source: str | None = None,
     run_id: int | None = None,
+    sort_by: str = "idea_score",
+    sort_dir: str = "desc",
     client: MySQLClient | None = None,
 ) -> dict[str, Any]:
     db = client or MySQLClient()
@@ -572,6 +574,7 @@ def fetch_keyword_ideas_page(
         source=source,
         run_id=run_id,
     )
+    order_sql, normalized_sort, normalized_dir = _idea_order_by(sort_by, sort_dir)
     with db.connect() as conn:
         with conn.cursor() as cursor:
             db.ensure_keyword_workshop_tables(cursor)
@@ -582,13 +585,20 @@ def fetch_keyword_ideas_page(
                 SELECT *
                 FROM keyword_ideas
                 {where_sql}
-                ORDER BY idea_score DESC, confidence_score DESC, updated_at DESC
+                {order_sql}
                 LIMIT %s OFFSET %s
                 """,
                 params + [limit_value, offset_value],
             )
             rows = [_normalize_idea_row(row) for row in cursor.fetchall()]
-    return {"rows": rows, "total": total, "limit": limit_value, "offset": offset_value}
+    return {
+        "rows": rows,
+        "total": total,
+        "limit": limit_value,
+        "offset": offset_value,
+        "sort_by": normalized_sort,
+        "sort_dir": normalized_dir,
+    }
 
 
 def fetch_keyword_idea_runs_page(
@@ -1154,6 +1164,33 @@ def _build_idea_filters(
         clauses.append("last_run_id = %s")
         params.append(int(run_id))
     return "WHERE " + " AND ".join(clauses), params
+
+
+def _idea_order_by(sort_by: str, sort_dir: str) -> tuple[str, str, str]:
+    sorts = {
+        "id": "id",
+        "keyword": "normalized_keyword",
+        "recommendation_level": "recommendation_level",
+        "idea_score": "idea_score",
+        "confidence_score": "confidence_score",
+        "source_types": "source_types",
+        "status": "status",
+        "occurrence_count": "occurrence_count",
+        "updated_at": "updated_at",
+        "created_at": "created_at",
+        "last_run_id": "last_run_id",
+    }
+    normalized_sort = str(sort_by or "idea_score").strip()
+    if normalized_sort not in sorts:
+        normalized_sort = "idea_score"
+    normalized_dir = "asc" if str(sort_dir or "").lower() == "asc" else "desc"
+    direction = "ASC" if normalized_dir == "asc" else "DESC"
+    expr = sorts[normalized_sort]
+    return (
+        f"ORDER BY {expr} IS NULL, {expr} {direction}, idea_score DESC, confidence_score DESC, updated_at DESC, id DESC",
+        normalized_sort,
+        normalized_dir,
+    )
 
 
 def _source_status_for_run_transition(target_status: str) -> str:

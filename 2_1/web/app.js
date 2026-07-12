@@ -15,7 +15,7 @@ async function api(path) {
   } catch {
     throw new Error(`后端响应格式异常（HTTP ${resp.status}）`);
   }
-  if (!payload.ok) throw new Error(apiErrorMessage(payload, resp.status));
+  if (!payload.ok) throw apiRequestError(payload, resp.status);
   return payload.data;
 }
 
@@ -31,8 +31,17 @@ async function apiSend(path, method, body) {
   } catch {
     throw new Error(`后端响应格式异常（HTTP ${resp.status}）`);
   }
-  if (!payload.ok) throw new Error(apiErrorMessage(payload, resp.status));
+  if (!payload.ok) throw apiRequestError(payload, resp.status);
   return payload.data;
+}
+
+function apiRequestError(payload, status) {
+  const err = new Error(apiErrorMessage(payload, status));
+  err.name = "ApiRequestError";
+  err.status = status;
+  err.code = payload?.code || "";
+  err.data = payload?.data || null;
+  return err;
 }
 
 function apiErrorMessage(payload, status) {
@@ -80,6 +89,106 @@ function notice(msg, kind = "ok") {
   _noticeTimer = setTimeout(() => { el.className = "notice"; }, 4000);
 }
 
+let browserDriverDialogFinish = null;
+
+function closeBrowserDriverDialog(approved = false) {
+  if (browserDriverDialogFinish) {
+    browserDriverDialogFinish(approved);
+    return true;
+  }
+  const modal = document.getElementById("browser-driver-dialog");
+  if (modal) modal.remove();
+  return !!modal;
+}
+
+function confirmBrowserDriverDownload(info = {}) {
+  closeBrowserDriverDialog(false);
+  const browser = info.browser || {};
+  const versions = Array.isArray(info.detected_driver_versions)
+    ? info.detected_driver_versions.filter(Boolean)
+    : [];
+  const modal = document.createElement("div");
+  modal.id = "browser-driver-dialog";
+  modal.className = "modal-backdrop";
+  modal.innerHTML = `
+    <section class="modal-panel browser-driver-modal" role="dialog" aria-modal="true" aria-label="下载匹配浏览器驱动">
+      <div class="modal-head"><h2>需要匹配的浏览器驱动</h2></div>
+      <div class="browser-driver-body">
+        <p>已找到本机 Google Chrome，但当前没有可用的匹配驱动。是否现在下载？</p>
+        <div class="browser-driver-facts">
+          <div><span>Chrome 版本</span><b>${escapeHtml(browser.version || "未知")}</b></div>
+          <div><span>需要的驱动</span><b>${escapeHtml(info.expected_driver || "匹配版本")}</b></div>
+          ${versions.length ? `<div><span>已发现旧驱动</span><b>${escapeHtml(versions.join("、"))}</b></div>` : ""}
+        </div>
+        <p class="hint">驱动将从 Google Chrome for Testing 下载到当前用户缓存，仅用于控制本机 Chrome；不会替换 Chrome，也不会读取日常浏览器配置。</p>
+      </div>
+      <div class="browser-driver-actions">
+        <button class="btn" type="button" data-driver-cancel>暂不下载</button>
+        <button class="btn btn-warn" type="button" data-driver-install>下载匹配驱动</button>
+      </div>
+    </section>`;
+  document.body.appendChild(modal);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const onKeydown = (event) => {
+      if (event.key === "Escape") finish(false);
+    };
+    const finish = (approved) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeydown);
+      modal.remove();
+      browserDriverDialogFinish = null;
+      resolve(!!approved);
+    };
+    browserDriverDialogFinish = finish;
+    modal.querySelector("[data-driver-cancel]").onclick = () => finish(false);
+    modal.querySelector("[data-driver-install]").onclick = () => finish(true);
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) finish(false);
+    });
+    document.addEventListener("keydown", onKeydown);
+    modal.querySelector("[data-driver-install]").focus();
+  });
+}
+
+async function repairBrowserDriver(err) {
+  if (err?.code !== "chrome_driver_required" || err?.data?.can_download_driver === false) {
+    throw err;
+  }
+  const approved = await confirmBrowserDriverDownload(err.data || {});
+  if (!approved) {
+    const cancelled = new Error("未下载浏览器驱动，本次操作已取消。");
+    cancelled.code = "chrome_driver_download_cancelled";
+    throw cancelled;
+  }
+  notice("正在下载匹配的 ChromeDriver，请稍候…", "ok");
+  const installed = await apiSend("/api/crawl/browser-driver/install", "POST", { confirmed: true });
+  notice(`ChromeDriver ${installed?.driver?.version || ""} 已就绪`, "ok");
+  return installed;
+}
+
+async function ensureBrowserRuntimeReady() {
+  try {
+    return await api("/api/crawl/browser-runtime");
+  } catch (err) {
+    await repairBrowserDriver(err);
+    return api("/api/crawl/browser-runtime");
+  }
+}
+
+async function runBrowserAction(action) {
+  await ensureBrowserRuntimeReady();
+  try {
+    return await action();
+  } catch (err) {
+    if (err?.code !== "chrome_driver_required") throw err;
+    await repairBrowserDriver(err);
+    return action();
+  }
+}
+
 /* ---------- 通用 UI ---------- */
 const fmt = {
   money: (v) => (v == null || v === "" ? "—" : `$${Number(v).toFixed(2)}`),
@@ -111,6 +220,70 @@ function scoreBadge(score) {
 function displayTitle(row, fallback = "—") {
   return row?.title_zh || row?.title || row?.title_original || fallback;
 }
+
+const AMAZON_MARKETPLACE_DOMAINS = {
+  US: "amazon.com", CA: "amazon.ca", MX: "amazon.com.mx", BR: "amazon.com.br",
+  UK: "amazon.co.uk", GB: "amazon.co.uk", DE: "amazon.de", FR: "amazon.fr",
+  IT: "amazon.it", ES: "amazon.es", NL: "amazon.nl", SE: "amazon.se",
+  PL: "amazon.pl", BE: "amazon.com.be", JP: "amazon.co.jp", AU: "amazon.com.au",
+  IN: "amazon.in", SG: "amazon.sg", TR: "amazon.com.tr", SA: "amazon.sa",
+  AE: "amazon.ae", EG: "amazon.eg",
+};
+
+function amazonProductHref(rowOrAsin) {
+  const row = typeof rowOrAsin === "object" && rowOrAsin ? rowOrAsin : {};
+  const asin = String(row.asin || rowOrAsin || "").trim().toUpperCase();
+  const marketplace = String(row.marketplace || "US").trim().toUpperCase();
+  let domain = AMAZON_MARKETPLACE_DOMAINS[marketplace] || AMAZON_MARKETPLACE_DOMAINS.US;
+  try {
+    const source = new URL(String(row.product_url || ""));
+    const host = source.hostname.toLowerCase().replace(/^www\./, "");
+    if (Object.values(AMAZON_MARKETPLACE_DOMAINS).includes(host)) domain = host;
+  } catch { /* 缺少原链接时按站点生成标准链接。 */ }
+  return `https://www.${domain}/dp/${encodeURIComponent(asin)}`;
+}
+
+function amazonProductLink(rowOrAsin, label, maxLength = null) {
+  const row = typeof rowOrAsin === "object" && rowOrAsin ? rowOrAsin : {};
+  const asin = String(row.asin || rowOrAsin || "").trim().toUpperCase();
+  const fullLabel = String(label || asin || "—");
+  if (!/^[A-Z0-9]{10}$/.test(asin)) return escapeHtml(maxLength ? truncate(fullLabel, maxLength) : fullLabel);
+  const shown = maxLength ? truncate(fullLabel, maxLength) : fullLabel;
+  const marketplace = String(row.marketplace || "US").trim().toUpperCase();
+  const sourceUrl = String(row.product_url || "");
+  const tooltip = `${fullLabel}\n按住 Ctrl 并双击，在系统默认浏览器打开 Amazon 商品页`;
+  return `<a class="amazon-product-link" href="${escapeHtml(amazonProductHref(rowOrAsin))}"
+    data-amazon-asin="${escapeHtml(asin)}" data-amazon-marketplace="${escapeHtml(marketplace)}"
+    data-amazon-product-url="${escapeHtml(sourceUrl)}" title="${escapeHtml(tooltip)}"
+    onclick="return window.amazonProductLinkClick(event)"
+    ondblclick="window.amazonProductLinkDoubleClick(event)">${escapeHtml(shown)}</a>`;
+}
+
+window.amazonProductLinkClick = (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  return false;
+};
+
+window.amazonProductLinkDoubleClick = async (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  if (!event.ctrlKey) return;
+  const link = event.currentTarget;
+  const body = {
+    asin: link.dataset.amazonAsin,
+    marketplace: link.dataset.amazonMarketplace || "US",
+    product_url: link.dataset.amazonProductUrl || null,
+  };
+  try {
+    await apiSend("/api/desktop/open-amazon-product", "POST", body);
+    notice("已在系统默认浏览器打开 Amazon 商品页", "ok");
+  } catch (err) {
+    const fallback = link.href;
+    if (fallback) window.open(fallback, "_blank", "noopener");
+    else notice(err.message || "商品链接打开失败", "bad");
+  }
+};
 
 const CLIENT_TRANSLATE_SOURCE_LANG = "en";
 const CLIENT_TRANSLATE_TARGET_LANG = "zh";
@@ -345,16 +518,97 @@ function hasTextSelection() {
 }
 window.navHash = (hash) => { if (hasTextSelection()) return; location.hash = hash; };
 
+const VIEW_STATE_STORAGE_KEY = "amazon_view_state_v2";
+const persistedStateMeta = new WeakMap();
+
+function readViewStateBag() {
+  try {
+    const raw = localStorage.getItem(VIEW_STATE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeViewStateBag(bag) {
+  try {
+    localStorage.setItem(VIEW_STATE_STORAGE_KEY, JSON.stringify(bag));
+  } catch {
+    // 嵌入式桌面壳或隐私模式下可能不可写；状态保存失败不影响主流程。
+  }
+}
+
+function hydrateStateValue(defaultValue, savedValue) {
+  if (savedValue == null) return defaultValue;
+  if (typeof defaultValue === "number") {
+    const n = Number(savedValue);
+    return Number.isFinite(n) ? n : defaultValue;
+  }
+  if (typeof defaultValue === "boolean") return savedValue === true || savedValue === "true";
+  if (typeof defaultValue === "string") return String(savedValue);
+  return savedValue;
+}
+
+function createPersistentState(key, defaults, fields = Object.keys(defaults)) {
+  const saved = readViewStateBag()[key] || {};
+  const state = { ...defaults };
+  fields.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(saved, field)) {
+      state[field] = hydrateStateValue(defaults[field], saved[field]);
+    }
+  });
+  persistedStateMeta.set(state, { key, fields });
+  return state;
+}
+
+function persistState(state) {
+  const meta = persistedStateMeta.get(state);
+  if (!meta) return;
+  const bag = readViewStateBag();
+  const payload = {};
+  meta.fields.forEach((field) => {
+    const value = state[field];
+    if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "boolean" || Array.isArray(value)) {
+      payload[field] = value;
+    }
+  });
+  bag[meta.key] = payload;
+  writeViewStateBag(bag);
+}
+
+function bindStateInputs(ids, readFn) {
+  ids.forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const save = () => {
+      if (typeof readFn === "function") readFn();
+    };
+    el.addEventListener("change", save);
+    el.addEventListener("input", save);
+  });
+}
+
 const productCompareSelection = new Set();
 let productCompareRows = new Map();
-const recommendationState = { limit: 20, offset: 0, sortBy: "total_score", sortDir: "desc", blueOnly: false };
-const productState = { limit: 50, offset: 0 };
-const keywordState = { limit: 50, offset: 0, keyword: "", minProducts: "" };
-const keywordProductState = { keyword: "", limit: 25, offset: 0 };
+const recommendationState = createPersistentState("recommendations", { limit: 20, offset: 0, sortBy: "total_score", sortDir: "desc", blueOnly: false });
+const productState = createPersistentState("products", {
+  limit: 50,
+  offset: 0,
+  keyword: "",
+  minScore: "",
+  minPrice: "",
+  maxPrice: "",
+  maxReviews: "",
+  sortBy: "total_score",
+  sortDir: "desc",
+});
+const keywordState = createPersistentState("keywords", { limit: 50, offset: 0, keyword: "", minProducts: "", groupMode: "tail", primaryOpen: false, sortBy: "opportunity_score", sortDir: "desc" });
+const keywordProductState = createPersistentState("keywordProducts", { keyword: "", limit: 25, offset: 0, sortBy: "total_score", sortDir: "desc" });
 const keywordLibraryRows = new Map();
 const keywordLibrarySelected = new Set();
 const keywordLibraryTreeCollapsed = new Set();
-const keywordLibraryState = {
+const keywordLibraryState = createPersistentState("keywordLibrary", {
   limit: 50,
   offset: 0,
   keyword: "",
@@ -363,19 +617,33 @@ const keywordLibraryState = {
   trackingFilter: "all",
   sourceFilter: "all",
   viewMode: "table",
-};
+  sortBy: "latest_snapshot_at",
+  sortDir: "desc",
+});
 const keywordWorkshopIdeaRows = new Map();
-const keywordWorkshopState = {
+const keywordWorkshopState = createPersistentState("keywordWorkshop", {
   limit: 50,
   offset: 0,
   keyword: "",
   status: "candidate",
   source: "all",
-  selected: new Set(),
   lastRunId: null,
   runId: null,
   runsLimit: 8,
-};
+  sortBy: "idea_score",
+  sortDir: "desc",
+});
+keywordWorkshopState.selected = new Set();
+const crawlState = createPersistentState("crawl", { keyword: "", pages: 1, queueMode: false });
+const trackingFormState = createPersistentState("trackingForm", { keyword: "", targetSnapshots: 3, pagesPerKeyword: 2, marketplace: "US" });
+const htmlImportState = createPersistentState("htmlImport", { keyword: "", selectedFiles: [] });
+const reviewImportState = createPersistentState("reviewImport", {
+  file: "",
+  defaultAsin: "",
+  htmlDefaultAsin: "",
+  outputFormat: "csv",
+  selectedHtmlFiles: [],
+});
 const taskErrorRows = new Map();
 const taskRows = new Map();
 const taskSelected = new Set();
@@ -438,6 +706,7 @@ function bindPager(id, state, page, loadFn) {
   if (!el) return;
   state.limit = page.limit;
   state.offset = page.offset;
+  persistState(state);
   const total = Math.max(0, Number(page.total) || 0);
   const prev = el.querySelector('[data-page="prev"]');
   const next = el.querySelector('[data-page="next"]');
@@ -448,15 +717,18 @@ function bindPager(id, state, page, loadFn) {
     const totalPages = Math.max(1, Math.ceil(total / state.limit));
     const pageNo = Math.max(1, Math.min(Number(jump?.value) || 1, totalPages));
     state.offset = (pageNo - 1) * state.limit;
+    persistState(state);
     loadFn();
   };
   if (prev) prev.onclick = () => {
     state.offset = Math.max(0, state.offset - state.limit);
+    persistState(state);
     loadFn();
   };
   if (next) next.onclick = () => {
     const maxOffset = Math.max(0, (Math.ceil(total / state.limit) - 1) * state.limit);
     state.offset = Math.min(maxOffset, state.offset + state.limit);
+    persistState(state);
     loadFn();
   };
   if (go) go.onclick = jumpToPage;
@@ -466,6 +738,7 @@ function bindPager(id, state, page, loadFn) {
   if (pageSize) pageSize.onchange = () => {
     state.limit = Number(pageSize.value) || state.limit;
     state.offset = 0;
+    persistState(state);
     loadFn();
   };
 }
@@ -597,22 +870,26 @@ async function viewRecommendations() {
   document.getElementById("rec-sort").onchange = () => {
     recommendationState.sortBy = document.getElementById("rec-sort").value;
     recommendationState.offset = 0;
+    persistState(recommendationState);
     loadRecommendations();
   };
   document.getElementById("rec-dir").onchange = () => {
     recommendationState.sortDir = document.getElementById("rec-dir").value;
     recommendationState.offset = 0;
+    persistState(recommendationState);
     loadRecommendations();
   };
   document.getElementById("rec-blue").onchange = () => {
     recommendationState.blueOnly = document.getElementById("rec-blue").checked;
     recommendationState.offset = 0;
+    persistState(recommendationState);
     loadRecommendations();
   };
   await loadRecommendations();
 }
 
 async function loadRecommendations() {
+  persistState(recommendationState);
   const box = document.getElementById("rec-cards");
   const meta = document.getElementById("rec-meta");
   const pager = document.getElementById("rec-pager-wrap");
@@ -643,10 +920,11 @@ async function loadRecommendations() {
     }
     box.innerHTML = `<div class="cards">${rows.map((r) => `
       <div class="card" onclick="window.navHash('#/product/${encodeURIComponent(r.asin)}')">
-        <h3>${escapeHtml(displayTitle(r, r.asin))}</h3>
+        <h3>${amazonProductLink(r, displayTitle(r, r.asin), 86)}</h3>
         <div class="row"><span>综合得分</span> <b>${scoreBadge(r.total_score)}</b></div>
         <div class="row" title="占位值，趋势第二步接入真实增长分前未计入综合得分"><span>增长分（占位）</span> <b>${fmt.num(r.growth_score, 0)}</b></div>
         <div class="row"><span>价格</span> <b>${fmt.money(r.price)}</b></div>
+        <div class="row"><span>尺寸/规格</span> <b>${escapeHtml(truncate(fmt.text(r.product_size), 42))}</b></div>
         <div class="row"><span>评分 / 评论</span> <b>${fmt.num(r.rating)} · ${fmt.int(r.review_count)}</b></div>
         <div class="row"><span>近月购买</span> <b>${fmt.int(r.monthly_bought)}</b></div>
       </div>`).join("")}</div>`;
@@ -654,8 +932,8 @@ async function loadRecommendations() {
     bindPager("rec-pager", recommendationState, page, loadRecommendations);
     if (csv) csv.disabled = false;
     document.getElementById("rec-csv").onclick = () => {
-      const headers = ["ASIN", "标题", "综合得分", "增长分(占位)", "价格", "评分", "评论数", "近月购买"];
-      const data = rows.map((r) => [r.asin, displayTitle(r, r.asin), r.total_score, r.growth_score, r.price, r.rating, r.review_count, r.monthly_bought]);
+      const headers = ["ASIN", "标题", "综合得分", "增长分(占位)", "价格", "尺寸/规格", "评分", "评论数", "近月购买"];
+      const data = rows.map((r) => [r.asin, displayTitle(r, r.asin), r.total_score, r.growth_score, r.price, r.product_size, r.rating, r.review_count, r.monthly_bought]);
     exportCsv("推荐蓝海.csv", headers, data);
   };
   } catch (err) {
@@ -685,8 +963,19 @@ async function viewProducts() {
     </div>
     <div id="prod-table"></div>
     <div id="prod-pager-wrap"></div>`;
+  document.getElementById("f-keyword").value = productState.keyword;
+  document.getElementById("f-min-score").value = productState.minScore;
+  document.getElementById("f-min-price").value = productState.minPrice;
+  document.getElementById("f-max-price").value = productState.maxPrice;
+  document.getElementById("f-max-reviews").value = productState.maxReviews;
   document.getElementById("f-apply").onclick = () => loadProducts(true);
   document.getElementById("f-reset").onclick = () => {
+    productState.keyword = "";
+    productState.minScore = "";
+    productState.minPrice = "";
+    productState.maxPrice = "";
+    productState.maxReviews = "";
+    productCompareSelection.clear();
     ["f-keyword", "f-min-score", "f-min-price", "f-max-price", "f-max-reviews"]
       .forEach((id) => { document.getElementById(id).value = ""; });
     loadProducts(true);
@@ -703,8 +992,21 @@ async function viewProducts() {
   });
   await loadProducts();
 }
+
+function readProductFiltersFromDom() {
+  productState.keyword = document.getElementById("f-keyword").value.trim();
+  productState.minScore = document.getElementById("f-min-score").value.trim();
+  productState.minPrice = document.getElementById("f-min-price").value.trim();
+  productState.maxPrice = document.getElementById("f-max-price").value.trim();
+  productState.maxReviews = document.getElementById("f-max-reviews").value.trim();
+}
+
 async function loadProducts(resetPage = false) {
-  if (resetPage) productState.offset = 0;
+  if (resetPage) {
+    productState.offset = 0;
+    readProductFiltersFromDom();
+  }
+  persistState(productState);
   const box = document.getElementById("prod-table");
   const meta = document.getElementById("prod-meta");
   const pager = document.getElementById("prod-pager-wrap");
@@ -714,15 +1016,17 @@ async function loadProducts(resetPage = false) {
   const q = new URLSearchParams({
     limit: String(productState.limit),
     offset: String(productState.offset),
+    sort_by: productState.sortBy,
+    sort_dir: productState.sortDir,
   });
-  const g = (id) => document.getElementById(id).value.trim();
-  if (g("f-keyword")) q.set("keyword", g("f-keyword"));
-  if (g("f-min-score")) q.set("min_score", g("f-min-score"));
-  if (g("f-min-price")) q.set("min_price", g("f-min-price"));
-  if (g("f-max-price")) q.set("max_price", g("f-max-price"));
-  if (g("f-max-reviews")) q.set("max_reviews", g("f-max-reviews"));
+  if (productState.keyword) q.set("keyword", productState.keyword);
+  if (productState.minScore) q.set("min_score", productState.minScore);
+  if (productState.minPrice) q.set("min_price", productState.minPrice);
+  if (productState.maxPrice) q.set("max_price", productState.maxPrice);
+  if (productState.maxReviews) q.set("max_reviews", productState.maxReviews);
   try {
     const page = normalizePage(await api(`/api/products?${q.toString()}`), productState.limit);
+    syncRemoteSortState(productState, page);
     const rows = page.rows;
     meta.textContent = pageSummary(page, "商品") + " · 点列头排序 · 勾选 2-5 个商品后对比";
     if (!rows.length) {
@@ -736,14 +1040,15 @@ async function loadProducts(resetPage = false) {
     productCompareRows = new Map(rows.map((r) => [String(r.asin || ""), r]));
     renderSortableTable(box, [
       { key: "_select", label: "", sortable: false, csv: false, align: "check", render: (r) => productCompareCheckbox(r) },
-      { key: "title", label: "标题", render: (r) => escapeHtml(truncate(displayTitle(r, r.asin), 60)), sortVal: (r) => displayTitle(r, r.asin) },
+      { key: "title", label: "标题", render: (r) => amazonProductLink(r, displayTitle(r, r.asin), 60), sortVal: (r) => displayTitle(r, r.asin) },
       { key: "total_score", label: "得分", align: "num", numeric: true, render: (r) => scoreBadge(r.total_score), sortVal: (r) => r.total_score },
       { key: "price", label: "价格", align: "num", numeric: true, render: (r) => fmt.money(r.price), sortVal: (r) => r.price },
+      { key: "product_size", label: "尺寸/规格", render: (r) => escapeHtml(truncate(fmt.text(r.product_size), 28)), sortVal: (r) => r.product_size || "" },
       { key: "rating", label: "评分", align: "num", numeric: true, render: (r) => fmt.num(r.rating), sortVal: (r) => r.rating },
       { key: "review_count", label: "评论", align: "num", numeric: true, render: (r) => fmt.int(r.review_count), sortVal: (r) => r.review_count },
       { key: "monthly_bought", label: "近月购买", align: "num", numeric: true, render: (r) => fmt.int(r.monthly_bought), sortVal: (r) => r.monthly_bought },
       { key: "organic_rank", label: "序位估算", align: "num", numeric: true, render: (r) => fmt.int(r.organic_rank), sortVal: (r) => r.organic_rank },
-    ], rows, { rowHash: (r) => `#/product/${encodeURIComponent(r.asin)}`, defaultSort: { key: "total_score", dir: -1 }, exportName: "商品池" });
+    ], rows, { rowHash: (r) => `#/product/${encodeURIComponent(r.asin)}`, remoteSort: remoteSortOptions(productState, loadProducts), exportName: "商品池" });
     pager.innerHTML = renderPager("prod-pager", page, [20, 50, 100]);
     bindPager("prod-pager", productState, page, loadProducts);
     updateProductCompareBar();
@@ -981,11 +1286,13 @@ function collectAgentLiveContext() {
     };
   } else if (hash === "#/products") {
     ctx.product_filters = {
-      keyword: agentInputValue("f-keyword"),
-      min_score: agentInputValue("f-min-score"),
-      min_price: agentInputValue("f-min-price"),
-      max_price: agentInputValue("f-max-price"),
-      max_reviews: agentInputValue("f-max-reviews"),
+      keyword: productState.keyword,
+      min_score: productState.minScore,
+      min_price: productState.minPrice,
+      max_price: productState.maxPrice,
+      max_reviews: productState.maxReviews,
+      sort_by: productState.sortBy,
+      sort_dir: productState.sortDir,
       selected_asins: [...productCompareSelection],
       limit: productState.limit,
       offset: productState.offset,
@@ -994,8 +1301,12 @@ function collectAgentLiveContext() {
     ctx.keyword_filters = {
       keyword: keywordState.keyword,
       min_products: keywordState.minProducts,
+      sort_by: keywordState.sortBy,
+      sort_dir: keywordState.sortDir,
       selected_primary: document.querySelector(".kw-primary-chip.active")?.dataset.primary || "",
       selected_keyword: keywordProductState.keyword,
+      selected_product_sort_by: keywordProductState.sortBy,
+      selected_product_sort_dir: keywordProductState.sortDir,
       group_mode: keywordGroupMode,
       limit: keywordState.limit,
       offset: keywordState.offset,
@@ -1008,6 +1319,8 @@ function collectAgentLiveContext() {
       tracking_filter: keywordLibraryState.trackingFilter,
       source_filter: keywordLibraryState.sourceFilter,
       view_mode: keywordLibraryState.viewMode,
+      sort_by: keywordLibraryState.sortBy,
+      sort_dir: keywordLibraryState.sortDir,
       selected_keyword_ids: keywordLibrarySelectedIds(),
       selected_keywords: keywordLibrarySelectedRows(),
       limit: keywordLibraryState.limit,
@@ -1019,6 +1332,8 @@ function collectAgentLiveContext() {
       status: keywordWorkshopState.status,
       source: keywordWorkshopState.source,
       run_id: keywordWorkshopState.runId,
+      sort_by: keywordWorkshopState.sortBy,
+      sort_dir: keywordWorkshopState.sortDir,
       selected_idea_ids: keywordWorkshopSelectedIds(),
       limit: keywordWorkshopState.limit,
       offset: keywordWorkshopState.offset,
@@ -1303,7 +1618,9 @@ async function executeTrackingSuggestion(suggestion) {
   if (suggestion.operation === "collect") {
     const taskId = Number(suggestion.task_id || 0);
     if (!taskId) throw new Error("建议缺少追踪任务 ID。");
-    const result = await apiSend("/api/tracking/check", "POST", { execute: true, task_id: taskId });
+    const result = await runBrowserAction(
+      () => apiSend("/api/tracking/check", "POST", { execute: true, task_id: taskId })
+    );
     return { task_id: taskId, result };
   }
   throw new Error("暂不支持该追踪建议。");
@@ -1397,6 +1714,9 @@ window.confirmAgentAction = async (approved) => {
   agentState.sending = true;
   renderAgentMessages();
   try {
+    if (approved && ["open_amazon_page", "trigger_collection"].includes(action.tool)) {
+      await ensureBrowserRuntimeReady();
+    }
     const data = await apiSend("/api/agent/chat", "POST", {
       conversation_id: agentState.conversationId,
       message: null,
@@ -1563,19 +1883,42 @@ async function viewProductDetail(asin) {
   const p = detail.product || detail || {};
   const snaps = (detail.snapshots || []).slice().sort((a, b) =>
     String(a.snapshot_at).localeCompare(String(b.snapshot_at)));
+  const latest = snaps[snaps.length - 1] || {};
+  const bsrRanks = Array.isArray(detail.best_seller_ranks) ? detail.best_seller_ranks : [];
   content.innerHTML = `
     <div class="detail-head">
       <a class="link back-link" href="#/products">← 返回商品池</a>
-      <h2 style="margin:0;font-size:16px">${escapeHtml(displayTitle(p, asin))}</h2>
-      ${p.image_url ? `<figure class="product-hero">
-        <img class="product-hero__img" loading="lazy" alt="商品主图" title="点击放大看细节"
-             src="/api/products/${encodeURIComponent(asin)}/image"
-             onclick="window.openImageZoom('${encodeURIComponent(asin)}')"
-             onerror="this.closest('.product-hero').classList.add('product-hero--failed')" />
-        <figcaption class="product-hero__cap">商品图 · 点击放大看细节</figcaption>
-      </figure>` : ""}
-      <div class="meta">ASIN: ${escapeHtml(asin)} · 综合得分 ${scoreBadge(p.total_score)}
-        · 首次采集 ${fmt.text(p.first_seen_at)} · 最近采集 ${fmt.text(p.last_seen_at)}</div>
+      <h2 class="product-detail-title">${amazonProductLink(p, displayTitle(p, asin), 100)}</h2>
+      <div class="product-identity">
+        ${p.image_url ? `<figure class="product-hero">
+          <img class="product-hero__img" loading="lazy" alt="商品主图" title="点击放大看细节"
+               src="/api/products/${encodeURIComponent(asin)}/image"
+               onclick="window.openImageZoom('${encodeURIComponent(asin)}')"
+               onerror="this.closest('.product-hero').classList.add('product-hero--failed');this.closest('.product-identity').classList.add('product-identity--no-image')" />
+          <figcaption class="product-hero__cap">商品图 · 点击放大看细节</figcaption>
+        </figure>` : `<div class="product-image-empty">暂无商品图</div>`}
+        <section class="product-summary" aria-label="商品信息">
+          <div class="product-summary-head">
+            <h3>商品信息</h3>
+            <button class="btn btn-sm" id="collect-product-detail" type="button">采集商品详情</button>
+          </div>
+          <div class="product-facts">
+            <div class="product-fact"><span>ASIN</span><strong>${amazonProductLink(p, asin)}</strong></div>
+            <div class="product-fact"><span>综合得分</span><strong>${scoreBadge(p.total_score)}</strong></div>
+            <div class="product-fact"><span>价格</span><strong>${fmt.money(latest.price)}</strong></div>
+            <div class="product-fact"><span>评分 / 评论</span><strong>${fmt.num(latest.rating)} / ${fmt.int(latest.review_count)}</strong></div>
+            <div class="product-fact"><span>近月购买</span><strong>${fmt.int(latest.monthly_bought)}</strong></div>
+            <div class="product-fact"><span>尺寸 / 规格</span><strong>${escapeHtml(fmt.text(p.product_size))}</strong></div>
+            <div class="product-fact"><span>首次采集</span><strong>${escapeHtml(fmt.text(p.first_seen_at))}</strong></div>
+            <div class="product-fact"><span>最近采集</span><strong>${escapeHtml(fmt.text(p.last_seen_at))}</strong></div>
+            <div class="product-fact"><span>Amazon 首次上架日期</span><strong>${detailCollectedValue(p.date_first_available)}</strong></div>
+            <div class="product-fact"><span>详情采集时间</span><strong>${detailCollectedValue(p.detail_collected_at)}</strong></div>
+            <div class="product-fact product-fact-wide"><span>商品类别</span><strong>${detailCollectedValue(p.category_path)}</strong></div>
+            <div class="product-fact product-fact-wide"><span>热销榜排名</span><strong>${renderBestSellerRanks(bsrRanks)}</strong></div>
+          </div>
+          <div id="detail-collect-status" class="detail-collect-status"></div>
+        </section>
+      </div>
     </div>
     <div class="panel">
       <h2>选品建议</h2>
@@ -1599,9 +1942,47 @@ async function viewProductDetail(asin) {
       <h2>历史快照（${snaps.length}）</h2>
       ${snaps.length ? snapTable(snaps) : `<div class="state">暂无快照。</div>`}
     </div>`;
+  document.getElementById("collect-product-detail").onclick = () => collectCurrentProductDetail(asin);
   if (snaps.length >= 2) renderTrendChart(snaps);
   fillTrendConfidence(asin);
   fillProductAdvice(asin);
+}
+
+function detailCollectedValue(value) {
+  return value == null || value === ""
+    ? `<span class="detail-missing">未采集</span>`
+    : escapeHtml(String(value));
+}
+
+function renderBestSellerRanks(ranks) {
+  if (!ranks.length) return `<span class="detail-missing">未采集</span>`;
+  return `<span class="bsr-list">${ranks.map((item) =>
+    `<span><b>#${fmt.int(item.rank)}</b> ${escapeHtml(item.category_name || "未命名类目")}${item.is_primary ? "（主类目）" : ""}</span>`
+  ).join("")}</span>`;
+}
+
+async function collectCurrentProductDetail(asin) {
+  if (!confirm(
+    `确认采集 ASIN ${asin} 的 Amazon 商品详情？\n\n` +
+    "本次只访问 1 个详情页，复用当前采集 Chrome；遇到验证码或登录页会立即停止，不会写入不可信字段。"
+  )) return;
+  const button = document.getElementById("collect-product-detail");
+  const status = document.getElementById("detail-collect-status");
+  if (button) button.disabled = true;
+  if (status) status.innerHTML = `<span class="mini-spinner"></span>正在读取详情页并校验字段…`;
+  try {
+    const result = await runBrowserAction(
+      () => apiSend(`/api/products/${encodeURIComponent(asin)}/collect-detail`, "POST")
+    );
+    const missing = Array.isArray(result?.["未采集字段"]) ? result["未采集字段"] : [];
+    notice(missing.length ? `详情采集完成；${missing.join("、")}未采集` : "商品详情采集完成", "ok");
+    await viewProductDetail(asin);
+  } catch (err) {
+    if (status) status.textContent = err.message || "商品详情采集失败";
+    notice(err.message || "商品详情采集失败", "bad");
+  } finally {
+    if (button && document.body.contains(button)) button.disabled = false;
+  }
 }
 
 /* 选品建议面板：透出 controller.get_product_advice（与 GUI 共享逻辑）。 */
@@ -1823,6 +2204,7 @@ function renderCompareTable(items) {
   const metrics = [
     { label: "综合得分", get: (it) => numOrNull(it.p.total_score), render: (it) => scoreBadge(it.p.total_score), best: "max" },
     { label: "价格", get: (it) => numOrNull(it.p.price), render: (it) => fmt.money(it.p.price), best: "min" },
+    { label: "尺寸/规格", render: (it) => escapeHtml(truncate(fmt.text(it.p.product_size), 36)) },
     { label: "评分", get: (it) => numOrNull(it.p.rating), render: (it) => fmt.num(it.p.rating), best: "max" },
     { label: "评论数（越低竞争越小）", get: (it) => numOrNull(it.p.review_count), render: (it) => fmt.int(it.p.review_count), best: "min" },
     { label: "近月购买", get: (it) => numOrNull(it.p.monthly_bought), render: (it) => fmt.int(it.p.monthly_bought), best: "max" },
@@ -1831,7 +2213,7 @@ function renderCompareTable(items) {
     { label: "最近采集", render: (it) => fmt.text(it.p.snapshot_at || it.p.last_seen_at) },
   ];
   const head = `<th>指标</th>` + items.map((it) =>
-    `<th><a class="link" href="#/product/${encodeURIComponent(it.asin)}">${escapeHtml(truncate(displayTitle(it.p, it.asin), 28))}</a></th>`
+    `<th>${amazonProductLink(it.p, displayTitle(it.p, it.asin), 28)}<br><a class="link compare-detail-link" href="#/product/${encodeURIComponent(it.asin)}">站内详情</a></th>`
   ).join("");
   const body = metrics.map((m) => {
     let bestIdx = -1;
@@ -1935,6 +2317,7 @@ function setKeywordLibraryViewMode(mode) {
   if (!["table", "tree"].includes(mode) || keywordLibraryState.viewMode === mode) return;
   keywordLibraryState.viewMode = mode;
   keywordLibraryState.offset = 0;
+  persistState(keywordLibraryState);
   keywordLibrarySelected.clear();
   const detail = document.getElementById("klib-detail");
   if (detail) detail.innerHTML = "";
@@ -1960,6 +2343,7 @@ async function loadKeywordLibrary(resetPage = false) {
     keywordLibraryTreeCollapsed.clear();
     document.getElementById("klib-detail").innerHTML = "";
   }
+  persistState(keywordLibraryState);
   const table = document.getElementById("klib-table");
   const meta = document.getElementById("klib-meta");
   const pager = document.getElementById("klib-pager-wrap");
@@ -1980,10 +2364,13 @@ async function loadKeywordLibrary(resetPage = false) {
     snapshot_filter: keywordLibraryState.snapshotFilter,
     tracking_filter: keywordLibraryState.trackingFilter,
     source_filter: keywordLibraryState.sourceFilter,
+    sort_by: keywordLibraryState.sortBy,
+    sort_dir: keywordLibraryState.sortDir,
   });
   if (keywordLibraryState.keyword) q.set("keyword", keywordLibraryState.keyword);
   try {
     const page = normalizePage(await api(`/api/keyword-library/keywords?${q.toString()}`), keywordLibraryState.limit);
+    syncRemoteSortState(keywordLibraryState, page);
     const rows = page.rows || [];
     renderKeywordLibrarySummary(page.summary || {});
     meta.textContent = pageSummary(page, "关键词资产") + " · 资产库包含已入库但暂无快照的关键词";
@@ -2010,7 +2397,7 @@ async function loadKeywordLibrary(resetPage = false) {
       { key: "source_types", label: "来源", render: (r) => keywordLibrarySourceBadges(r), csv: (r) => keywordLibrarySourceText(r) },
       { key: "tracking_status", label: "追踪", render: (r) => keywordLibraryTrackingBadge(r.tracking_status), sortVal: (r) => r.tracking_status },
       { key: "actions", label: "操作", sortable: false, csv: false, render: (r) => keywordLibraryActions(r) },
-    ], rows, { defaultSort: { key: "latest_snapshot_at", dir: -1 }, exportName: "关键词资产库", onRowClick: showKeywordLibraryDetail });
+    ], rows, { remoteSort: remoteSortOptions(keywordLibraryState, loadKeywordLibrary), exportName: "关键词资产库", onRowClick: showKeywordLibraryDetail });
     pager.innerHTML = renderPager("klib-pager", page, [20, 50, 100]);
     bindPager("klib-pager", keywordLibraryState, page, loadKeywordLibrary);
     updateKeywordLibrarySelected();
@@ -2246,6 +2633,7 @@ window.keywordLibraryOpportunity = (keywordId) => {
   keywordState.keyword = row.keyword || "";
   keywordState.minProducts = "";
   keywordState.offset = 0;
+  persistState(keywordState);
   location.hash = "#/keywords";
 };
 
@@ -2307,9 +2695,10 @@ function renderKeywordLibraryProducts(products) {
     return;
   }
   renderSortableTable(box, [
-    { key: "title", label: "标题", render: (item) => escapeHtml(truncate(displayTitle(item, item.asin), 68)), sortVal: (item) => displayTitle(item, item.asin) },
+    { key: "title", label: "标题", render: (item) => amazonProductLink(item, displayTitle(item, item.asin), 68), sortVal: (item) => displayTitle(item, item.asin) },
     { key: "total_score", label: "得分", align: "num", numeric: true, render: (item) => scoreBadge(item.total_score), sortVal: (item) => item.total_score },
     { key: "price", label: "价格", align: "num", numeric: true, render: (item) => fmt.money(item.price), sortVal: (item) => item.price },
+    { key: "product_size", label: "尺寸/规格", render: (item) => escapeHtml(truncate(fmt.text(item.product_size), 28)), sortVal: (item) => item.product_size || "" },
     { key: "rating", label: "评分", align: "num", numeric: true, render: (item) => fmt.num(item.rating), sortVal: (item) => item.rating },
     { key: "review_count", label: "评论", align: "num", numeric: true, render: (item) => fmt.int(item.review_count), sortVal: (item) => item.review_count },
     { key: "monthly_bought", label: "近月购买", align: "num", numeric: true, render: (item) => fmt.int(item.monthly_bought), sortVal: (item) => item.monthly_bought },
@@ -2400,6 +2789,7 @@ async function viewKeywordWorkshop() {
     keywordWorkshopState.source = "all";
     keywordWorkshopState.runId = null;
     keywordWorkshopState.selected.clear();
+    persistState(keywordWorkshopState);
     document.getElementById("kws-filter").value = "";
     document.getElementById("kws-status").value = "candidate";
     document.getElementById("kws-source").value = "all";
@@ -2444,6 +2834,7 @@ async function runKeywordWorkshop() {
     keywordWorkshopState.status = "candidate";
     keywordWorkshopState.runId = result.run_id;
     keywordWorkshopState.selected.clear();
+    persistState(keywordWorkshopState);
     const status = document.getElementById("kws-status");
     if (status) status.value = "candidate";
     await loadKeywordRuns();
@@ -2479,6 +2870,7 @@ async function loadKeywordIdeas(resetPage = false) {
     keywordWorkshopState.source = document.getElementById("kws-source").value;
     keywordWorkshopState.selected.clear();
   }
+  persistState(keywordWorkshopState);
   const table = document.getElementById("kws-table");
   const meta = document.getElementById("kws-meta");
   const pager = document.getElementById("kws-pager-wrap");
@@ -2491,6 +2883,8 @@ async function loadKeywordIdeas(resetPage = false) {
     limit: String(keywordWorkshopState.limit),
     offset: String(keywordWorkshopState.offset),
     marketplace: "US",
+    sort_by: keywordWorkshopState.sortBy,
+    sort_dir: keywordWorkshopState.sortDir,
   });
   if (keywordWorkshopState.keyword) q.set("keyword", keywordWorkshopState.keyword);
   if (keywordWorkshopState.status && keywordWorkshopState.status !== "all") q.set("status", keywordWorkshopState.status);
@@ -2498,6 +2892,7 @@ async function loadKeywordIdeas(resetPage = false) {
   if (keywordWorkshopState.runId) q.set("run_id", String(keywordWorkshopState.runId));
   try {
     const page = normalizePage(await api(`/api/keyword-workshop/ideas?${q.toString()}`), keywordWorkshopState.limit);
+    syncRemoteSortState(keywordWorkshopState, page);
     const rows = page.rows || [];
     meta.textContent = pageSummary(page, "候选词")
       + (keywordWorkshopState.runId ? ` · 当前批次 #${keywordWorkshopState.runId}` : "")
@@ -2528,7 +2923,7 @@ async function loadKeywordIdeas(resetPage = false) {
       { key: "evidence", label: "证据", sortable: false, csv: false,
         render: (r) => `<button type="button" class="btn btn-sm" onclick="event.stopPropagation();window.openKeywordIdeaEvidence('${escapeHtml(r.id)}')">查看</button>` },
       { key: "updated_at", label: "更新时间", render: (r) => fmt.text(r.updated_at), sortVal: (r) => r.updated_at },
-    ], rows, { defaultSort: { key: "idea_score", dir: -1 }, exportName: "关键词创意候选" });
+    ], rows, { remoteSort: remoteSortOptions(keywordWorkshopState, loadKeywordIdeas), exportName: "关键词创意候选" });
     pager.innerHTML = renderPager("kws-pager", page, [20, 50, 100]);
     bindPager("kws-pager", keywordWorkshopState, page, loadKeywordIdeas);
     updateKeywordWorkshopSelected();
@@ -2606,6 +3001,7 @@ async function keywordWorkshopSelectRun(runId) {
   keywordWorkshopState.runId = runId ? Number(runId) : null;
   keywordWorkshopState.offset = 0;
   keywordWorkshopState.selected.clear();
+  persistState(keywordWorkshopState);
   await loadKeywordRuns();
   await loadKeywordIdeas();
 }
@@ -2822,14 +3218,14 @@ window.keywordWorkshopRunStatus = async (runId, status) => {
 /* ---------- 视图：关键词机会 ---------- */
 async function viewKeywords() {
   content.innerHTML = `
-    <details id="kw-primary-panel" class="panel kw-primary-panel">
+    <details id="kw-primary-panel" class="panel kw-primary-panel"${keywordState.primaryOpen ? " open" : ""}>
       <summary>一级关键词分组（点击展开）</summary>
       <p class="kw-primary-tip">把相同中心词的关键词归为一组，如 mini squishy / cow squishy → <b>squishy</b>，gift for man / man → <b>man</b>。基于机会列表前 500 条聚合，一级带组内平均机会分（≥70 标「蓝海赛道」、按机会排序），点一级看二级关键词，再点二级看详情。</p>
       <div class="kw-primary-controls">
         <span class="kw-ctrl-label">归类方式</span>
-        <button class="chip kw-mode active" data-mode="tail">词尾</button>
-        <button class="chip kw-mode" data-mode="first">词首</button>
-        <button class="chip kw-mode" data-mode="shared">共享词</button>
+        <button class="chip kw-mode${keywordGroupMode === "tail" ? " active" : ""}" data-mode="tail">词尾</button>
+        <button class="chip kw-mode${keywordGroupMode === "first" ? " active" : ""}" data-mode="first">词首</button>
+        <button class="chip kw-mode${keywordGroupMode === "shared" ? " active" : ""}" data-mode="shared">共享词</button>
         <span class="queue-spacer"></span>
         <button class="btn btn-sm" id="kw-custom-group">自定义分组</button>
         <button class="btn btn-sm" id="kw-semantic-group">语义分组</button>
@@ -2849,6 +3245,8 @@ async function viewKeywords() {
     <div id="kw-detail"></div>`;
   const primaryPanel = document.getElementById("kw-primary-panel");
   primaryPanel.addEventListener("toggle", () => {
+    keywordState.primaryOpen = primaryPanel.open;
+    persistState(keywordState);
     if (primaryPanel.open && !primaryPanel.dataset.loaded) {
       primaryPanel.dataset.loaded = "1";
       keywordAllRows = null; // 每次进入页面首开重拉，避免陈旧
@@ -2858,6 +3256,8 @@ async function viewKeywords() {
   primaryPanel.querySelectorAll(".kw-mode").forEach((b) => {
     b.onclick = () => {
       keywordGroupMode = b.dataset.mode;
+      keywordState.groupMode = keywordGroupMode;
+      persistState(keywordState);
       primaryPanel.querySelectorAll(".kw-mode").forEach((x) => x.classList.toggle("active", x === b));
       renderKeywordPrimaryGroups();
     };
@@ -2876,6 +3276,9 @@ async function viewKeywords() {
   document.getElementById("kw-reset").onclick = () => {
     keywordState.keyword = "";
     keywordState.minProducts = "";
+    keywordProductState.keyword = "";
+    keywordProductState.offset = 0;
+    persistState(keywordProductState);
     document.getElementById("kw-filter").value = "";
     document.getElementById("kw-min-products").value = "";
     document.getElementById("kw-detail").innerHTML = "";
@@ -2894,6 +3297,7 @@ async function loadKeywords(resetPage = false) {
     keywordState.minProducts = document.getElementById("kw-min-products").value.trim();
     document.getElementById("kw-detail").innerHTML = "";
   }
+  persistState(keywordState);
   const table = document.getElementById("kw-table");
   const meta = document.getElementById("kw-meta");
   const pager = document.getElementById("kw-pager-wrap");
@@ -2903,11 +3307,14 @@ async function loadKeywords(resetPage = false) {
   const q = new URLSearchParams({
     limit: String(keywordState.limit),
     offset: String(keywordState.offset),
+    sort_by: keywordState.sortBy,
+    sort_dir: keywordState.sortDir,
   });
   if (keywordState.keyword) q.set("keyword", keywordState.keyword);
   if (keywordState.minProducts) q.set("min_products", keywordState.minProducts);
   try {
     const page = normalizePage(await api(`/api/keywords/opportunities?${q.toString()}`), keywordState.limit);
+    syncRemoteSortState(keywordState, page);
     const rows = page.rows;
     meta.textContent = pageSummary(page, "关键词") + " · 点行展开详情与该词下商品 · 机会分 ≥70 标「蓝海」";
     if (!rows.length) {
@@ -2925,7 +3332,7 @@ async function loadKeywords(resetPage = false) {
     { key: "avg_review_count", label: "竞争", align: "num", numeric: true, render: (r) => fmt.int(r.avg_review_count), sortVal: (r) => r.avg_review_count },
     { key: "avg_price", label: "价格带", align: "num", numeric: true, render: (r) => fmt.money(r.avg_price), sortVal: (r) => r.avg_price },
     { key: "avg_organic_rank", label: "自然序位估算", align: "num", numeric: true, render: (r) => fmt.num(r.avg_organic_rank, 0), sortVal: (r) => r.avg_organic_rank },
-  ], rows, { defaultSort: { key: "opportunity_score", dir: -1 }, exportName: "关键词机会", onRowClick: showKeywordDetail });
+  ], rows, { remoteSort: remoteSortOptions(keywordState, loadKeywords), exportName: "关键词机会", onRowClick: showKeywordDetail });
     pager.innerHTML = renderPager("kw-pager", page, [20, 50, 100]);
     bindPager("kw-pager", keywordState, page, loadKeywords);
   } catch (err) {
@@ -2934,7 +3341,7 @@ async function loadKeywords(resetPage = false) {
 }
 
 /* ---------- 一级关键词分组（聚合机会 + 多种归类规则 + 占位入口） ---------- */
-let keywordGroupMode = "tail";   // tail 词尾 / first 词首 / shared 共享词
+let keywordGroupMode = ["tail", "first", "shared"].includes(keywordState.groupMode) ? keywordState.groupMode : "tail";   // tail 词尾 / first 词首 / shared 共享词
 let keywordAllRows = null;       // 缓存全量行，切换归类方式不重拉（进入页面首开会清空重拉）
 let keywordPrimaryGroups = new Map();
 
@@ -3065,6 +3472,7 @@ function showKeywordDetail(r) {
   if (!box) return;
   keywordProductState.keyword = r.keyword || "";
   keywordProductState.offset = 0;
+  persistState(keywordProductState);
   const level = r.opportunity_level ? ` <span class="badge badge-dim">${escapeHtml(r.opportunity_level)}</span>` : "";
   box.innerHTML = `
     <div class="panel">
@@ -3100,6 +3508,7 @@ function showKeywordDetail(r) {
 }
 
 async function loadKeywordProducts() {
+  persistState(keywordProductState);
   const keyword = keywordProductState.keyword;
   const box = document.getElementById("kw-products");
   const meta = document.getElementById("kw-products-meta");
@@ -3113,9 +3522,12 @@ async function loadKeywordProducts() {
     keyword_exact: "true",
     limit: String(keywordProductState.limit),
     offset: String(keywordProductState.offset),
+    sort_by: keywordProductState.sortBy,
+    sort_dir: keywordProductState.sortDir,
   });
   try {
     const page = normalizePage(await api(`/api/products?${q.toString()}`), keywordProductState.limit);
+    syncRemoteSortState(keywordProductState, page);
     const rows = page.rows;
     meta.textContent = pageSummary(page, "商品") + ` · 关键词：${keyword}`;
     if (!rows.length) {
@@ -3125,14 +3537,15 @@ async function loadKeywordProducts() {
       return;
     }
     renderSortableTable(box, [
-      { key: "title", label: "标题", render: (item) => escapeHtml(truncate(displayTitle(item, item.asin), 68)), sortVal: (item) => displayTitle(item, item.asin) },
+      { key: "title", label: "标题", render: (item) => amazonProductLink(item, displayTitle(item, item.asin), 68), sortVal: (item) => displayTitle(item, item.asin) },
       { key: "total_score", label: "得分", align: "num", numeric: true, render: (item) => scoreBadge(item.total_score), sortVal: (item) => item.total_score },
       { key: "price", label: "价格", align: "num", numeric: true, render: (item) => fmt.money(item.price), sortVal: (item) => item.price },
+      { key: "product_size", label: "尺寸/规格", render: (item) => escapeHtml(truncate(fmt.text(item.product_size), 28)), sortVal: (item) => item.product_size || "" },
       { key: "rating", label: "评分", align: "num", numeric: true, render: (item) => fmt.num(item.rating), sortVal: (item) => item.rating },
       { key: "review_count", label: "评论", align: "num", numeric: true, render: (item) => fmt.int(item.review_count), sortVal: (item) => item.review_count },
       { key: "monthly_bought", label: "近月购买", align: "num", numeric: true, render: (item) => fmt.int(item.monthly_bought), sortVal: (item) => item.monthly_bought },
       { key: "organic_rank", label: "序位估算", align: "num", numeric: true, render: (item) => fmt.int(item.organic_rank), sortVal: (item) => item.organic_rank },
-    ], rows, { rowHash: (item) => `#/product/${encodeURIComponent(item.asin)}`, defaultSort: { key: "total_score", dir: -1 }, exportName: `关键词-${keyword}-商品` });
+    ], rows, { rowHash: (item) => `#/product/${encodeURIComponent(item.asin)}`, remoteSort: remoteSortOptions(keywordProductState, loadKeywordProducts), exportName: `关键词-${keyword}-商品` });
     pager.innerHTML = renderPager("kw-products-pager", page, [10, 25, 50]);
     bindPager("kw-products-pager", keywordProductState, page, loadKeywordProducts);
   } catch (err) {
@@ -3147,7 +3560,7 @@ async function viewReviews() {
   if (!rows || !rows.length) return emptyState("暂无评论洞察数据。");
   content.innerHTML = `<div class="result-meta">共 ${rows.length} 条 · 点列头排序</div><div id="rv-table"></div>`;
   renderSortableTable(document.getElementById("rv-table"), [
-    { key: "title", label: "商品 / ASIN", render: (r) => escapeHtml(truncate(displayTitle(r, r.asin || r.keyword || "—"), 80)), sortVal: (r) => displayTitle(r, r.asin || r.keyword || "") },
+    { key: "title", label: "商品 / ASIN", render: (r) => amazonProductLink(r, displayTitle(r, r.asin || r.keyword || "—"), 80), sortVal: (r) => displayTitle(r, r.asin || r.keyword || "") },
     { key: "neg", label: "低分占比", align: "num", numeric: true, render: (r) => formatNegativeRate(r), sortVal: (r) => negativeRateValue(r) },
     { key: "pain", label: "主要痛点", render: (r) => escapeHtml(truncate(formatPainPoints(r.top_pain_points || r.pain_points), 60)), csv: (r) => formatPainPoints(r.top_pain_points || r.pain_points) },
     { key: "opp", label: "改良机会", render: (r) => escapeHtml(truncate(r.opportunity_summary || r.improvement_opportunities || "—", 60)), csv: (r) => r.opportunity_summary || r.improvement_opportunities || "" },
@@ -3473,7 +3886,15 @@ function viewCrawl() {
     </div>
     <div id="cr-result"></div>`;
   const modeBox = document.getElementById("cr-queue-mode");
+  document.getElementById("cr-keyword").value = crawlState.keyword;
+  document.getElementById("cr-pages").value = crawlState.pages;
+  modeBox.checked = crawlState.queueMode;
   modeBox.onchange = () => setQueueMode(modeBox.checked);
+  bindStateInputs(["cr-keyword", "cr-pages"], () => {
+    crawlState.keyword = document.getElementById("cr-keyword").value.trim();
+    crawlState.pages = Math.max(1, Math.min(7, Number(document.getElementById("cr-pages").value) || 1));
+    persistState(crawlState);
+  });
   document.getElementById("cr-run").onclick = runManualCrawl;
   document.getElementById("cr-queue-add").onclick = addToQueue;
   document.getElementById("cr-open-amazon").onclick = openAmazonForCrawl;
@@ -3491,9 +3912,12 @@ function viewCrawl() {
   renderQueueList();
   setQueueControls();
   refreshQueueSelect();
+  setQueueMode(modeBox.checked);
 }
 
 function setQueueMode(on) {
+  crawlState.queueMode = !!on;
+  persistState(crawlState);
   document.getElementById("cr-queue").style.display = on ? "" : "none";
   document.getElementById("cr-run").style.display = on ? "none" : "";
   document.getElementById("cr-queue-add").style.display = on ? "" : "none";
@@ -3553,8 +3977,13 @@ function addToQueue() {
   if (crawlQueue.items.some((it) => it.keyword.toLowerCase() === keyword.toLowerCase())) {
     notice("该关键词已在队列中", "bad"); return;
   }
+  crawlState.keyword = keyword;
+  crawlState.pages = pages;
+  persistState(crawlState);
   crawlQueue.items.push({ keyword, pages, status: "待采", reason: "", collected_at: "" });
   kwEl.value = "";
+  crawlState.keyword = "";
+  persistState(crawlState);
   renderQueueList();
   setQueueControls();
 }
@@ -3634,7 +4063,9 @@ async function runQueue() {
     it.reason = "";
     renderQueueList();
     try {
-      const r = await apiSend("/api/crawl/run-import", "POST", { keyword: it.keyword, pages: it.pages });
+      const r = await runBrowserAction(
+        () => apiSend("/api/crawl/run-import", "POST", { keyword: it.keyword, pages: it.pages })
+      );
       it.status = r.outcome || "完成";
       it.reason = r["原因"] || "";
       if (it.status === "完成") {
@@ -3642,8 +4073,13 @@ async function runQueue() {
       }
       importedTotal += Number(r["入库商品数"]) || 0;
     } catch (err) {
-      it.status = "失败";
-      it.reason = err.message;
+      if (err?.code === "chrome_driver_download_cancelled") {
+        it.status = "待采";
+        it.reason = "已取消驱动下载";
+      } else {
+        it.status = "失败";
+        it.reason = err.message;
+      }
     }
     renderQueueList();
     if (it.status !== "完成") crawlQueuePaused = true; // 任一非完成 → 自动暂停
@@ -3698,7 +4134,7 @@ async function openAmazonForCrawl() {
   btn.disabled = true;
   box.innerHTML = `<div class="state"><div class="spinner"></div>正在打开 Amazon 页面…</div>`;
   try {
-    const result = await apiSend("/api/crawl/open-amazon", "POST");
+    const result = await runBrowserAction(() => apiSend("/api/crawl/open-amazon", "POST"));
     box.innerHTML = `
       <div class="panel">
         <h3>Amazon 页面已打开</h3>
@@ -3724,13 +4160,18 @@ async function runManualCrawl() {
   const btn = document.getElementById("cr-run");
   if (!keyword) { notice("请填写采集关键词", "bad"); return; }
   if (pages < 1 || pages > 7) { notice("采集页数需在 1-7 页之间", "bad"); return; }
+  crawlState.keyword = keyword;
+  crawlState.pages = pages;
+  persistState(crawlState);
   if (!confirm(
     `立即联网采集「${keyword}」${pages} 页？\n\n会打开浏览器访问 Amazon 搜索页并保存 HTML；不自动写入数据库。遇到验证码、登录页或空页会停止。`
   )) return;
   btn.disabled = true;
   box.innerHTML = `<div class="state"><div class="spinner"></div>采集中…（浏览器会自动打开，请勿刷新页面）</div>`;
   try {
-    const result = await apiSend("/api/crawl/run", "POST", { keyword, pages });
+    const result = await runBrowserAction(
+      () => apiSend("/api/crawl/run", "POST", { keyword, pages })
+    );
     box.innerHTML = renderCrawlResult(result);
     notice(result["状态"] === "完成" ? "采集完成" : "采集已停止，请查看原因", result["状态"] === "完成" ? "ok" : "bad");
   } catch (err) {
@@ -3799,6 +4240,17 @@ async function viewTracking() {
       </div>
       <div id="t-list">${trackingTable(tasks)}</div>
     </div>`;
+  document.getElementById("t-keyword").value = trackingFormState.keyword;
+  document.getElementById("t-target").value = trackingFormState.targetSnapshots;
+  document.getElementById("t-pages").value = trackingFormState.pagesPerKeyword;
+  document.getElementById("t-market").value = trackingFormState.marketplace;
+  bindStateInputs(["t-keyword", "t-target", "t-pages", "t-market"], () => {
+    trackingFormState.keyword = document.getElementById("t-keyword").value.trim();
+    trackingFormState.targetSnapshots = Number(document.getElementById("t-target").value) || 3;
+    trackingFormState.pagesPerKeyword = Number(document.getElementById("t-pages").value) || 2;
+    trackingFormState.marketplace = document.getElementById("t-market").value.trim() || "US";
+    persistState(trackingFormState);
+  });
   document.getElementById("t-create").onclick = createTracking;
   document.getElementById("t-clear-selected").onclick = () => {
     trackingSelected.clear();
@@ -3880,12 +4332,17 @@ function trackingSelectedTasks() {
 async function createTracking() {
   const kw = document.getElementById("t-keyword").value.trim();
   if (!kw) return notice("请填写关键词", "bad");
+  trackingFormState.keyword = kw;
+  trackingFormState.targetSnapshots = Number(document.getElementById("t-target").value) || 3;
+  trackingFormState.pagesPerKeyword = Number(document.getElementById("t-pages").value) || 2;
+  trackingFormState.marketplace = document.getElementById("t-market").value.trim() || "US";
+  persistState(trackingFormState);
   try {
     await apiSend("/api/tracking/tasks", "POST", {
       keyword: kw,
-      target_snapshots: Number(document.getElementById("t-target").value) || 3,
-      pages_per_keyword: Number(document.getElementById("t-pages").value) || 2,
-      marketplace: document.getElementById("t-market").value.trim() || "US",
+      target_snapshots: trackingFormState.targetSnapshots,
+      pages_per_keyword: trackingFormState.pagesPerKeyword,
+      marketplace: trackingFormState.marketplace,
     });
     notice("追踪任务已创建", "ok");
     viewTracking();
@@ -3923,7 +4380,9 @@ window.trackCollect = async (id) => {
   )) return;
   notice("联网采集执行中…（串行，请稍候）", "ok");
   try {
-    const r = await apiSend("/api/tracking/check", "POST", { execute: true, task_id: id });
+    const r = await runBrowserAction(
+      () => apiSend("/api/tracking/check", "POST", { execute: true, task_id: id })
+    );
     notice("采集完成：" + summarizeCheck(r), "ok");
     viewTracking();
   } catch (err) { notice(err.message, "bad"); }
@@ -3977,14 +4436,38 @@ function csvValue(col, item) {
   return item[col.key];
 }
 
+function remoteSortOptions(state, loadFn) {
+  return {
+    key: state.sortBy,
+    dir: state.sortDir === "asc" ? 1 : -1,
+    onChange: (key, dir) => {
+      state.sortBy = key;
+      state.sortDir = dir > 0 ? "asc" : "desc";
+      state.offset = 0;
+      persistState(state);
+      loadFn();
+    },
+  };
+}
+
+function syncRemoteSortState(state, page) {
+  if (!page) return;
+  if (page.sort_by) state.sortBy = page.sort_by;
+  if (page.sort_dir) state.sortDir = page.sort_dir;
+  persistState(state);
+}
+
 /* 通用可排序表格：点列头切换升/降序，数值列按数字排，可选行跳转、CSV 导出。
    columns: [{key,label,render?(item),sortVal?(item),csv?(item),numeric?,align?:'num'}]
    opts: {rowHash?(item)=>hash, defaultSort?:{key,dir}, exportName?:string} */
 function renderSortableTable(container, columns, data, opts = {}) {
-  const state = { key: null, dir: 1, ...(opts.defaultSort || {}) };
+  const remote = opts.remoteSort || null;
+  const state = remote
+    ? { key: remote.key || null, dir: remote.dir > 0 ? 1 : -1 }
+    : { key: null, dir: 1, ...(opts.defaultSort || {}) };
   function draw() {
     const rows = data.slice();
-    if (state.key) {
+    if (state.key && !remote) {
       const col = columns.find((c) => c.key === state.key);
       if (col && col.sortable !== false) {
         rows.sort((a, b) => {
@@ -4021,6 +4504,11 @@ function renderSortableTable(container, columns, data, opts = {}) {
     container.querySelectorAll("th.sortable").forEach((th) => {
       th.onclick = () => {
         const k = th.dataset.key;
+        const nextDir = state.key === k ? -state.dir : 1;
+        if (remote) {
+          if (typeof remote.onChange === "function") remote.onChange(k, nextDir);
+          return;
+        }
         if (state.key === k) state.dir = -state.dir;
         else { state.key = k; state.dir = 1; }
         draw();
@@ -4069,8 +4557,28 @@ async function viewImport() {
     </div>
     <div id="imp-result"></div>`;
   if (!files.length) return;
+  document.getElementById("imp-keyword").value = htmlImportState.keyword;
+  restoreCheckedValues(".imp-file", htmlImportState.selectedFiles);
+  bindStateInputs(["imp-keyword"], saveHtmlImportFormState);
+  document.querySelectorAll(".imp-file").forEach((checkbox) => checkbox.addEventListener("change", saveHtmlImportFormState));
   document.getElementById("imp-preview").onclick = () => runImport(false);
   document.getElementById("imp-commit").onclick = () => runImport(true);
+}
+
+function restoreCheckedValues(selector, savedValues) {
+  const boxes = [...document.querySelectorAll(selector)];
+  if (!boxes.length || !Array.isArray(savedValues) || !savedValues.length) return;
+  const available = new Set(boxes.map((box) => String(box.value || "")));
+  const selected = savedValues.filter((value) => available.has(String(value)));
+  if (!selected.length) return;
+  boxes.forEach((box) => { box.checked = selected.includes(String(box.value || "")); });
+}
+
+function saveHtmlImportFormState() {
+  const keyword = document.getElementById("imp-keyword");
+  htmlImportState.keyword = keyword ? keyword.value.trim() : "";
+  htmlImportState.selectedFiles = [...document.querySelectorAll(".imp-file:checked")].map((c) => c.value);
+  persistState(htmlImportState);
 }
 
 function renderHtmlFileTree(files) {
@@ -4122,6 +4630,7 @@ async function runImport(commit) {
   if (commit && !confirm(`确认把 ${files.length} 个 HTML 文件解析并写入数据库（MySQL）？\n建议先「预览入库」确认有效候选与过滤情况。`)) return;
   box.innerHTML = `<div class="state"><div class="spinner"></div>${commit ? "写入中…" : "预览入库中…"}</div>`;
   const keyword = document.getElementById("imp-keyword").value.trim() || null;
+  saveHtmlImportFormState();
   try {
     const r = await apiSend(`/api/import/html/${commit ? "commit" : "preview"}`, "POST", { files, keyword });
     box.innerHTML = renderImportResult(r, commit);
@@ -4184,10 +4693,34 @@ async function viewReviewImport() {
       <div id="rv-html-result"></div>
     </div>`;
   if (imp.length) {
+    const fileEl = document.getElementById("rv-file");
+    if (reviewImportState.file && imp.includes(reviewImportState.file)) fileEl.value = reviewImportState.file;
+    document.getElementById("rv-asin").value = reviewImportState.defaultAsin;
+    bindStateInputs(["rv-file", "rv-asin"], saveReviewImportFormState);
     document.getElementById("rv-preview").onclick = () => runReviewImport(false);
     document.getElementById("rv-commit").onclick = () => runReviewImport(true);
   }
-  if (htmls.length) document.getElementById("rh-parse").onclick = runReviewParse;
+  if (htmls.length) {
+    document.getElementById("rh-asin").value = reviewImportState.htmlDefaultAsin;
+    document.getElementById("rh-fmt").value = reviewImportState.outputFormat || "csv";
+    restoreCheckedValues(".rh-file", reviewImportState.selectedHtmlFiles);
+    bindStateInputs(["rh-asin", "rh-fmt"], saveReviewImportFormState);
+    document.querySelectorAll(".rh-file").forEach((checkbox) => checkbox.addEventListener("change", saveReviewImportFormState));
+    document.getElementById("rh-parse").onclick = runReviewParse;
+  }
+}
+
+function saveReviewImportFormState() {
+  const fileEl = document.getElementById("rv-file");
+  const asinEl = document.getElementById("rv-asin");
+  const htmlAsinEl = document.getElementById("rh-asin");
+  const fmtEl = document.getElementById("rh-fmt");
+  reviewImportState.file = fileEl ? fileEl.value : reviewImportState.file;
+  reviewImportState.defaultAsin = asinEl ? asinEl.value.trim() : reviewImportState.defaultAsin;
+  reviewImportState.htmlDefaultAsin = htmlAsinEl ? htmlAsinEl.value.trim() : reviewImportState.htmlDefaultAsin;
+  reviewImportState.outputFormat = fmtEl ? fmtEl.value : reviewImportState.outputFormat;
+  reviewImportState.selectedHtmlFiles = [...document.querySelectorAll(".rh-file:checked")].map((c) => c.value);
+  persistState(reviewImportState);
 }
 
 async function runReviewImport(commit) {
@@ -4197,6 +4730,7 @@ async function runReviewImport(commit) {
   if (commit && !confirm(`确认把「${file}」的评论写入数据库（MySQL）？建议先预览导入，确认有效候选与过滤情况。`)) return;
   box.innerHTML = `<div class="state"><div class="spinner"></div>${commit ? "导入中…" : "预览导入中…"}</div>`;
   const default_asin = document.getElementById("rv-asin").value.trim() || null;
+  saveReviewImportFormState();
   try {
     const r = await apiSend(`/api/import/reviews/${commit ? "commit" : "preview"}`, "POST", { file, default_asin });
     box.innerHTML = renderSummaryPanel(commit ? "导入结果" : "预览导入结果", r);
@@ -4211,6 +4745,7 @@ async function runReviewParse() {
   box.innerHTML = `<div class="state"><div class="spinner"></div>解析中…</div>`;
   const default_asin = document.getElementById("rh-asin").value.trim() || null;
   const output_format = document.getElementById("rh-fmt").value;
+  saveReviewImportFormState();
   try {
     const r = await apiSend("/api/import/reviews/parse-html", "POST", { files, default_asin, output_format });
     box.innerHTML = renderSummaryPanel("解析结果", r);

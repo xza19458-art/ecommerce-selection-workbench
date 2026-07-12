@@ -40,6 +40,10 @@ WAREHOUSE_TABLES: dict[str, str] = {
           p.title_translated_at,
           p.brand,
           p.category_path,
+          p.product_size,
+          p.date_first_available,
+          p.detail_collected_at,
+          p.detail_source_file,
           p.product_url,
           p.image_url,
           p.first_seen_at,
@@ -75,6 +79,23 @@ WAREHOUSE_TABLES: dict[str, str] = {
           s.created_at
         FROM product_snapshots s
         JOIN products p ON p.id = s.product_id
+    """,
+    "fact_product_bsr_snapshots": """
+        SELECT
+          b.id AS bsr_snapshot_id,
+          b.product_id,
+          p.marketplace,
+          p.asin,
+          b.snapshot_at,
+          b.rank_value,
+          b.category_name,
+          b.category_url,
+          b.is_primary,
+          b.raw_text,
+          b.source_file,
+          b.created_at
+        FROM product_bsr_snapshots b
+        JOIN products p ON p.id = b.product_id
     """,
     "fact_keyword_rank_snapshots": """
         SELECT
@@ -241,6 +262,8 @@ def sync_analytics_warehouse(
     summaries: list[WarehouseTableSummary] = []
     with db.connect() as mysql_conn:
         with mysql_conn.cursor() as cursor:
+            db.ensure_product_attribute_columns(cursor)
+            db.ensure_product_detail_schema(cursor)
             with duckdb.connect(str(warehouse_config.duckdb_path)) as warehouse_conn:
                 for table_name in selected_tables:
                     dataframe = _fetch_dataframe(cursor, WAREHOUSE_TABLES[table_name])

@@ -31,6 +31,7 @@ DISPLAY_FIELDS = {
     "title_translated_at": "商品标题翻译时间",
     "brand": "品牌",
     "category_path": "类目路径",
+    "product_size": "尺寸/规格",
     "product_url": "商品链接",
     "image_url": "主图链接",
     "price": "价格",
@@ -88,6 +89,7 @@ class AmazonProductRecord:
     source_file: str | None = None
     brand: str | None = None
     category_path: str | None = None
+    product_size: str | None = None
     title_zh: str | None = None
     title_lang: str | None = None
     title_translation_status: str | None = None
@@ -271,6 +273,7 @@ def _parse_item(
     rating = _extract_rating(item)
     review_count = _extract_review_count(item)
     monthly_bought = _extract_monthly_bought(item)
+    product_size = _extract_product_size(item, title)
     raw_result_position = _extract_rank(item)
     is_sponsored = _is_sponsored(item)
     is_deal = bool(item.select_one(".a-badge-text, .s-label-popover-default, [aria-label*='deal' i]"))
@@ -295,6 +298,7 @@ def _parse_item(
         rank_confidence="unknown",
         snapshot_at=snapshot_at,
         source_file=source_file,
+        product_size=product_size,
     )
 
 
@@ -387,6 +391,89 @@ def _extract_monthly_bought(item: Tag) -> int | None:
         if value is not None:
             return value
     value = extract_monthly_bought_text(item.get_text(" ", strip=True))
+    return value
+
+
+def _extract_product_size(item: Tag, title: str | None) -> str | None:
+    for node in item.select(
+        ".a-size-base.a-color-secondary, "
+        ".a-size-small.a-color-secondary, "
+        ".a-row.a-size-base.a-color-secondary, "
+        ".a-row.a-size-small.a-color-secondary, "
+        "[aria-label*='Size' i]"
+    ):
+        candidates = [_node_text(node)]
+        label = node.get("aria-label")
+        if label:
+            candidates.append(str(label))
+        for text in candidates:
+            value = _extract_size_from_text(text, explicit_only=True)
+            if value:
+                return value
+    return _extract_size_from_text(title, explicit_only=False)
+
+
+def _extract_size_from_text(text: str | None, *, explicit_only: bool) -> str | None:
+    if not text:
+        return None
+    source = _clean_spaces(text)
+    if not source:
+        return None
+
+    label_pattern = re.compile(
+        r"\b(?:product size|item package quantity|package quantity|number of items|"
+        r"unit count|size name|item size|size)\s*[:：]\s*([^|;]{1,90})",
+        re.IGNORECASE,
+    )
+    match = label_pattern.search(source)
+    if match:
+        value = _clean_size_text(match.group(1))
+        if value:
+            return value
+    if explicit_only:
+        return None
+
+    for pattern in (
+        r"\b(\d+\s*(?:pack|packs)\s*\([^)]{1,50}\b(?:count|ct|pack|packs|piece|pieces|pcs)\b[^)]{0,50}\))(?=$|[^A-Za-z0-9])",
+        r"\b(\d+(?:\.\d+)?\s*(?:x|×|by)\s*\d+(?:\.\d+)?(?:\s*(?:x|×|by)\s*\d+(?:\.\d+)?)?\s*(?:inch|inches|in\.?|cm|mm|ft|feet|foot))\b",
+        r"\b(\d+\s*(?:count|ct|pack|packs|piece|pieces|pcs)\b)\b",
+        r"\b((?:pack|set|box|case)\s+of\s+\d+)\b",
+        r"\b(\d+(?:\.\d+)?\s*(?:fl\.?\s*oz|oz|ounce|ounces|lb|lbs|pound|pounds|inch|inches|in\.?|cm|mm|ft|feet|foot))\b",
+        r"\b(xx-large|x-large|extra[- ]large|xxl|xl|small|medium|large|jumbo|mini)\b",
+    ):
+        match = re.search(pattern, source, re.IGNORECASE)
+        if match:
+            value = _clean_size_text(match.group(1))
+            if value:
+                return value
+    return None
+
+
+def _clean_size_text(text: str | None) -> str | None:
+    value = _clean_spaces(text)
+    if not value:
+        return None
+    value = re.split(
+        r"\b(?:color|colour|style|style name|pattern|pattern name|flavor|scent|material)\s*[:：]",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    value = re.sub(r"^(?:product size|size name|item size|size)\s*[:：]\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n-–—,;|")
+    if not value or len(value) > 90:
+        return None
+    noise = (
+        "bought in past month",
+        "out of 5 stars",
+        "sponsored",
+        "customer reviews",
+        "climate pledge",
+        "add to cart",
+    )
+    lowered = value.lower()
+    if any(token in lowered for token in noise):
+        return None
     return value
 
 

@@ -26,6 +26,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from core.browser_runtime import (
+    BrowserRuntimeError,
+    get_browser_runtime_status,
+    install_matching_chromedriver,
+)
 from core.controller import AppController
 from services.agent_chat import AgentChatService, AgentConversationStore, build_agent_action_suggestions
 from services.llm_provider import (
@@ -35,6 +40,7 @@ from services.llm_provider import (
     save_agent_config,
     test_agent_provider_config,
 )
+from services.product_detail_collection import ProductDetailCollectionError
 
 app = FastAPI(title="Amazon 选品助手 API", version="0.1.0")
 
@@ -59,6 +65,27 @@ class NoCacheStaticFiles(StaticFiles):
 
 def _ok(data: Any) -> dict[str, Any]:
     return {"ok": True, "data": jsonable_encoder(data), "message": ""}
+
+
+@app.exception_handler(BrowserRuntimeError)
+async def _handle_browser_runtime(_request, exc: BrowserRuntimeError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "ok": False,
+            "data": jsonable_encoder(exc.details),
+            "message": str(exc),
+            "code": exc.code,
+        },
+    )
+
+
+@app.exception_handler(ProductDetailCollectionError)
+async def _handle_product_detail_collection(_request, exc: ProductDetailCollectionError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"ok": False, "data": None, "message": str(exc), "code": "product_detail_unavailable"},
+    )
 
 
 @app.exception_handler(Exception)
@@ -108,6 +135,12 @@ class DesktopOpenWebIn(BaseModel):
     path: str = "/"
 
 
+class DesktopOpenAmazonProductIn(BaseModel):
+    asin: str
+    marketplace: str = "US"
+    product_url: str | None = None
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return _ok({"status": "ok"})
@@ -128,6 +161,21 @@ def desktop_open_web(body: DesktopOpenWebIn, request: Request) -> dict[str, Any]
         raise HTTPException(status_code=400, detail="只允许打开本地应用页面")
 
     url = f"{base_url}{path}"
+    webbrowser.open(url, new=2)
+    return _ok({"url": url})
+
+
+@app.post("/api/desktop/open-amazon-product")
+def desktop_open_amazon_product(body: DesktopOpenAmazonProductIn) -> dict[str, Any]:
+    import webbrowser
+
+    from services.amazon_urls import amazon_product_url
+
+    url = amazon_product_url(
+        body.asin,
+        marketplace=body.marketplace,
+        source_url=body.product_url,
+    )
     webbrowser.open(url, new=2)
     return _ok({"url": url})
 
@@ -161,6 +209,8 @@ def products(
     min_price: float | None = None,
     max_price: float | None = None,
     max_reviews: int | None = None,
+    sort_by: str = "total_score",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     return _ok(
         _controller.get_product_pool_page(
@@ -172,6 +222,8 @@ def products(
             min_price=min_price,
             max_price=max_price,
             max_reviews=max_reviews,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
     )
 
@@ -179,6 +231,12 @@ def products(
 @app.get("/api/products/{asin}")
 def product_detail(asin: str) -> dict[str, Any]:
     return _ok(_controller.get_product_history(asin))
+
+
+@app.post("/api/products/{asin}/collect-detail")
+def product_detail_collect(asin: str) -> dict[str, Any]:
+    # 单商品、单页面、用户主动触发；复用共享 Chrome，遇验证即停并保存拦截 HTML。
+    return _ok(_controller.collect_product_detail(asin))
 
 
 @app.get("/api/products/{asin}/image")
@@ -221,7 +279,12 @@ def product_advice(asin: str) -> dict[str, Any]:
 
 @app.get("/api/keywords/opportunities")
 def keyword_opportunities(
-    limit: int = 100, offset: int = 0, keyword: str | None = None, min_products: int | None = None
+    limit: int = 100,
+    offset: int = 0,
+    keyword: str | None = None,
+    min_products: int | None = None,
+    sort_by: str = "opportunity_score",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     return _ok(
         _controller.get_keyword_opportunities_page(
@@ -229,6 +292,8 @@ def keyword_opportunities(
             offset=offset,
             keyword=keyword,
             min_products=min_products,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
     )
 
@@ -244,6 +309,8 @@ def keyword_library_keywords(
     snapshot_filter: str = "all",
     tracking_filter: str = "all",
     source_filter: str = "all",
+    sort_by: str = "latest_snapshot_at",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     from services.keyword_library import fetch_keyword_assets_page
 
@@ -256,6 +323,8 @@ def keyword_library_keywords(
             snapshot_filter=snapshot_filter,
             tracking_filter=tracking_filter,
             source_filter=source_filter,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
     )
 
@@ -339,6 +408,8 @@ def keyword_workshop_ideas(
     keyword: str | None = None,
     source: str | None = None,
     run_id: int | None = None,
+    sort_by: str = "idea_score",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     from services.keyword_workshop import fetch_keyword_ideas_page
 
@@ -351,6 +422,8 @@ def keyword_workshop_ideas(
             keyword=keyword,
             source=source,
             run_id=run_id,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
     )
 
@@ -424,6 +497,10 @@ class TrackingCheckIn(BaseModel):
 class CrawlRunIn(BaseModel):
     keyword: str
     pages: int | None = None
+
+
+class BrowserDriverInstallIn(BaseModel):
+    confirmed: bool = False
 
 
 class CrawlQueueIn(BaseModel):
@@ -520,6 +597,19 @@ def crawl_run_import(body: CrawlRunIn) -> dict[str, Any]:
     return _ok(_controller.run_keyword_crawl_and_import(body.keyword, pages=body.pages))
 
 
+@app.get("/api/crawl/browser-runtime")
+def crawl_browser_runtime() -> dict[str, Any]:
+    """Read-only preflight; never downloads a browser or driver."""
+    return _ok(get_browser_runtime_status())
+
+
+@app.post("/api/crawl/browser-driver/install")
+def crawl_browser_driver_install(body: BrowserDriverInstallIn) -> dict[str, Any]:
+    if not body.confirmed:
+        raise HTTPException(status_code=400, detail="下载浏览器驱动前必须由用户明确确认")
+    return _ok(install_matching_chromedriver())
+
+
 @app.post("/api/crawl/open-amazon")
 def crawl_open_amazon() -> dict[str, Any]:
     return _ok(_controller.open_amazon_page())
@@ -568,7 +658,7 @@ def _list_html_files() -> list[str]:
     files: list[str] = []
     for path in _HTML_IMPORT_DIR.rglob("*.html"):
         rel = path.relative_to(_HTML_IMPORT_DIR)
-        if rel.parts and rel.parts[0] == "_blocked":
+        if rel.parts and rel.parts[0] in {"_blocked", "_details"}:
             continue
         files.append(rel.as_posix())
     return sorted(files)

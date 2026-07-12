@@ -15,6 +15,7 @@ RECOMMENDATION_COLUMNS = {
     "title": "商品标题",
     "keyword": "关键词",
     "total_score": "综合得分",
+    "product_size": "尺寸/规格",
     "price": "价格",
     "rating": "评分",
     "review_count": "评论数",
@@ -57,7 +58,9 @@ def fetch_recommendations_page(
     with db.connect() as conn:
         with conn.cursor() as cursor:
             has_title_zh = db.has_columns(cursor, "products", ("title_zh",))
+            has_product_size = db.has_columns(cursor, "products", ("product_size",))
             title_select = _product_title_select(has_title_zh)
+            product_size_select = _product_size_select(has_product_size)
             where_sql, params = _recommendation_filters(min_score=min_score)
             from_sql = f"""
                 FROM product_scores ps
@@ -89,6 +92,7 @@ def fetch_recommendations_page(
                   k.keyword,
                   ps.total_score,
                   ps.growth_score,
+                  {product_size_select},
                   snap.price,
                   snap.rating,
                   snap.review_count,
@@ -150,6 +154,12 @@ def _product_title_select(has_title_zh: bool) -> str:
     if has_title_zh:
         return "COALESCE(NULLIF(p.title_zh, ''), p.title) AS title, p.title AS title_original, p.title_zh"
     return "p.title"
+
+
+def _product_size_select(has_product_size: bool) -> str:
+    if has_product_size:
+        return "p.product_size"
+    return "NULL AS product_size"
 
 
 def _recommendation_order_by(sort_by: str, sort_dir: str) -> tuple[str, str, str]:

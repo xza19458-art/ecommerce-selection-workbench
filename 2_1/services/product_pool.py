@@ -21,6 +21,8 @@ def fetch_product_pool(
     min_price: float | None = None,
     max_price: float | None = None,
     max_reviews: int | None = None,
+    sort_by: str = "total_score",
+    sort_dir: str = "desc",
     client: MySQLClient | None = None,
 ) -> list[dict[str, Any]]:
     return fetch_product_pool_page(
@@ -31,6 +33,8 @@ def fetch_product_pool(
         min_price=min_price,
         max_price=max_price,
         max_reviews=max_reviews,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         client=client,
     )["rows"]
 
@@ -45,6 +49,8 @@ def fetch_product_pool_page(
     min_price: float | None = None,
     max_price: float | None = None,
     max_reviews: int | None = None,
+    sort_by: str = "total_score",
+    sort_dir: str = "desc",
     client: MySQLClient | None = None,
 ) -> dict[str, Any]:
     db = client or MySQLClient()
@@ -53,7 +59,15 @@ def fetch_product_pool_page(
     with db.connect() as conn:
         with conn.cursor() as cursor:
             has_title_zh = db.has_columns(cursor, "products", ("title_zh",))
+            has_product_size = db.has_columns(cursor, "products", ("product_size",))
             title_select = _product_title_select(has_title_zh)
+            product_size_select = _product_size_select(has_product_size)
+            order_sql, normalized_sort, normalized_dir = _pool_order_by(
+                sort_by,
+                sort_dir,
+                has_title_zh=has_title_zh,
+                has_product_size=has_product_size,
+            )
             keyword_join_sql, keyword_join_params = _build_keyword_join(keyword=keyword, keyword_exact=keyword_exact)
             where_sql, params = _build_pool_filters(
                 keyword=keyword,
@@ -63,6 +77,7 @@ def fetch_product_pool_page(
                 max_price=max_price,
                 max_reviews=max_reviews,
                 has_title_zh=has_title_zh,
+                has_product_size=has_product_size,
             )
             params = keyword_join_params + params
             from_sql = f"""
@@ -87,6 +102,7 @@ def fetch_product_pool_page(
                   {title_select},
                   p.product_url,
                   p.image_url,
+                  {product_size_select},
                   p.first_seen_at,
                   p.last_seen_at,
                   k.keyword,
@@ -101,7 +117,7 @@ def fetch_product_pool_page(
                   snap.organic_rank,
                   snap.is_deal
                 {from_sql}
-                ORDER BY ps.total_score DESC, snap.monthly_bought DESC
+                {order_sql}
                 LIMIT %s OFFSET %s
                 """,
                 params + [limit_value, offset_value],
@@ -112,6 +128,8 @@ def fetch_product_pool_page(
         "total": total,
         "limit": limit_value,
         "offset": offset_value,
+        "sort_by": normalized_sort,
+        "sort_dir": normalized_dir,
     }
 
 
@@ -131,14 +149,26 @@ def fetch_product_history(
     with db.connect() as conn:
         with conn.cursor() as cursor:
             has_title_zh = db.has_columns(cursor, "products", ("title_zh",))
+            has_product_size = db.has_columns(cursor, "products", ("product_size",))
+            has_detail_columns = db.has_columns(
+                cursor,
+                "products",
+                ("date_first_available", "detail_collected_at", "detail_source_file"),
+            )
             title_select = _product_title_select(has_title_zh)
+            product_size_select = _product_size_select(has_product_size)
+            detail_select = _product_detail_select(has_detail_columns)
             cursor.execute(
                 f"""
                 SELECT
                   p.asin,
+                  p.marketplace,
                   {title_select},
                   p.product_url,
                   p.image_url,
+                  p.category_path,
+                  {product_size_select},
+                  {detail_select},
                   p.first_seen_at,
                   p.last_seen_at,
                   ps.total_score,
@@ -180,10 +210,17 @@ def fetch_product_history(
             if not snapshots:
                 snapshots = _fetch_product_snapshots_from_mysql(cursor, asin)
 
+            best_seller_ranks = (
+                _fetch_latest_bsr_snapshots(cursor, asin)
+                if db.has_table(cursor, "product_bsr_snapshots")
+                else []
+            )
+
     normalized_snapshots = [_normalize_row(row) for row in snapshots]
     return {
         "product": _normalize_row(product),
         "snapshots": normalized_snapshots,
+        "best_seller_ranks": [_normalize_row(row) for row in best_seller_ranks],
         "snapshot_freshness": build_snapshot_freshness(normalized_snapshots),
     }
 
@@ -231,6 +268,30 @@ def _fetch_product_snapshots_from_mysql(cursor: Any, asin: str) -> list[dict[str
     return list(cursor.fetchall())
 
 
+def _fetch_latest_bsr_snapshots(cursor: Any, asin: str) -> list[dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT
+          b.snapshot_at,
+          b.rank_value AS `rank`,
+          b.category_name,
+          b.category_url,
+          b.is_primary
+        FROM product_bsr_snapshots b
+        JOIN products p ON p.id = b.product_id
+        WHERE p.asin = %s
+          AND b.snapshot_at = (
+            SELECT MAX(b2.snapshot_at)
+            FROM product_bsr_snapshots b2
+            WHERE b2.product_id = b.product_id
+          )
+        ORDER BY b.is_primary DESC, b.rank_value ASC, b.id ASC
+        """,
+        (asin,),
+    )
+    return list(cursor.fetchall())
+
+
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(row)
     for key in (
@@ -247,12 +308,20 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         value = normalized.get(key)
         if value is not None:
             normalized[key] = float(value)
-    for key in ("first_seen_at", "last_seen_at", "snapshot_at"):
+    for key in (
+        "first_seen_at",
+        "last_seen_at",
+        "snapshot_at",
+        "date_first_available",
+        "detail_collected_at",
+    ):
         value = normalized.get(key)
         if value is not None:
             normalized[key] = str(value)
     if "is_deal" in normalized:
         normalized["is_deal"] = "是" if normalized.get("is_deal") else "否"
+    if "is_primary" in normalized:
+        normalized["is_primary"] = bool(normalized.get("is_primary"))
     return normalized
 
 
@@ -329,6 +398,7 @@ def _build_pool_filters(
     max_price: float | None,
     max_reviews: int | None,
     has_title_zh: bool = False,
+    has_product_size: bool = False,
 ) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -339,12 +409,16 @@ def _build_pool_filters(
             pass
         else:
             like = f"%{term}%"
+            keyword_clauses = ["p.asin LIKE %s", "p.title LIKE %s", "k.keyword LIKE %s"]
+            keyword_params = [like, like, like]
             if has_title_zh:
-                clauses.append("(p.asin LIKE %s OR p.title LIKE %s OR p.title_zh LIKE %s OR k.keyword LIKE %s)")
-                params.extend([like, like, like, like])
-            else:
-                clauses.append("(p.asin LIKE %s OR p.title LIKE %s OR k.keyword LIKE %s)")
-                params.extend([like, like, like])
+                keyword_clauses.insert(2, "p.title_zh LIKE %s")
+                keyword_params.insert(2, like)
+            if has_product_size:
+                keyword_clauses.append("p.product_size LIKE %s")
+                keyword_params.append(like)
+            clauses.append("(" + " OR ".join(keyword_clauses) + ")")
+            params.extend(keyword_params)
     if min_score is not None:
         clauses.append("ps.total_score >= %s")
         params.append(min_score)
@@ -426,3 +500,53 @@ def _product_title_select(has_title_zh: bool) -> str:
     if has_title_zh:
         return "COALESCE(NULLIF(p.title_zh, ''), p.title) AS title, p.title AS title_original, p.title_zh"
     return "p.title"
+
+
+def _product_size_select(has_product_size: bool) -> str:
+    if has_product_size:
+        return "p.product_size"
+    return "NULL AS product_size"
+
+
+def _product_detail_select(has_detail_columns: bool) -> str:
+    if has_detail_columns:
+        return "p.date_first_available, p.detail_collected_at, p.detail_source_file"
+    return "NULL AS date_first_available, NULL AS detail_collected_at, NULL AS detail_source_file"
+
+
+def _pool_order_by(
+    sort_by: str,
+    sort_dir: str,
+    *,
+    has_title_zh: bool,
+    has_product_size: bool,
+) -> tuple[str, str, str]:
+    title_expr = "COALESCE(NULLIF(p.title_zh, ''), p.title)" if has_title_zh else "p.title"
+    product_size_expr = "p.product_size" if has_product_size else "p.asin"
+    sorts = {
+        "asin": "p.asin",
+        "title": title_expr,
+        "keyword": "k.keyword",
+        "total_score": "ps.total_score",
+        "growth_score": "ps.growth_score",
+        "price": "snap.price",
+        "product_size": product_size_expr,
+        "rating": "snap.rating",
+        "review_count": "snap.review_count",
+        "monthly_bought": "snap.monthly_bought",
+        "organic_rank": "snap.organic_rank",
+        "snapshot_at": "snap.snapshot_at",
+        "first_seen_at": "p.first_seen_at",
+        "last_seen_at": "p.last_seen_at",
+    }
+    normalized_sort = str(sort_by or "total_score").strip()
+    if normalized_sort not in sorts:
+        normalized_sort = "total_score"
+    normalized_dir = "asc" if str(sort_dir or "").lower() == "asc" else "desc"
+    direction = "ASC" if normalized_dir == "asc" else "DESC"
+    expr = sorts[normalized_sort]
+    return (
+        f"ORDER BY {expr} IS NULL, {expr} {direction}, ps.total_score DESC, snap.monthly_bought DESC, p.asin ASC",
+        normalized_sort,
+        normalized_dir,
+    )

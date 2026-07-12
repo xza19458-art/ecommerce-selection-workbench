@@ -285,7 +285,7 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
         ),
         AgentToolDefinition(
             name="query_product_detail",
-            description="按 ASIN 查询商品详情、最新评分和历史快照。",
+            description="按 ASIN 查询商品详情、最新评分、历史快照，以及已采集的类目、Amazon 首次可售日期和多类目 BSR。",
             parameters=_schema({"asin": _string("Amazon ASIN。")}, required=["asin"]),
         ),
         AgentToolDefinition(

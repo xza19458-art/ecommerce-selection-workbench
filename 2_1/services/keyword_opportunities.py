@@ -16,6 +16,8 @@ def fetch_keyword_opportunities(
     *,
     keyword: str | None = None,
     min_products: int | None = None,
+    sort_by: str = "opportunity_score",
+    sort_dir: str = "desc",
     client: MySQLClient | None = None,
     prefer_warehouse: bool = True,
 ) -> list[dict[str, Any]]:
@@ -24,6 +26,8 @@ def fetch_keyword_opportunities(
         limit=limit,
         keyword=keyword,
         min_products=min_products,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         client=client,
         prefer_warehouse=prefer_warehouse,
     )["rows"]
@@ -35,6 +39,8 @@ def fetch_keyword_opportunities_page(
     offset: int = 0,
     keyword: str | None = None,
     min_products: int | None = None,
+    sort_by: str = "opportunity_score",
+    sort_dir: str = "desc",
     client: MySQLClient | None = None,
     prefer_warehouse: bool = True,
 ) -> dict[str, Any]:
@@ -46,6 +52,8 @@ def fetch_keyword_opportunities_page(
                 offset=offset,
                 keyword=keyword,
                 min_products=min_products,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
             )
             page["rows"] = [_enrich_row(_normalize_row(row)) for row in page["rows"]]
             return page
@@ -65,6 +73,8 @@ def fetch_keyword_opportunities_page(
         offset=offset,
         keyword=keyword,
         min_products=min_products,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         client=client,
     )
     page["rows"] = [_enrich_row(_normalize_row(row)) for row in page["rows"]]
@@ -93,7 +103,9 @@ def _fetch_keyword_opportunities_page_from_mysql(
     offset: int,
     keyword: str | None,
     min_products: int | None,
-    client: MySQLClient | None,
+    sort_by: str = "opportunity_score",
+    sort_dir: str = "desc",
+    client: MySQLClient | None = None,
 ) -> dict[str, Any]:
     db = client or MySQLClient()
     where_sql, where_params = _build_filters(keyword=keyword)
@@ -101,6 +113,7 @@ def _fetch_keyword_opportunities_page_from_mysql(
     params = where_params + having_params
     limit_value = _normalize_limit(limit)
     offset_value = _normalize_offset(offset)
+    order_sql, normalized_sort, normalized_dir = _keyword_opportunity_order_by(sort_by, sort_dir)
     ctes = _keyword_opportunity_mysql_ctes()
     select_sql = _keyword_opportunity_mysql_select(where_sql, having_sql)
 
@@ -120,14 +133,21 @@ def _fetch_keyword_opportunities_page_from_mysql(
                 f"""
                 {ctes}
                 {select_sql}
-                ORDER BY avg_total_score DESC, total_monthly_bought DESC, product_count DESC
+                {order_sql}
                 LIMIT %s OFFSET %s
                 """,
                 params + [limit_value, offset_value],
             )
             rows = cursor.fetchall()
 
-    return {"rows": rows, "total": total, "limit": limit_value, "offset": offset_value}
+    return {
+        "rows": rows,
+        "total": total,
+        "limit": limit_value,
+        "offset": offset_value,
+        "sort_by": normalized_sort,
+        "sort_dir": normalized_dir,
+    }
 
 
 def _fetch_keyword_opportunities_from_warehouse(
@@ -150,6 +170,8 @@ def _fetch_keyword_opportunities_page_from_warehouse(
     offset: int,
     keyword: str | None,
     min_products: int | None,
+    sort_by: str = "opportunity_score",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     where_sql, where_params = _build_filters(keyword=keyword, table_alias="k", placeholder="?")
     having_sql, having_params = _build_having(
@@ -160,6 +182,7 @@ def _fetch_keyword_opportunities_page_from_warehouse(
     params = where_params + having_params
     limit_value = _normalize_limit(limit)
     offset_value = _normalize_offset(offset)
+    order_sql, normalized_sort, normalized_dir = _keyword_opportunity_order_by(sort_by, sort_dir)
     ctes = _keyword_opportunity_warehouse_ctes()
     select_sql = _keyword_opportunity_warehouse_select(where_sql, having_sql)
 
@@ -176,12 +199,19 @@ def _fetch_keyword_opportunities_page_from_warehouse(
         f"""
         {ctes}
         {select_sql}
-        ORDER BY avg_total_score DESC, total_monthly_bought DESC, product_count DESC
+        {order_sql}
         LIMIT ? OFFSET ?
         """,
         params + [limit_value, offset_value],
     )
-    return {"rows": rows, "total": total, "limit": limit_value, "offset": offset_value}
+    return {
+        "rows": rows,
+        "total": total,
+        "limit": limit_value,
+        "offset": offset_value,
+        "sort_by": normalized_sort,
+        "sort_dir": normalized_dir,
+    }
 
 
 def _keyword_opportunity_mysql_ctes() -> str:
@@ -324,6 +354,48 @@ def _keyword_opportunity_warehouse_select(where_sql: str, having_sql: str) -> st
         GROUP BY k.keyword_id, k.marketplace, k.keyword
         {having_sql}
     """
+
+
+def _keyword_opportunity_order_by(sort_by: str, sort_dir: str) -> tuple[str, str, str]:
+    depth_score = (
+        "CASE "
+        "WHEN product_count <= 0 THEN 0 "
+        "WHEN product_count < 3 THEN 35 "
+        "WHEN product_count <= 10 THEN 75 "
+        "WHEN product_count <= 50 THEN 100 "
+        "ELSE 85 END"
+    )
+    opportunity_expr = (
+        "COALESCE(avg_demand_score, 0) * 0.30 + "
+        "COALESCE(avg_competition_score, 0) * 0.25 + "
+        "COALESCE(avg_rating_score, 0) * 0.15 + "
+        "COALESCE(avg_price_score, 0) * 0.10 + "
+        "COALESCE(avg_rank_score, 0) * 0.10 + "
+        f"({depth_score}) * 0.10"
+    )
+    sorts = {
+        "keyword": "keyword",
+        "opportunity_score": opportunity_expr,
+        "product_count": "product_count",
+        "avg_monthly_bought": "avg_monthly_bought",
+        "total_monthly_bought": "total_monthly_bought",
+        "avg_review_count": "avg_review_count",
+        "avg_price": "avg_price",
+        "avg_organic_rank": "avg_organic_rank",
+        "avg_total_score": "avg_total_score",
+        "latest_snapshot_at": "latest_snapshot_at",
+    }
+    normalized_sort = str(sort_by or "opportunity_score").strip()
+    if normalized_sort not in sorts:
+        normalized_sort = "opportunity_score"
+    normalized_dir = "asc" if str(sort_dir or "").lower() == "asc" else "desc"
+    direction = "ASC" if normalized_dir == "asc" else "DESC"
+    expr = sorts[normalized_sort]
+    return (
+        f"ORDER BY {expr} IS NULL, {expr} {direction}, avg_total_score DESC, total_monthly_bought DESC, product_count DESC",
+        normalized_sort,
+        normalized_dir,
+    )
 
 
 def _build_filters(*, keyword: str | None, table_alias: str = "k", placeholder: str = "%s") -> tuple[str, list[Any]]:

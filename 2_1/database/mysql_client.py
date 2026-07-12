@@ -21,6 +21,38 @@ PRODUCT_TRANSLATION_COLUMNS = {
     "title_translated_at": "title_translated_at DATETIME NULL COMMENT 'Product title translation time'",
 }
 
+PRODUCT_ATTRIBUTE_COLUMNS = {
+    "product_size": "product_size VARCHAR(255) NULL COMMENT '尺寸/规格（搜索结果可见规格或标题尺寸，最佳努力采集）' AFTER category_path",
+}
+
+PRODUCT_DETAIL_COLUMNS = {
+    "date_first_available": "date_first_available DATE NULL COMMENT 'Amazon Date First Available（最佳努力采集）' AFTER product_size",
+    "detail_collected_at": "detail_collected_at DATETIME NULL COMMENT '最近一次有效详情页采集时间' AFTER date_first_available",
+    "detail_source_file": "detail_source_file VARCHAR(1024) NULL COMMENT '最近一次详情页HTML来源文件' AFTER detail_collected_at",
+}
+
+PRODUCT_BSR_SNAPSHOTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS product_bsr_snapshots (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'BSR snapshot ID',
+  product_id BIGINT UNSIGNED NOT NULL COMMENT 'Product ID',
+  snapshot_at DATETIME NOT NULL COMMENT 'Collection time',
+  rank_value INT UNSIGNED NOT NULL COMMENT 'Best Sellers Rank',
+  category_name VARCHAR(512) NOT NULL COMMENT 'Rank category name',
+  category_url TEXT NULL COMMENT 'Amazon Best Sellers category URL',
+  is_primary TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Primary broad-category rank',
+  raw_text TEXT NULL COMMENT 'Original Best Sellers Rank text',
+  source_file VARCHAR(1024) NULL COMMENT 'Saved detail HTML source',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Created time',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_product_bsr_snapshot_category (product_id, snapshot_at, category_name),
+  KEY idx_product_bsr_time (product_id, snapshot_at),
+  KEY idx_bsr_category_rank (category_name, rank_value),
+  CONSTRAINT fk_product_bsr_product
+    FOREIGN KEY (product_id) REFERENCES products(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Amazon Best Sellers Rank time series'
+"""
+
 REVIEW_TRANSLATION_COLUMNS = {
     "title_zh": "title_zh TEXT NULL COMMENT 'Chinese review title translation'",
     "body_zh": "body_zh TEXT NULL COMMENT 'Chinese review body translation'",
@@ -224,10 +256,10 @@ class MySQLClient:
             """
             INSERT INTO products (
               marketplace, asin, title, title_zh, title_lang, title_translation_status,
-              title_translation_engine, title_translated_at, brand, category_path, product_url, image_url,
+              title_translation_engine, title_translated_at, brand, category_path, product_size, product_url, image_url,
               first_seen_at, last_seen_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
               id = LAST_INSERT_ID(id),
               title = VALUES(title),
@@ -249,6 +281,7 @@ class MySQLClient:
               END,
               brand = COALESCE(VALUES(brand), brand),
               category_path = COALESCE(VALUES(category_path), category_path),
+              product_size = COALESCE(NULLIF(VALUES(product_size), ''), product_size),
               product_url = VALUES(product_url),
               image_url = VALUES(image_url),
               last_seen_at = VALUES(last_seen_at)
@@ -264,6 +297,7 @@ class MySQLClient:
                 getattr(record, "title_translated_at", None),
                 record.brand,
                 record.category_path,
+                getattr(record, "product_size", None),
                 record.product_url,
                 record.image_url,
                 record.snapshot_at,
@@ -275,6 +309,14 @@ class MySQLClient:
     def ensure_translation_columns(self, cursor: Any) -> None:
         self._ensure_table_columns(cursor, "products", PRODUCT_TRANSLATION_COLUMNS)
         self._ensure_table_columns(cursor, "product_reviews", REVIEW_TRANSLATION_COLUMNS)
+
+    def ensure_product_attribute_columns(self, cursor: Any) -> None:
+        self._ensure_table_columns(cursor, "products", PRODUCT_ATTRIBUTE_COLUMNS)
+
+    def ensure_product_detail_schema(self, cursor: Any) -> None:
+        self.ensure_product_attribute_columns(cursor)
+        self._ensure_table_columns(cursor, "products", PRODUCT_DETAIL_COLUMNS)
+        cursor.execute(PRODUCT_BSR_SNAPSHOTS_TABLE_SQL)
 
     def ensure_translation_cache_table(self, cursor: Any) -> None:
         cursor.execute(TRANSLATION_CACHE_TABLE_SQL)
@@ -290,6 +332,19 @@ class MySQLClient:
     def has_columns(self, cursor: Any, table: str, columns: list[str] | tuple[str, ...]) -> bool:
         existing = self._fetch_existing_columns(cursor, table)
         return all(column in existing for column in columns)
+
+    def has_table(self, cursor: Any, table: str) -> bool:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_name = %s
+            """,
+            (self.config.database, table),
+        )
+        row = cursor.fetchone() or {}
+        return int(row.get("total") or row.get("COUNT(*)") or 0) > 0
 
     def _ensure_table_columns(self, cursor: Any, table: str, columns: dict[str, str]) -> None:
         existing = self._fetch_existing_columns(cursor, table)

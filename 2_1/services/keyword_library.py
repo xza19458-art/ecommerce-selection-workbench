@@ -38,6 +38,8 @@ def fetch_keyword_assets_page(
     snapshot_filter: str = "all",
     tracking_filter: str = "all",
     source_filter: str = "all",
+    sort_by: str = "latest_snapshot_at",
+    sort_dir: str = "desc",
     client: MySQLClient | None = None,
 ) -> dict[str, Any]:
     """Return all keyword assets, including keywords without rank snapshots."""
@@ -54,6 +56,7 @@ def fetch_keyword_assets_page(
         source_filter=source_filter,
     )
     select_sql = _keyword_asset_select(where_sql)
+    order_sql, normalized_sort, normalized_dir = _keyword_asset_order_by(sort_by, sort_dir)
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
@@ -65,11 +68,7 @@ def fetch_keyword_assets_page(
             cursor.execute(
                 f"""
                 {select_sql}
-                ORDER BY
-                  latest_snapshot_at IS NULL,
-                  latest_snapshot_at DESC,
-                  product_count DESC,
-                  keyword_id DESC
+                {order_sql}
                 LIMIT %s OFFSET %s
                 """,
                 params + [limit_value, offset_value],
@@ -81,6 +80,8 @@ def fetch_keyword_assets_page(
         "total": total,
         "limit": limit_value,
         "offset": offset_value,
+        "sort_by": normalized_sort,
+        "sort_dir": normalized_dir,
         "summary": summary,
     }
 
@@ -160,7 +161,8 @@ def fetch_keyword_asset_detail(
             if not row:
                 raise ValueError(f"关键词不存在: {keyword_id}")
             asset = _normalize_asset_row(row)
-            products = _fetch_keyword_products(cursor, keyword_id, limit=20)
+            has_product_size = db.has_columns(cursor, "products", ("product_size",))
+            products = _fetch_keyword_products(cursor, keyword_id, limit=20, has_product_size=has_product_size)
     return {"asset": asset, "products": products}
 
 
@@ -666,6 +668,32 @@ def _build_asset_filters(
     return where_sql, params
 
 
+def _keyword_asset_order_by(sort_by: str, sort_dir: str) -> tuple[str, str, str]:
+    sorts = {
+        "keyword": "k.keyword",
+        "product_count": "product_count",
+        "snapshot_time_count": "snapshot_time_count",
+        "latest_snapshot_at": "latest_snapshot_at",
+        "avg_total_score": "avg_total_score",
+        "avg_organic_rank": "avg_organic_rank",
+        "source_types": "source_types",
+        "tracking_status": "active_count",
+        "created_at": "k.created_at",
+        "keyword_id": "k.id",
+    }
+    normalized_sort = str(sort_by or "latest_snapshot_at").strip()
+    if normalized_sort not in sorts:
+        normalized_sort = "latest_snapshot_at"
+    normalized_dir = "asc" if str(sort_dir or "").lower() == "asc" else "desc"
+    direction = "ASC" if normalized_dir == "asc" else "DESC"
+    expr = sorts[normalized_sort]
+    return (
+        f"ORDER BY {expr} IS NULL, {expr} {direction}, latest_snapshot_at DESC, product_count DESC, keyword_id DESC",
+        normalized_sort,
+        normalized_dir,
+    )
+
+
 def _fetch_summary(cursor: Any, marketplace: str) -> dict[str, Any]:
     where_sql, params = _build_asset_filters(marketplace=marketplace)
     select_sql = _keyword_asset_select(where_sql)
@@ -691,13 +719,21 @@ def _fetch_summary(cursor: Any, marketplace: str) -> dict[str, Any]:
     }
 
 
-def _fetch_keyword_products(cursor: Any, keyword_id: int, *, limit: int) -> list[dict[str, Any]]:
+def _fetch_keyword_products(
+    cursor: Any,
+    keyword_id: int,
+    *,
+    limit: int,
+    has_product_size: bool = False,
+) -> list[dict[str, Any]]:
+    product_size_select = "p.product_size" if has_product_size else "NULL AS product_size"
     cursor.execute(
-        """
+        f"""
         SELECT
           p.asin,
           p.title,
           p.title_zh,
+          {product_size_select},
           snap.price,
           snap.rating,
           snap.review_count,

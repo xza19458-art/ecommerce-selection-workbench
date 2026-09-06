@@ -113,6 +113,105 @@ def test_detail_parser_keeps_legitimate_missing_fields_as_none() -> None:
     assert record.best_seller_ranks == ()
 
 
+def test_detail_parser_reads_offer_specs_quality_and_variants() -> None:
+    html = f"""
+    <html><body>
+      <input id="ASIN" value="{ASIN}" />
+      <span id="productTitle">Structured Product</span>
+      <div id="corePrice_feature_div">
+        <span class="a-price"><span class="a-offscreen">$19.99</span></span>
+        <span class="a-price a-text-price"><span class="a-offscreen">$24.99</span></span>
+        <span class="savingsPercentage">-20%</span>
+      </div>
+      <span id="couponText">Save 10% with coupon</span>
+      <div id="availability"><span>In Stock</span></div>
+      <a id="sellerProfileTriggerId">Example Seller</a>
+      <div id="fulfillerInfoFeature_feature_div">
+        <span>Ships from</span><span class="offer-display-feature-text-message">Amazon.com</span>
+      </div>
+      <i class="a-icon-prime"></i>
+      <div id="buybox-see-all-buying-choices">3 new offers</div>
+      <div id="glow-ingress-line2">Delivering to New York 10001</div>
+      <div id="averageCustomerReviews">
+        <span id="acrPopover" title="4.7 out of 5 stars">4.7 out of 5 stars</span>
+        <span id="acrCustomerReviewText" aria-label="1,234 Reviews">(1,234)</span>
+      </div>
+      <span id="social-proofing-faceout-title-tk_bought"><b>400+ bought</b> in past month</span>
+      <div id="feature-bullets"><ul>
+        <li><span class="a-list-item">First useful bullet</span></li>
+        <li><span class="a-list-item">Second useful bullet</span></li>
+      </ul></div>
+      <div id="altImages"><ul>
+        <li class="imageThumbnail"></li><li class="imageThumbnail"></li>
+        <li class="videoThumbnail"></li>
+      </ul></div>
+      <div id="aplus_feature_div">A+ content</div>
+      <table id="histogramTable">
+        <tr><td>5 star</td><td>80%</td></tr><tr><td>1 star</td><td>5%</td></tr>
+      </table>
+      <table id="productDetails_detailBullets_sections1">
+        <tr><th>Product Dimensions</th><td>7.5 x 4 x 2 inches</td></tr>
+        <tr><th>Package Dimensions</th><td>25.4 x 12.7 x 5.08 cm</td></tr>
+        <tr><th>Item Weight</th><td>1.5 pounds</td></tr>
+        <tr><th>Package Weight</th><td>32 ounces</td></tr>
+        <tr><th>Unit Count</th><td>36 Count</td></tr>
+        <tr><th>Item model number</th><td>MODEL-36</td></tr>
+        <tr><th>Parent ASIN</th><td>B0PARENT01</td></tr>
+      </table>
+      <script>
+        var data = {{"parentAsin":"B0PARENT01","dimensionValuesDisplayData":{{
+          "{ASIN}":["Red","36 Count"],"B0CHILD001":["Blue","36 Count"]
+        }}}};
+      </script>
+    </body></html>
+    """
+
+    record = parse_amazon_detail_content(html)
+
+    assert record.offer.current_price == 19.99
+    assert record.offer.list_price == 24.99
+    assert record.offer.currency == "USD"
+    assert record.offer.rating == 4.7
+    assert record.offer.review_count == 1234
+    assert record.offer.monthly_bought == 400
+    assert record.offer.discount_percent == 20.0
+    assert record.offer.availability_status == "in_stock"
+    assert record.offer.fulfillment_channel == "FBA"
+    assert record.offer.is_prime is True
+    assert record.offer.offer_count == 3
+    assert record.offer.image_count == 2
+    assert record.offer.video_count == 1
+    assert record.offer.bullet_count == 2
+    assert record.offer.has_a_plus is True
+    assert record.offer.rating_histogram == {"5": 0.8, "1": 0.05}
+    assert record.offer.postal_code == "10001"
+    assert record.physical_specs.parent_asin == "B0PARENT01"
+    assert record.physical_specs.item_length_in == 7.5
+    assert record.physical_specs.package_length_in == 10.0
+    assert record.physical_specs.item_weight_oz == 24.0
+    assert record.physical_specs.package_weight_oz == 32.0
+    assert record.physical_specs.unit_count == 36.0
+    assert record.physical_specs.model_number == "MODEL-36"
+    assert [item.child_asin for item in record.variants] == ["B0CHILD001", ASIN]
+    assert next(item for item in record.variants if item.child_asin == ASIN).is_selected is True
+
+
+def test_detail_parser_does_not_read_monthly_bought_from_recommendations() -> None:
+    html = f"""
+    <html><body>
+      <input id="ASIN" value="{ASIN}" />
+      <span id="productTitle">Product without main social proof</span>
+      <div class="recommendation-carousel">
+        <span>9K+ bought in past month</span>
+      </div>
+    </body></html>
+    """
+
+    record = parse_amazon_detail_content(html)
+
+    assert record.offer.monthly_bought is None
+
+
 def test_detail_page_classifier_rejects_robot_check() -> None:
     state, reason = classify_amazon_detail_page(
         "<html><body>Sorry, we just need to make sure you're not a robot</body></html>",
@@ -122,6 +221,22 @@ def test_detail_page_classifier_rejects_robot_check() -> None:
 
     assert state == "blocked"
     assert "验证码" in str(reason)
+
+
+def test_self_parent_asin_is_not_exposed_as_parent_relation() -> None:
+    html = f"""
+    <html><body>
+      <input id="ASIN" value="{ASIN}" />
+      <span id="productTitle">Self-parent test product</span>
+      <table><tr><th>Parent ASIN</th><td>{ASIN}</td></tr></table>
+      <script>var data = {{"parentAsin":"{ASIN}"}};</script>
+    </body></html>
+    """
+
+    record = parse_amazon_detail_content(html)
+
+    assert record.asin == ASIN
+    assert record.physical_specs.parent_asin is None
 
 
 def test_amazon_product_url_uses_only_known_amazon_hosts() -> None:
@@ -144,7 +259,10 @@ if __name__ == "__main__":
         test_detail_parser_supports_detail_bullets_and_missing_breadcrumbs,
         test_detail_parser_uses_json_ld_only_as_optional_fallback,
         test_detail_parser_keeps_legitimate_missing_fields_as_none,
+        test_detail_parser_reads_offer_specs_quality_and_variants,
+        test_detail_parser_does_not_read_monthly_bought_from_recommendations,
         test_detail_page_classifier_rejects_robot_check,
+        test_self_parent_asin_is_not_exposed_as_parent_relation,
         test_amazon_product_url_uses_only_known_amazon_hosts,
     ]
     for test in tests:

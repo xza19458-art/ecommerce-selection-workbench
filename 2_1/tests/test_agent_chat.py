@@ -109,6 +109,32 @@ class OperationProvider:
         return LLMResponse(reply="Operation flow finished.", finished=True)
 
 
+def test_conversation_store_evicts_oldest_conversation() -> None:
+    store = AgentConversationStore(max_conversations=2)
+    first = store.get_or_create("first")
+    store.get_or_create("second")
+    store.get_or_create("third")
+
+    assert len(store) == 2
+    assert "first" not in store._items
+    assert first.conversation_id == "first"
+
+
+def test_conversation_store_compacts_old_history_at_user_boundary() -> None:
+    store = AgentConversationStore(max_messages=8)
+    conversation = store.get_or_create("long")
+    for index in range(20):
+        role = "user" if index % 2 == 0 else "assistant"
+        conversation.messages.append({"role": role, "content": str(index)})
+
+    store.compact(conversation)
+
+    body = [message for message in conversation.messages if message.get("role") != "system"]
+    assert len(body) <= 8
+    assert body[0]["role"] == "user"
+    assert conversation.messages[0]["content"] == SYSTEM_PROMPT
+
+
 def test_agent_chat_executes_readonly_tool_then_returns_final_reply() -> None:
     provider = MockProvider()
     service = AgentChatService(provider, controller=FakeController(), store=AgentConversationStore())
@@ -127,8 +153,21 @@ def test_agent_chat_executes_readonly_tool_then_returns_final_reply() -> None:
 
 def test_system_prompt_guides_overview_and_keyword_group_tools() -> None:
     assert "query_app_overview" in SYSTEM_PROMPT
+    assert "query_detail_evidence_priorities" in SYSTEM_PROMPT
+    assert "明确指定研究项目时必须传 project_id" in SYSTEM_PROMPT
+    assert "页面未提供不等于 0" in SYSTEM_PROMPT
+    assert "当前扫描范围未发现匹配证据" in SYSTEM_PROMPT
     assert "query_keyword_groups" in SYSTEM_PROMPT
     assert "query_keyword_ideas" in SYSTEM_PROMPT
+    assert "query_research_review_queue" in SYSTEM_PROMPT
+    assert "query_research_decision_report" in SYSTEM_PROMPT
+    assert "detail_evidence_readiness" in SYSTEM_PROMPT
+    assert "不改变决策门禁、综合评分或冻结报告指纹" in SYSTEM_PROMPT
+    assert "query_tracking_evidence" in SYSTEM_PROMPT
+    assert "支持、反对、数据缺口" in SYSTEM_PROMPT
+    assert "Agent 不能保存或暂停观察计划" in SYSTEM_PROMPT
+    assert "不代表后台自动调度" in SYSTEM_PROMPT
+    assert "不是商品机会评分" in SYSTEM_PROMPT
     assert "一级关键词分组" in SYSTEM_PROMPT
     assert "当前应用上下文" in SYSTEM_PROMPT
 

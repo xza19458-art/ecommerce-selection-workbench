@@ -9,7 +9,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core import browser_runtime
+from core.controller import AppController, _build_chrome_options
 from core.browser_runtime import (
+    BrowserBusyError,
     ChromeDriverInstallation,
     ChromeDriverRequiredError,
     ChromeInstallation,
@@ -17,6 +19,7 @@ from core.browser_runtime import (
     select_compatible_driver,
     versions_are_compatible,
 )
+from desktop_app import _webview_start_options
 
 
 def test_chrome_115_plus_requires_matching_build_family() -> None:
@@ -115,6 +118,45 @@ def test_missing_matching_driver_returns_downloadable_structured_error() -> None
     assert error.details["detected_driver_versions"] == ["148.0.7778.178"]
 
 
+def test_product_detail_collection_rejects_concurrent_browser_use() -> None:
+    controller = AppController()
+    controller._browser_operation_lock.acquire()
+    try:
+        try:
+            controller.collect_product_detail("B0TEST0001")
+        except BrowserBusyError as error:
+            assert error.code == "browser_busy"
+            assert "其他任务" in str(error)
+        else:
+            raise AssertionError("并发详情采集应在访问浏览器前被拒绝")
+        assert controller._browser is None
+    finally:
+        controller._browser_operation_lock.release()
+
+
+def test_collection_browser_uses_installed_chrome_native_user_agent(tmp_path: Path) -> None:
+    options = _build_chrome_options(Path("chrome.exe"), tmp_path / "profile")
+
+    assert options.binary_location == "chrome.exe"
+    assert not any("user-agent=" in argument.lower() for argument in options.arguments)
+
+
+def test_desktop_webview_state_uses_persistent_user_data_path() -> None:
+    import pkg_paths
+
+    original_user_data_path = pkg_paths.user_data_path
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pkg_paths.user_data_path = lambda *parts: Path(tmp_dir).joinpath(*parts)
+            options = _webview_start_options()
+
+            assert options["private_mode"] is False
+            assert options["storage_path"] == str((Path(tmp_dir) / "webview_state").resolve())
+            assert Path(str(options["storage_path"])).is_dir()
+    finally:
+        pkg_paths.user_data_path = original_user_data_path
+
+
 if __name__ == "__main__":
     tests = [
         test_chrome_115_plus_requires_matching_build_family,
@@ -124,6 +166,9 @@ if __name__ == "__main__":
         test_missing_chrome_does_not_offer_driver_only_download,
         test_cached_driver_version_is_read_from_cache_path_without_launching_every_binary,
         test_missing_matching_driver_returns_downloadable_structured_error,
+        test_product_detail_collection_rejects_concurrent_browser_use,
+        test_collection_browser_uses_installed_chrome_native_user_agent,
+        test_desktop_webview_state_uses_persistent_user_data_path,
     ]
     for test in tests:
         test()

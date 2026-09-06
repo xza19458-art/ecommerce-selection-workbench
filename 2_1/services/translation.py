@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from pkg_paths import user_data_path
 from services.translation_rules import (
     detect_language,
     is_target_language,
@@ -17,12 +18,12 @@ from services.translation_rules import (
 )
 
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "translation.json"
-ARGOS_RUNTIME_ROOT = Path(__file__).resolve().parents[1] / ".argos"
+CONFIG_PATH = user_data_path("config", "translation.json")
+ARGOS_RUNTIME_ROOT = user_data_path(".argos")
 
 
 def ensure_argos_runtime_env(root: Path = ARGOS_RUNTIME_ROOT) -> Path:
-    """Keep Argos runtime files inside the project workspace by default."""
+    """Keep Argos runtime files inside the writable application data root."""
     root.mkdir(parents=True, exist_ok=True)
     defaults = {
         "XDG_DATA_HOME": root / "data",
@@ -178,7 +179,7 @@ class ArgosTranslator(BaseTranslator):
         ensure_argos_runtime_env()
         try:
             from argostranslate import translate
-        except ImportError as exc:
+        except ImportError:
             self._load_error = "argostranslate is not installed"
             return
 

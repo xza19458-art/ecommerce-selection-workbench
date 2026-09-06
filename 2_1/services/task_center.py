@@ -20,13 +20,7 @@ def fetch_task_jobs(
 ) -> list[dict[str, Any]]:
     """Fetch recent crawl/import jobs from MySQL."""
     db = client or MySQLClient()
-    where_sql = ""
-    params: list[Any] = []
-
-    if status and status != "全部":
-        where_sql = "WHERE status = %s"
-        params.append(status)
-
+    where_sql, params = _build_filters(status=status)
     params.append(_normalize_limit(limit))
     with db.connect() as conn:
         with conn.cursor() as cursor:
@@ -53,6 +47,94 @@ def fetch_task_jobs(
             )
             rows = cursor.fetchall()
     return [_normalize_row(row) for row in rows]
+
+
+def fetch_task_jobs_page(
+    limit: int = 25,
+    *,
+    offset: int = 0,
+    keyword: str | None = None,
+    status: str | None = None,
+    job_type: str | None = None,
+    client: MySQLClient | None = None,
+) -> dict[str, Any]:
+    """Fetch a filtered, paged task-center result without truncating the total."""
+
+    db = client or MySQLClient()
+    limit_value = _normalize_limit(limit)
+    offset_value = _normalize_offset(offset)
+    where_sql, params = _build_filters(
+        keyword=keyword,
+        status=status,
+        job_type=job_type,
+    )
+    with db.connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COUNT(*) AS total FROM crawl_jobs {where_sql}",
+                params,
+            )
+            total = int((cursor.fetchone() or {}).get("total") or 0)
+            cursor.execute(
+                f"""
+                SELECT
+                  id,
+                  keyword,
+                  url,
+                  pages,
+                  status,
+                  started_at,
+                  finished_at,
+                  total_found,
+                  total_valid,
+                  total_inserted,
+                  error_message
+                FROM crawl_jobs
+                {where_sql}
+                ORDER BY started_at DESC, id DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [limit_value, offset_value],
+            )
+            rows = [_normalize_row(row) for row in cursor.fetchall()]
+    return {
+        "rows": rows,
+        "total": total,
+        "limit": limit_value,
+        "offset": offset_value,
+    }
+
+
+def _build_filters(
+    *,
+    keyword: str | None = None,
+    status: str | None = None,
+    job_type: str | None = None,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    keyword_value = str(keyword or "").strip()
+    status_value = str(status or "").strip()
+    type_value = str(job_type or "").strip().lower()
+
+    if keyword_value:
+        clauses.append("COALESCE(keyword, '') LIKE %s")
+        params.append(f"%{keyword_value}%")
+    if status_value and status_value not in {"all", "全部"}:
+        clauses.append("status = %s")
+        params.append(status_value)
+    import_condition = (
+        "(COALESCE(url, '') LIKE %s OR pages IS NULL "
+        "OR COALESCE(total_inserted, 0) > 0)"
+    )
+    if type_value in {"import", "入库"}:
+        clauses.append(import_condition)
+        params.append(f"{IMPORT_JOB_URL_PREFIX}%")
+    elif type_value in {"crawl", "爬取"}:
+        clauses.append(f"NOT {import_condition}")
+        params.append(f"{IMPORT_JOB_URL_PREFIX}%")
+
+    return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
 
 
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -95,3 +177,11 @@ def _normalize_limit(limit: int) -> int:
     except (TypeError, ValueError):
         value = 100
     return max(1, min(value, 500))
+
+
+def _normalize_offset(offset: int) -> int:
+    try:
+        value = int(offset)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, value)

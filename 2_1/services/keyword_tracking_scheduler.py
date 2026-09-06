@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from database.mysql_client import MySQLClient
+from pkg_paths import resolve_user_writable_path
 from services.keyword_tracking import (
     STATUS_ACTIVE,
     STATUS_COMPLETED,
@@ -104,6 +105,9 @@ def run_keyword_tracking_scheduler(
 
     db = client or MySQLClient()
     started_at = datetime.now().replace(microsecond=0)
+    save_root = resolve_user_writable_path(save_root)
+    stop_file = resolve_user_writable_path(stop_file)
+    manifest_root = resolve_user_writable_path(manifest_root)
     decisions: list[TrackingQueueDecision] = []
     tasks = _load_tasks(task_id=task_id, limit=limit, client=db)
     collection_limits = get_collection_limits()

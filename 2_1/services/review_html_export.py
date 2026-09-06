@@ -14,6 +14,7 @@ from parsers.amazon_review_parser import (
     count_review_rejected_reasons,
     parse_amazon_review_html,
 )
+from pkg_paths import resolve_user_writable_path
 
 
 @dataclass
@@ -53,7 +54,11 @@ def export_review_html_files(
 
     fmt = _normalize_format(output_format, output_path)
     output = _resolve_output_path(output_path, fmt)
-    rejected_output = Path(rejected_output_path) if rejected_output_path else _default_rejected_path(output)
+    rejected_output = (
+        resolve_user_writable_path(rejected_output_path)
+        if rejected_output_path
+        else _default_rejected_path(output)
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     rejected_output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -87,9 +92,9 @@ def _normalize_format(output_format: str, output_path: str | Path | None) -> str
 
 def _resolve_output_path(output_path: str | Path | None, fmt: str) -> Path:
     if output_path:
-        return Path(output_path)
+        return resolve_user_writable_path(output_path)
     suffix = ".json" if fmt == "json" else ".csv"
-    return Path("数据结果") / f"评论HTML解析{suffix}"
+    return resolve_user_writable_path(Path("数据结果") / f"评论HTML解析{suffix}")
 
 
 def _default_rejected_path(output: Path) -> Path:

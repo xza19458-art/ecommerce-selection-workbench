@@ -7,8 +7,6 @@ from tkinter import font as tkfont
 from tkinter import ttk
 from tkinter import messagebox
 from pathlib import Path
-from typing import Dict
-
 from core.controller import AppController
 from services.trend_analysis import assess_product_trend
 
@@ -25,6 +23,7 @@ class MainWindow(tk.Tk):
         self._center_window()
 
         self._controller = AppController()
+        self._database_import_preview: dict | None = None
 
         # 设置字体
         try:
@@ -991,11 +990,19 @@ class MainWindow(tk.Tk):
         def preview_thread():
             try:
                 summary = self._controller.preview_files_for_database(selected_files, save_folder, keyword)
+                self._database_import_preview = {
+                    "files": tuple(selected_files),
+                    "keyword": keyword or "",
+                    "confirmation_token": summary.get("确认令牌"),
+                    "expected_valid": int(summary.get("有效入库候选") or 0),
+                    "fingerprint": summary.get("批次指纹") or "--",
+                }
                 message = self._format_summary("入库预览完成", summary)
                 self.after(0, lambda: self.set_status(message))
                 self.after(0, lambda: messagebox.showinfo("入库预览", message))
                 self.after(0, lambda: self._load_files("数据结果"))
             except Exception as e:
+                self._database_import_preview = None
                 error_msg = f"入库预览失败: {str(e)}"
                 self.after(0, lambda: self.set_status(error_msg))
                 self.after(0, lambda: self._log_error(error_msg))
@@ -1011,21 +1018,38 @@ class MainWindow(tk.Tk):
             self.set_status("请选择要写入数据库的HTML文件")
             return
 
+        keyword = self._keyword_var.get().strip() or None
+        preview = self._database_import_preview
+        if (
+            not preview
+            or tuple(selected_files) != preview.get("files")
+            or (keyword or "") != preview.get("keyword")
+            or not preview.get("confirmation_token")
+        ):
+            self.set_status("文件选择或关键词尚未预览，请先执行入库预览")
+            messagebox.showwarning("写入数据库", "请先预览当前文件和关键词，再确认写入数据库。")
+            return
+
         confirm = messagebox.askyesno(
             "写入数据库",
-            f"将严格过滤不完整商品，并写入 {len(selected_files)} 个HTML文件的有效数据。是否继续？"
+            f"确认写入批次 {preview['fingerprint']}？\n\n"
+            f"有效候选 {preview['expected_valid']} 条，来源文件 {len(selected_files)} 个。"
         )
         if not confirm:
             return
 
-        keyword = self._keyword_var.get().strip() or None
         self.set_status(f"开始写入数据库，共 {len(selected_files)} 个文件")
 
         import threading
 
         def import_thread():
             try:
-                summary = self._controller.import_files_to_database(selected_files, keyword)
+                summary = self._controller.import_previewed_files_to_database(
+                    selected_files,
+                    keyword,
+                    confirmation_token=preview["confirmation_token"],
+                    expected_valid=preview["expected_valid"],
+                )
                 message = self._format_summary("写入数据库完成", summary)
                 self.after(0, lambda: self.set_status(message))
                 self.after(0, lambda: messagebox.showinfo("写入数据库", message))
@@ -1033,6 +1057,8 @@ class MainWindow(tk.Tk):
                 error_msg = f"写入数据库失败: {str(e)}"
                 self.after(0, lambda: self.set_status(error_msg))
                 self.after(0, lambda: self._log_error(error_msg))
+            finally:
+                self._database_import_preview = None
 
         thread = threading.Thread(target=import_thread)
         thread.daemon = True
@@ -2779,7 +2805,19 @@ class MainWindow(tk.Tk):
 
     def _format_summary(self, title: str, summary: dict) -> str:
         parts = [title]
-        for key in ["解析商品数", "有效入库候选", "有效商品数", "过滤商品数", "入库商品数"]:
+        for key in [
+            "批次指纹",
+            "入库关键词",
+            "解析商品数",
+            "有效入库候选",
+            "有效商品数",
+            "过滤商品数",
+            "预计新增商品",
+            "预计更新已有商品",
+            "预计新增时间序列",
+            "预计新增关键词排名",
+            "入库商品数",
+        ]:
             if key in summary:
                 parts.append(f"{key}: {summary[key]}")
         reasons = summary.get("过滤原因") or {}

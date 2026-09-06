@@ -112,9 +112,6 @@ def import_reviews_from_file(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_translation_columns(cursor)
-            if translation_config.enabled and translation_config.use_cache:
-                db.ensure_translation_cache_table(cursor)
             for row in rows:
                 try:
                     record = _row_to_record(row, default_asin=default_asin)

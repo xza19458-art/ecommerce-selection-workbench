@@ -13,8 +13,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pkg_paths import user_data_path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = user_data_path()
 CONFIG_PATH = ROOT / "config" / "settings.json"
 SCHEMA_VERSION = 1
 

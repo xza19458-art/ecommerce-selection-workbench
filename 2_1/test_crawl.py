@@ -14,7 +14,7 @@ save_path = Path("html") / f"{keyword}_{pages}.html"
 # 确保保存文件夹存在
 save_path.parent.mkdir(exist_ok=True)
 
-print(f"开始测试爬取功能...")
+print("开始测试爬取功能...")
 print(f"关键词: {keyword}")
 print(f"页数: {pages}")
 print(f"保存路径: {save_path}")

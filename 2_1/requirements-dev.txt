@@ -1,0 +1,8 @@
+-r requirements.txt
+
+bandit>=1.9,<2
+coverage>=7.10,<8
+httpx>=0.28,<0.29
+pip-tools>=7.6,<8
+pytest>=9,<10
+ruff>=0.15,<0.16

@@ -1,10 +1,14 @@
 """应用控制器：处理网页爬取和数据分析逻辑。"""
 
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 import logging
 import re
+import shutil
+import threading
 import time
+import tempfile
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -16,14 +20,34 @@ import random
 from typing import Callable
 
 from core.browser_runtime import (
+    BrowserBusyError,
     ChromeDriverRepairRequiredError,
     ChromeLaunchError,
     resolve_browser_runtime,
 )
 from main import parse_amazon_page
+from pkg_paths import resolve_user_writable_path, user_data_path
 
 
 logger = logging.getLogger(__name__)
+
+
+def _build_chrome_options(chrome_path: Path, profile_dir: Path) -> Options:
+    options = Options()
+    options.binary_location = str(chrome_path)
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-notifications")
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
+    # Keep the installed Chrome's native UA so it agrees with browser version
+    # and Client Hints. Collection timing and stop boundaries remain unchanged.
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    return options
 
 
 class AppController:
@@ -31,49 +55,33 @@ class AppController:
 
     def __init__(self) -> None:
         self._browser = None
+        self._browser_profile_dir: Path | None = None
         self._amazon_location_prepared = False
+        self._browser_operation_lock = threading.Lock()
+
+    @contextmanager
+    def _browser_operation(self, label: str):
+        if not self._browser_operation_lock.acquire(blocking=False):
+            raise BrowserBusyError(label)
+        try:
+            yield
+        finally:
+            self._browser_operation_lock.release()
 
     def _get_browser(self) -> webdriver.Chrome:
         """获取浏览器实例"""
         if not self._browser:
             runtime = resolve_browser_runtime()
-            options = Options()
-
-            # 只复用已安装的本机 Chrome 程序；采集仍使用隔离的临时用户目录。
-            options.binary_location = str(runtime.chrome.path)
-
-            # 伪装成正常用户
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-infobars")
-            options.add_argument("--start-maximized")
-            options.add_argument("--disable-notifications")
-
-            # 使用临时用户数据目录
-            import tempfile
-            temp_dir = tempfile.mkdtemp()
-            options.add_argument(f"--user-data-dir={temp_dir}")
-
-            # 随机选择用户代理
-            user_agents = [
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.160 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.117 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.5938.132 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.180 Safari/537.36"
-            ]
-            options.add_argument(f"user-agent={random.choice(user_agents)}")
-
-            # 禁用自动化扩展
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option("useAutomationExtension", False)
+            temp_dir = Path(tempfile.mkdtemp(prefix="amazon_selection_chrome_"))
+            self._browser_profile_dir = temp_dir
+            options = _build_chrome_options(runtime.chrome.path, temp_dir)
 
             # 显式传入已验证的本地驱动，禁止 Selenium 在此处静默联网下载。
             service = Service(executable_path=str(runtime.driver.path))
             try:
                 self._browser = webdriver.Chrome(service=service, options=options)
             except WebDriverException as exc:
+                self._cleanup_browser_profile()
                 message = str(exc).lower()
                 repair_markers = (
                     "only supports chrome version",
@@ -103,28 +111,65 @@ class AppController:
 
     def stop_browser(self) -> None:
         """停止浏览器"""
-        if self._browser:
-            try:
-                self._browser.quit()
-            except:
-                pass
+        with self._browser_operation_lock:
+            if self._browser:
+                try:
+                    self._browser.quit()
+                except Exception:
+                    logger.debug("关闭共享采集浏览器失败。", exc_info=True)
             self._browser = None
             self._amazon_location_prepared = False
+            self._cleanup_browser_profile()
+
+    def _cleanup_browser_profile(self) -> None:
+        profile_dir = self._browser_profile_dir
+        self._browser_profile_dir = None
+        if profile_dir is None:
+            return
+        try:
+            resolved = profile_dir.resolve()
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            if not resolved.is_relative_to(temp_root) or not resolved.name.startswith("amazon_selection_chrome_"):
+                logger.warning("拒绝清理不在受控临时目录内的浏览器配置: %s", resolved)
+                return
+            shutil.rmtree(resolved, ignore_errors=False)
+        except FileNotFoundError:
+            return
+        except OSError:
+            logger.debug("清理共享浏览器临时配置失败: %s", profile_dir, exc_info=True)
 
     def open_amazon_page(self) -> dict:
         """Open Amazon in the shared crawler browser for manual preparation."""
-        browser = self._get_browser()
-        browser.get("https://www.amazon.com/")
-        time.sleep(random.uniform(1, 2))
-        self._amazon_location_prepared = True
-        return {
-            "状态": "已打开",
-            "URL": getattr(browser, "current_url", "https://www.amazon.com/"),
-            "标题": getattr(browser, "title", ""),
-            "message": "Amazon 页面已打开，后续手动采集将复用当前浏览器会话。",
-        }
+        with self._browser_operation("预开启 Amazon 页面"):
+            browser = self._get_browser()
+            browser.get("https://www.amazon.com/")
+            time.sleep(random.uniform(1, 2))
+            self._amazon_location_prepared = True
+            return {
+                "状态": "已打开",
+                "URL": getattr(browser, "current_url", "https://www.amazon.com/"),
+                "标题": getattr(browser, "title", ""),
+                "message": "Amazon 页面已打开，后续手动采集将复用当前浏览器会话。",
+            }
 
     def collect_amazon_search_pages(
+        self,
+        url: str,
+        pages: int = 1,
+        on_page: Callable[[int, str, str, str], bool | None] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        page_delay_seconds: tuple[int, int] = (3, 5),
+    ) -> list[dict]:
+        with self._browser_operation("Amazon 搜索页采集"):
+            return self._collect_amazon_search_pages(
+                url,
+                pages=pages,
+                on_page=on_page,
+                stop_requested=stop_requested,
+                page_delay_seconds=page_delay_seconds,
+            )
+
+    def _collect_amazon_search_pages(
         self,
         url: str,
         pages: int = 1,
@@ -196,8 +241,8 @@ class AppController:
                 WebDriverWait(browser, 15).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-component-type='s-search-result']"))
                 )
-            except:
-                pass
+            except WebDriverException:
+                logger.debug("搜索结果卡片等待超时，继续按页面 HTML 做完整性校验。")
 
             time.sleep(random.uniform(3, 5))
 
@@ -236,8 +281,8 @@ class AppController:
                     current_page = int(current_page_elem.text)
                     if current_page < pages:
                         print(f"已达到最大页数 {current_page}，无法继续爬取")
-                except:
-                    pass
+                except (WebDriverException, ValueError):
+                    logger.debug("翻页失败后无法读取当前页码。", exc_info=True)
                 break
 
         time.sleep(random.uniform(2, 4))
@@ -317,19 +362,20 @@ class AppController:
                 }
             )
 
-        project_root = Path(__file__).resolve().parents[1]
-        html_root = project_root / "html"
+        data_root = user_data_path()
+        html_root = user_data_path("html")
         safe_keyword = _safe_file_part(keyword)
-        keyword_dir = html_root / safe_keyword
-        blocked_dir = html_root / "_blocked" / safe_keyword
         url = f"https://www.amazon.com/s?k={urllib.parse.quote_plus(keyword)}"
         started_at = datetime.now().replace(microsecond=0)
+        batch_stamp = started_at.strftime("%Y%m%d_%H%M%S")
+        keyword_dir = html_root / safe_keyword / batch_stamp
+        blocked_dir = html_root / "_blocked" / safe_keyword / batch_stamp
         pages_saved: list[dict] = []
         stop_reason: str | None = None
         job_id = self._try_create_crawl_job(keyword, url, pages) if record_job else None
 
         def relative(path: Path) -> str:
-            return path.relative_to(project_root).as_posix()
+            return path.relative_to(data_root).as_posix()
 
         def save_page(page_num: int, page_html: str, current_url: str, title: str) -> bool:
             nonlocal stop_reason
@@ -342,9 +388,10 @@ class AppController:
             if state == "ok":
                 parse_result = parse_amazon_search_content(
                     page_html,
-                    source_file=f"{safe_keyword}_{page_num}.html",
+                    source_file=f"{safe_keyword}_p{page_num}_{batch_stamp}.html",
                     keyword=keyword,
                     marketplace="US",
+                    snapshot_at=started_at,
                     require_complete=True,
                 )
                 total_found = parse_result.total_found
@@ -355,10 +402,10 @@ class AppController:
 
             if state != "ok":
                 save_dir = blocked_dir
-                suffix = f"_{state}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                suffix = f"_{state}"
 
             save_dir.mkdir(parents=True, exist_ok=True)
-            save_path = save_dir / f"{safe_keyword}_{page_num}{suffix}.html"
+            save_path = save_dir / f"{safe_keyword}_p{page_num}_{batch_stamp}{suffix}.html"
             save_path.write_text(page_html, encoding="utf-8")
 
             page_result = {
@@ -396,6 +443,7 @@ class AppController:
                 "保存页数": len([p for p in pages_saved if p.get("状态") == "已保存"]),
                 "状态": status,
                 "开始时间": started_at.isoformat(sep=" "),
+                "快照时间": started_at.replace(minute=0, second=0).isoformat(sep=" "),
                 "结束时间": datetime.now().replace(microsecond=0).isoformat(sep=" "),
                 "保存目录": relative(keyword_dir),
                 "页面": pages_saved,
@@ -427,20 +475,27 @@ class AppController:
 
         imported = 0
         import_error: str | None = None
+        import_warnings: list[str] = []
         if saved_pages:
-            project_root = Path(__file__).resolve().parents[1]
-            files = [str(project_root / page["保存文件"]) for page in saved_pages if page.get("保存文件")]
+            data_root = user_data_path()
+            files = [str(data_root / page["保存文件"]) for page in saved_pages if page.get("保存文件")]
             if files:
                 try:
                     from services.ingestion import ingest_html_files_to_mysql
 
+                    crawl_started_at = None
+                    if crawl.get("开始时间"):
+                        crawl_started_at = datetime.fromisoformat(str(crawl["开始时间"]))
                     summary = ingest_html_files_to_mysql(
                         files,
                         keyword=(keyword or "").strip(),
                         marketplace=marketplace,
+                        snapshot_at=crawl_started_at,
+                        url=self._build_import_source_url([Path(file_name) for file_name in files]),
                         require_complete=True,
                     )
                     imported = int(getattr(summary, "total_inserted", 0) or 0)
+                    import_warnings = list(getattr(summary, "warnings", ()) or ())
                 except Exception as exc:  # 入库失败不崩，标记失败让队列暂停
                     import_error = f"入库失败: {exc}"
 
@@ -470,6 +525,7 @@ class AppController:
             "采集时间": crawl.get("结束时间"),
             "页面": page_list,
             "保存目录": crawl.get("保存目录"),
+            "警告": import_warnings,
         }
 
     def _try_create_crawl_job(self, keyword: str, url: str, pages: int) -> int | None:
@@ -514,30 +570,33 @@ class AppController:
     def _try_create_import_job(self, keyword: str | None, files: list[Path]) -> int | None:
         try:
             from database.mysql_client import MySQLClient
-            from services.task_center import IMPORT_JOB_URL_PREFIX
-
-            project_root = Path(__file__).resolve().parents[1]
-            rel_files: list[str] = []
-            for file_path in files:
-                try:
-                    rel_files.append(file_path.relative_to(project_root).as_posix())
-                except ValueError:
-                    rel_files.append(file_path.as_posix())
-            file_label = ";".join(rel_files[:8])
-            if len(rel_files) > 8:
-                file_label += f";...(+{len(rel_files) - 8})"
             db = MySQLClient()
             with db.connect() as conn:
                 with conn.cursor() as cursor:
                     return db.create_job(
                         cursor,
                         keyword or self._infer_import_keyword(files),
-                        f"{IMPORT_JOB_URL_PREFIX}{file_label}",
+                        self._build_import_source_url(files),
                         None,
                     )
         except Exception:
             logger.warning("创建入库任务日志失败。", exc_info=True)
             return None
+
+    def _build_import_source_url(self, files: list[Path]) -> str:
+        from services.task_center import IMPORT_JOB_URL_PREFIX
+
+        data_root = user_data_path()
+        rel_files: list[str] = []
+        for file_path in files:
+            try:
+                rel_files.append(file_path.relative_to(data_root).as_posix())
+            except ValueError:
+                rel_files.append(file_path.as_posix())
+        file_label = ";".join(rel_files[:8])
+        if len(rel_files) > 8:
+            file_label += f";...(+{len(rel_files) - 8})"
+        return f"{IMPORT_JOB_URL_PREFIX}{file_label}"
 
     def _try_finish_import_job(
         self,
@@ -571,12 +630,19 @@ class AppController:
     def _infer_import_keyword(self, files: list[Path]) -> str | None:
         if not files:
             return None
-        project_html = Path(__file__).resolve().parents[1] / "html"
-        try:
-            rel = files[0].relative_to(project_html)
-        except ValueError:
-            return None
-        return rel.parts[0] if len(rel.parts) > 1 else None
+        project_html = user_data_path("html")
+        inferred: set[str] = set()
+        for file_path in files:
+            try:
+                rel = file_path.relative_to(project_html)
+            except ValueError:
+                continue
+            parts = rel.parts
+            if len(parts) > 3 and parts[0] in {"snapshots", "tracking_snapshots"}:
+                inferred.add(parts[2])
+            elif len(parts) > 1 and not parts[0].startswith("_"):
+                inferred.add(parts[0])
+        return next(iter(inferred)) if len(inferred) == 1 else None
 
     def process_files(self, files: list[str], save_folder: str = "数据结果", merge_analysis: bool = False) -> None:
         """处理选中的文件"""
@@ -586,11 +652,7 @@ class AppController:
         else:
             # 分别分析每个文件
             for file_name in files:
-                # 如果路径已经包含html/前缀，直接使用；否则添加html/前缀
-                if file_name.startswith("html/"):
-                    file_path = Path(file_name)
-                else:
-                    file_path = Path("html") / file_name
+                file_path = self._resolve_html_file(file_name)
 
                 if file_path.exists():
                     # 分析文件
@@ -601,26 +663,94 @@ class AppController:
 
     def preview_files_for_database(self, files: list[str], save_folder: str = "数据结果", keyword: str | None = None) -> dict:
         """Preview strict database candidates and export Chinese CSV files."""
-        from services.ingestion import count_rejected_reasons, export_preview, parse_html_files
+        from services.ingestion import (
+            count_rejected_reasons,
+            estimate_ingestion_impact,
+            export_preview,
+            prepare_ingestion_batch,
+        )
 
         html_files = [self._resolve_html_file(file_name) for file_name in files]
-        valid_records, rejected_records = parse_html_files(html_files, keyword=keyword, require_complete=True)
+        effective_keyword = (keyword or "").strip() or self._infer_import_keyword(html_files)
+        batch = prepare_ingestion_batch(html_files, keyword=effective_keyword, require_complete=True)
+        valid_records = list(batch.records)
+        rejected_records = list(batch.rejected_records)
         export_preview(valid_records, rejected_records, save_folder, prefix="database_candidates")
-        return {
+        warnings: list[str] = []
+        impact: dict = {}
+        try:
+            impact = estimate_ingestion_impact(valid_records, keyword=batch.keyword, marketplace=batch.marketplace)
+        except Exception:
+            warnings.append("MySQL 影响范围暂不可用；候选解析仍有效，写入前请确认数据库已启动。")
+            logger.warning("HTML import impact preview failed.", exc_info=True)
+
+        summary = {
+            "批次指纹": batch.batch_fingerprint,
+            "文件数": len(batch.files),
+            "入库关键词": batch.keyword or "未填写（不写关键词排名）",
             "解析商品数": len(valid_records) + len(rejected_records),
             "有效入库候选": len(valid_records),
+            "唯一候选 ASIN": len({record.asin for record in valid_records}),
             "过滤商品数": len(rejected_records),
+            "采集时间点": sorted({record.snapshot_at.isoformat(sep=" ") for record in valid_records}),
             "过滤原因": count_rejected_reasons(rejected_records),
+            "确认令牌": batch.confirmation_token,
+            "预检警告": warnings,
         }
+        if impact:
+            summary.update(
+                {
+                    "预计新增商品": impact["new_products"],
+                    "预计更新已有商品": impact["existing_products"],
+                    "预计新增时间序列": impact["new_snapshots"],
+                    "预计覆盖同一时点快照": impact["existing_snapshots"],
+                    "关键词入库状态": impact["keyword_status"],
+                }
+            )
+            if batch.keyword:
+                summary.update(
+                    {
+                        "预计新增关键词排名": impact["new_keyword_ranks"],
+                        "预计覆盖同一关键词排名": impact["existing_keyword_ranks"],
+                    }
+                )
+        return summary
 
     def import_files_to_database(self, files: list[str], keyword: str | None = None) -> dict:
-        """Import strict database candidates into MySQL."""
-        from services.ingestion import ingest_html_files_to_mysql
+        """Legacy-compatible direct import used by the Tk interface."""
+        html_files = [self._resolve_html_file(file_name) for file_name in files]
+        effective_keyword = (keyword or "").strip() or self._infer_import_keyword(html_files)
+        return self._persist_database_batch(html_files, effective_keyword)
+
+    def import_previewed_files_to_database(
+        self,
+        files: list[str],
+        keyword: str | None,
+        *,
+        confirmation_token: str,
+        expected_valid: int,
+    ) -> dict:
+        """Write only the exact candidate set bound to a successful preview."""
+        from services.ingestion import prepare_ingestion_batch, validate_ingestion_confirmation
 
         html_files = [self._resolve_html_file(file_name) for file_name in files]
+        effective_keyword = (keyword or "").strip() or self._infer_import_keyword(html_files)
+        batch = prepare_ingestion_batch(html_files, keyword=effective_keyword, require_complete=True)
+        validate_ingestion_confirmation(batch, confirmation_token, expected_valid)
+        return self._persist_database_batch(html_files, effective_keyword, prepared_batch=batch)
+
+    def _persist_database_batch(self, html_files: list[Path], keyword: str | None, prepared_batch=None) -> dict:
+        from services.ingestion import ingest_html_files_to_mysql
+
         job_id = self._try_create_import_job(keyword, html_files)
         try:
-            summary = ingest_html_files_to_mysql(html_files, keyword=keyword, require_complete=True)
+            summary = ingest_html_files_to_mysql(
+                html_files,
+                keyword=keyword,
+                require_complete=True,
+                record_job=False,
+                prepared_batch=prepared_batch,
+            )
         except Exception as exc:
             self._try_finish_import_job(job_id, "失败", 0, 0, 0, str(exc))
             raise
@@ -632,38 +762,36 @@ class AppController:
             summary.total_inserted,
             None,
         )
-        return {
+        result = {
             "解析商品数": summary.total_found,
             "有效商品数": summary.total_valid,
             "过滤商品数": summary.total_rejected,
             "入库商品数": summary.total_inserted,
+            "入库关键词": keyword or "未填写（未写关键词排名）",
             "过滤原因": summary.rejected_reasons,
+            "警告": list(summary.warnings),
         }
+        if prepared_batch is not None:
+            result["确认批次指纹"] = prepared_batch.batch_fingerprint
+        return result
 
     def sync_analytics_warehouse(self) -> dict:
         """Sync MySQL analysis data into the local DuckDB/Parquet warehouse."""
-        from services.analytics_warehouse import sync_analytics_warehouse
+        from repositories.warehouse import WarehouseRepository
 
-        summary = sync_analytics_warehouse()
-        return {
-            "总行数": summary.total_rows,
-            "DuckDB": str(summary.duckdb_path),
-            "Parquet": str(summary.parquet_dir),
-            "同步表": {table.name: table.rows for table in summary.tables},
-        }
+        return WarehouseRepository().sync()
+
+    def get_analytics_warehouse_status(self) -> dict:
+        """Return whether the local analytical copy still matches MySQL."""
+        from repositories.warehouse import WarehouseRepository
+
+        return WarehouseRepository().get_status()
 
     def get_settings(self) -> dict:
         """Current user settings + schema + defaults (S3 设置页透出 services.settings)."""
-        from services.settings import get_default_settings, get_settings_schema, load_settings_result
+        from repositories.system import SystemRepository
 
-        result = load_settings_result()
-
-        return {
-            "settings": result.settings,
-            "changes": [change.to_dict() for change in result.changes],
-            "schema": get_settings_schema(),
-            "defaults": get_default_settings(),
-        }
+        return SystemRepository().get_settings()
 
     def update_settings(self, patch: dict) -> dict:
         """Deep-merge patch into settings, normalize + server-side clamp, persist.
@@ -671,9 +799,9 @@ class AppController:
         Returns {settings, changes}: changes 是被服务端钳制/回落的项（B 层硬边界等），
         供前端如实回报用户。C 层自定义评分只作单独层，不替换标准评分口径。
         """
-        from services.settings import update_settings as _update
+        from repositories.system import SystemRepository
 
-        return _update(patch).to_dict()
+        return SystemRepository().update_settings(patch)
 
     def get_top_recommendations(self, limit: int = 50) -> list[dict]:
         """Fetch top product recommendations from MySQL."""
@@ -687,7 +815,21 @@ class AppController:
         offset: int = 0,
         sort_by: str = "total_score",
         sort_dir: str = "desc",
+        keyword: str | None = None,
         min_score: float | None = None,
+        max_score: float | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        min_rating: float | None = None,
+        max_rating: float | None = None,
+        min_reviews: int | None = None,
+        max_reviews: int | None = None,
+        min_bought: int | None = None,
+        max_bought: int | None = None,
+        min_rank: int | None = None,
+        max_rank: int | None = None,
+        deal_status: str = "all",
+        size_status: str = "all",
     ) -> dict:
         """Fetch paged product recommendations from MySQL."""
         from services.recommendations import fetch_recommendations_page
@@ -697,7 +839,21 @@ class AppController:
             offset=offset,
             sort_by=sort_by,
             sort_dir=sort_dir,
+            keyword=keyword,
             min_score=min_score,
+            max_score=max_score,
+            min_price=min_price,
+            max_price=max_price,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            min_reviews=min_reviews,
+            max_reviews=max_reviews,
+            min_bought=min_bought,
+            max_bought=max_bought,
+            min_rank=min_rank,
+            max_rank=max_rank,
+            deal_status=deal_status,
+            size_status=size_status,
         )
 
     def export_top_recommendations(self, save_folder: str = "数据结果", limit: int = 50) -> Path:
@@ -711,24 +867,46 @@ class AppController:
         limit: int = 100,
         keyword: str | None = None,
         keyword_exact: bool = False,
+        keyword_scope: str = "current",
         min_score: float | None = None,
+        max_score: float | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
+        min_rating: float | None = None,
+        max_rating: float | None = None,
+        min_reviews: int | None = None,
         max_reviews: int | None = None,
+        min_bought: int | None = None,
+        max_bought: int | None = None,
+        min_rank: int | None = None,
+        max_rank: int | None = None,
+        deal_status: str = "all",
+        size_status: str = "all",
         sort_by: str = "total_score",
         sort_dir: str = "desc",
     ) -> list[dict]:
         """Fetch product pool rows from MySQL."""
-        from services.product_pool import fetch_product_pool
+        from repositories.products import ProductRepository
 
-        return fetch_product_pool(
+        return ProductRepository().get_pool(
             limit=limit,
             keyword=keyword,
             keyword_exact=keyword_exact,
+            keyword_scope=keyword_scope,
             min_score=min_score,
+            max_score=max_score,
             min_price=min_price,
             max_price=max_price,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            min_reviews=min_reviews,
             max_reviews=max_reviews,
+            min_bought=min_bought,
+            max_bought=max_bought,
+            min_rank=min_rank,
+            max_rank=max_rank,
+            deal_status=deal_status,
+            size_status=size_status,
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
@@ -739,62 +917,94 @@ class AppController:
         offset: int = 0,
         keyword: str | None = None,
         keyword_exact: bool = False,
+        keyword_scope: str = "current",
         min_score: float | None = None,
+        max_score: float | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
+        min_rating: float | None = None,
+        max_rating: float | None = None,
+        min_reviews: int | None = None,
         max_reviews: int | None = None,
+        min_bought: int | None = None,
+        max_bought: int | None = None,
+        min_rank: int | None = None,
+        max_rank: int | None = None,
+        deal_status: str = "all",
+        size_status: str = "all",
         sort_by: str = "total_score",
         sort_dir: str = "desc",
     ) -> dict:
         """Fetch paged product pool rows from MySQL."""
-        from services.product_pool import fetch_product_pool_page
+        from repositories.products import ProductRepository
 
-        return fetch_product_pool_page(
+        return ProductRepository().get_pool_page(
             limit=limit,
             offset=offset,
             keyword=keyword,
             keyword_exact=keyword_exact,
+            keyword_scope=keyword_scope,
             min_score=min_score,
+            max_score=max_score,
             min_price=min_price,
             max_price=max_price,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            min_reviews=min_reviews,
             max_reviews=max_reviews,
+            min_bought=min_bought,
+            max_bought=max_bought,
+            min_rank=min_rank,
+            max_rank=max_rank,
+            deal_status=deal_status,
+            size_status=size_status,
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
 
-    def get_product_history(self, asin: str) -> dict:
+    def get_product_history(self, asin: str, score_keyword: str | None = None) -> dict:
         """Fetch one product and its time-series snapshots from MySQL."""
-        from services.product_pool import fetch_product_history
-        from services.review_insights import fetch_product_review_insight
+        from repositories.products import ProductRepository
 
-        detail = fetch_product_history(asin)
-        detail["review_insight"] = fetch_product_review_insight(asin)
-        return detail
+        return ProductRepository().get_history(asin, score_keyword=score_keyword)
 
     def collect_product_detail(self, asin: str) -> dict:
         """Collect one Amazon detail page using the shared browser session."""
         from services.product_detail_collection import collect_product_detail
 
-        return collect_product_detail(asin, self._get_browser())
+        with self._browser_operation("商品详情采集"):
+            return collect_product_detail(asin, self._get_browser())
 
-    def get_product_advice(self, asin: str) -> dict:
+    def get_product_advice(self, asin: str, score_keyword: str | None = None) -> dict:
         """Selection conclusion / risk / entry-strategy for one product (shared with GUI)."""
-        from services.product_advice import entry_strategy, risk_text, selection_conclusion
+        from repositories.products import ProductRepository
 
-        detail = self.get_product_history(asin)
-        product = (detail.get("product") or {}) if isinstance(detail, dict) else {}
-        snapshots = (detail.get("snapshots") or []) if isinstance(detail, dict) else []
-        return {
-            "conclusion": selection_conclusion(product, snapshots),
-            "risk": risk_text(product, snapshots),
-            "entry_strategy": entry_strategy(product, snapshots),
-        }
+        return ProductRepository().get_advice(asin, score_keyword=score_keyword)
 
     def get_task_jobs(self, limit: int = 100, status: str | None = None) -> list[dict]:
         """Fetch recent crawl/import task logs from MySQL."""
         from services.task_center import fetch_task_jobs
 
         return fetch_task_jobs(limit=limit, status=status)
+
+    def get_task_jobs_page(
+        self,
+        limit: int = 25,
+        offset: int = 0,
+        keyword: str | None = None,
+        status: str | None = None,
+        job_type: str | None = None,
+    ) -> dict:
+        """Fetch filtered task logs with an honest total and page metadata."""
+        from services.task_center import fetch_task_jobs_page
+
+        return fetch_task_jobs_page(
+            limit=limit,
+            offset=offset,
+            keyword=keyword,
+            status=status,
+            job_type=job_type,
+        )
 
     def get_keyword_opportunities(
         self,
@@ -890,20 +1100,20 @@ class AppController:
         }
 
     def _resolve_html_file(self, file_name: str) -> Path:
-        project_root = Path(__file__).resolve().parents[1]
+        data_root = user_data_path()
         path = Path(file_name)
-        if path.exists():
-            return path
         if file_name.startswith("html/") or file_name.startswith("html\\"):
-            return project_root / path
-        return project_root / "html" / file_name
+            return data_root / path
+        if path.exists():
+            return path.resolve()
+        return user_data_path("html", file_name)
 
     def _merge_analysis(self, files: list[str], save_folder: str = "数据结果") -> None:
         """合并分析多个HTML文件"""
         import pandas as pd
         import os
         import datetime
-        from main import parse_amazon_page, calculate_blue_score
+        from main import calculate_blue_score
 
         # 获取运行开始的时间，精确到小时
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:00:00")
@@ -923,11 +1133,7 @@ class AppController:
 
         # 分析每个文件并收集数据
         for file_name in files:
-            # 如果路径已经包含html/前缀，直接使用；否则添加html/前缀
-            if file_name.startswith("html/"):
-                file_path = Path(file_name)
-            else:
-                file_path = Path("html") / file_name
+            file_path = self._resolve_html_file(file_name)
 
             if file_path.exists():
                 print(f"开始分析: {file_path}")
@@ -1075,8 +1281,6 @@ class AppController:
 
         # 可视化
         import matplotlib.pyplot as plt
-        import numpy as np
-
         plt.figure(figsize=(12, 8))
 
         # 散点图：竞争 vs 需求
@@ -1129,10 +1333,10 @@ class AppController:
 
     def _move_results(self, save_folder: str = "数据结果") -> None:
         """移动结果文件到指定文件夹"""
-        data_dir = Path(save_folder)
+        data_dir = resolve_user_writable_path(save_folder)
 
         # 确保保存文件夹存在
-        data_dir.mkdir(exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
 
         # 移动CSV文件
         for csv_file in Path(".").glob("*.csv"):

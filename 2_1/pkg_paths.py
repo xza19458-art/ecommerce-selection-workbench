@@ -4,7 +4,7 @@
 
 - `resource_path`：随程序分发的**只读资源**（如 `web/` 静态前端、`config/*.example.json` 模板）。
   开发态根于 `2_1/`；PyInstaller 冻结态根于 `sys._MEIPASS`（onedir 的 `_internal`）。
-- `user_data_path`：**用户可写数据**（真实 `config/`、`data_warehouse/`、`logs/`、`html/`、`reviews/`）。
+- `user_data_path`：**用户可写数据**（真实 `config/`、`data_warehouse/`、`logs/`、`html/`、`reviews/`、`exports/`、`webview_state/`）。
   开发态根于 `2_1/`；冻结态根于 **exe 同级目录**，便于用户查看/编辑且不被打包覆盖。
 
 **开发态（未冻结）两者都根于 `2_1/`，与打包前行为完全一致——零回归。**
@@ -43,3 +43,17 @@ def resource_path(*parts: str) -> Path:
 def user_data_path(*parts: str) -> Path:
     """定位用户可写数据（config/data_warehouse/logs/html/reviews 等）。"""
     return user_data_root().joinpath(*parts)
+
+
+def resolve_user_writable_path(value: str | Path) -> Path:
+    """Resolve a relative output below the stable writable data root.
+
+    Explicit absolute paths remain supported for developer and CLI workflows.
+    Relative defaults no longer depend on the process working directory, which
+    varies when a frozen app is launched from Explorer or a shortcut.
+    """
+
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return user_data_root().joinpath(path)

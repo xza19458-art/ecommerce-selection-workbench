@@ -13,11 +13,13 @@ import json
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from pkg_paths import user_data_path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = user_data_path()
 CONFIG_PATH = ROOT / "config" / "agent.json"
 PROVIDER_OPTIONS = [
     {
@@ -89,8 +91,7 @@ class LLMProviderConfig:
     def from_file(cls, path: Path = CONFIG_PATH) -> "LLMProviderConfig":
         if not path.exists():
             raise LLMProviderError(
-                "未配置 Agent 模型。请复制 2_1/config/agent.example.json 为 agent.json，"
-                "或在 Web 的 AI 助手里填写模型配置。"
+                f"未配置 Agent 模型：{path}。请在 Web 的 AI 助手里填写模型配置。"
             )
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -112,6 +113,7 @@ class LLMProviderConfig:
             base_url = "https://api.anthropic.com/v1"
         if not base_url or not model:
             raise LLMProviderError("Agent 模型配置缺少 base_url 或 model。")
+        _validate_base_url(base_url)
         if not api_key:
             raise LLMProviderError("Agent 模型配置缺少 api_key；本地模型可填写占位值，例如 ollama。")
         return cls(
@@ -410,6 +412,19 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 def _provider_values() -> set[str]:
     return {str(item["value"]) for item in PROVIDER_OPTIONS}
+
+
+def _validate_base_url(value: str) -> None:
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except ValueError as exc:
+        raise LLMProviderError("Agent 模型地址格式无效。") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise LLMProviderError("Agent 模型地址必须是完整的 HTTP 或 HTTPS URL。")
+    if parsed.username or parsed.password:
+        raise LLMProviderError("Agent 模型地址不能包含用户名或密码，请使用 API Key 配置。")
+    if parsed.query or parsed.fragment:
+        raise LLMProviderError("Agent 模型基础地址不能包含查询参数或片段。")
 
 
 def _provider_label(value: str) -> str:

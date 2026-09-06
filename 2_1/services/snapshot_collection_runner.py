@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 
 from database.mysql_client import MySQLClient
 from parsers.amazon_search_parser import parse_amazon_search_content
+from pkg_paths import resolve_user_writable_path
 from services.snapshot_collection_plan import (
     SnapshotCollectionPlan,
     SnapshotCollectionTask,
@@ -143,6 +144,10 @@ def run_snapshot_collection(
 
     started_at = datetime.now().replace(microsecond=0)
     snapshot_at = started_at.replace(minute=0, second=0, microsecond=0)
+    save_root = resolve_user_writable_path(save_root)
+    stop_file = resolve_user_writable_path(stop_file)
+    if manifest_path is not None:
+        manifest_path = resolve_user_writable_path(manifest_path)
     limits = _normalize_runner_limits(
         max_keywords=max_keywords,
         min_interval_hours=min_interval_hours,

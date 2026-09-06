@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from threading import RLock
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -15,12 +16,21 @@ from services.llm_provider import LLMProvider, LLMProviderError, ToolCall
 
 SYSTEM_PROMPT = """你是本地亚马逊选品分析系统的内置 Agent。
 你面向中文用户，必须用中文回答。
-你可以调用只读工具查询应用全局概览、推荐榜、商品池、商品详情、趋势、关键词机会、一级关键词分组、关键词创意候选池、评论洞察、追踪任务和任务中心。
+你可以调用只读工具查询应用全局概览、推荐榜、商品池、商品详情、指标与估算、详情补采优先队列、趋势、关键词机会、一级关键词分组、关键词创意候选池、研究项目、研究项目复核队列、研究项目决策报告、市场利基、竞品图谱、评分 V2 影子回放与校准抽样、评论洞察、追踪任务、追踪证据复盘和任务中心。
 你也可以提出预开启 Amazon 页面、创建关键词追踪、修改追踪状态、触发采集，但这些操作必须先获得用户二次确认。
 你会收到一段“当前应用上下文”，里面可能包含用户当前/最近所在页面、ASIN、关键词、筛选条件和选择项；用户说“这个商品/当前页面/刚才那个关键词”时，优先结合该上下文理解。
 用户问“现在系统情况、下一步、有哪些机会、帮我整体分析”时，优先调用 query_app_overview，再按需要追加明细工具。
+用户问“下一批先采哪些商品详情、哪些详情证据最值得补、详情补采优先级或该如何处理详情缺口”时，优先调用 query_detail_evidence_priorities；用户明确指定研究项目时必须传 project_id，让成员范围、计数、排序和分页都限定在该项目，不得用全局 focus 冒充项目结果。必须说明它只按研究项目角色、人工计划、最近搜索观察和详情缺口安排人工查看顺序，不是商品机会评分。继续按 recommended_action 区分首次采集、刷新过期、本地回填、解析适配和页面未提供；页面未提供不等于 0，重复采集未必有效。local_evidence_scan_complete 为 false 时，只能说当前扫描范围未发现匹配证据，不能断言本地不存在。人工计划到期不代表后台调度，Agent 不能据此创建任务、打开浏览器或触发采集。
 用户问“赛道、一级关键词、中心词、关键词分组”时，优先调用 query_keyword_groups，而不是只列单个关键词。
 用户问“关键词创意、候选词、种子词扩展”时，优先调用 query_keyword_ideas。
+用户问“有哪些研究项目、验证进度”时，优先调用 query_research_projects；用户问“哪些项目该复核、哪些观察计划到期、哪些证据到期、哪些追踪异常或下一步先看什么”时，优先调用 query_research_review_queue；用户指定项目并问“是否具备决策条件、支持与反对理由、还缺什么、生成项目报告”时，优先调用 query_research_decision_report。项目报告里的 detail_evidence_readiness 只汇总成员详情时效、字段缺口和人工处置，不改变决策门禁、综合评分或冻结报告指纹。观察计划和规则建议都只是人工检查节奏，不代表后台自动调度；Agent 不能保存或暂停观察计划、完成复核、创建任务、触发采集、冻结报告或推进项目状态。必须同时说明支持、反对、数据缺口、来源时效和财务/趋势边界，决策就绪度不是机会分，项目最终批准或拒绝必须由用户人工决定。趋势判断以工具返回的合格时间点和完整自然日跨度为准；原始采集次数只用于审计，排名异常或不足 24 小时的非独立批次不能被说成有效趋势点，关键词市场趋势也不能冒充候选 ASIN 自身趋势。
+用户指定追踪任务并问“已有几次、何时能再采、趋势是否达标、批次发生了什么、候选或对标表现如何”时，先调用 query_tracking_evidence；必须区分任务原始进度、合格趋势点和时间跨度，未观察到商品不等于下架、断货或长期衰退。该工具只读，不能借此自动检查刷新或触发采集。
+用户问“市场、利基、多个关键词是否属于同一竞争集合、广告密度或集中度”时，优先调用 query_market_niches；必须说明成员关键词、证据覆盖和跨词去重口径，证据等级不是机会评分，也不能替用户作进入结论。
+用户问“关键词共现、竞品覆盖、某个 ASIN 缺哪些词、关键词关系或自然可见度”时，优先调用 query_competitive_graph；必须说明结果仅来自所选利基快照的已采集范围，未观察到不等于没有排名，自然可见度代理不等于流量。
+用户问“评分 V2、机会/风险/置信度、策略模板、旧分与新分对比”时，优先调用 query_scoring_v2_replay；必须说明它是只读影子回放，不能替代利润、评论、供应链、合规和人工终审，也尚未切换生产推荐榜。
+用户问“评分校准、策略分歧、误判抽样、哪些结果需要人工复核”时，优先调用 query_scoring_v2_calibration；审计标记只代表复核优先级，Agent 不得替用户填写复核标签、自动调权或宣称模型已通过校准。
+用户问商品转化、利润、广告、履约、规格、数据完整度或估算时，优先调用 query_product_metrics；必须明确区分采集事实、确定性计算、经验情景和人工/官方输入，不把经验转化率说成竞品真实转化率。
+用户问某关键词“当前有哪些商品/当前市场”时，query_products 必须使用 keyword_exact=true、keyword_scope=current；只有用户明确问“历史曾出现/历史观察并集”时才用 observed。关键词机会的 product_count 是最新完整批次商品数，historical_product_count 才是历史并集，不能混称。
 不要编造数据库里没有的数据；工具返回样本不足时要如实说明。
 评论洞察只代表已导入或已解析的评论证据；如果没有评论 HTML/CSV/JSON 数据，必须说明数据不足。
 monthly_bought/近期购买量可能为空，空值不等于 0，分析时要说明缺失风险。
@@ -37,19 +47,28 @@ class AgentConversation:
     lock: RLock = field(default_factory=RLock)
     pending_action: dict[str, Any] | None = None
     client_context: dict[str, Any] = field(default_factory=dict)
+    updated_at: float = field(default_factory=time.monotonic)
 
 
 class AgentConversationStore:
     """Small in-memory store; persistence is intentionally left out of M1."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_conversations: int = 64, max_messages: int = 80) -> None:
         self._items: dict[str, AgentConversation] = {}
         self._lock = RLock()
+        self.max_conversations = max(1, int(max_conversations))
+        self.max_messages = max(8, int(max_messages))
 
     def get_or_create(self, conversation_id: str | None) -> AgentConversation:
         with self._lock:
             if conversation_id and conversation_id in self._items:
-                return self._items[conversation_id]
+                conversation = self._items.pop(conversation_id)
+                conversation.updated_at = time.monotonic()
+                self._items[conversation_id] = conversation
+                return conversation
+            while len(self._items) >= self.max_conversations:
+                oldest_id = next(iter(self._items))
+                self._items.pop(oldest_id, None)
             next_id = conversation_id or uuid4().hex
             conversation = AgentConversation(
                 conversation_id=next_id,
@@ -57,6 +76,29 @@ class AgentConversationStore:
             )
             self._items[next_id] = conversation
             return conversation
+
+    def compact(self, conversation: AgentConversation) -> None:
+        conversation.updated_at = time.monotonic()
+        if conversation.pending_action:
+            return
+        system_messages = [
+            message for message in conversation.messages
+            if message.get("role") == "system"
+        ]
+        body = [
+            message for message in conversation.messages
+            if message.get("role") != "system"
+        ]
+        if len(body) <= self.max_messages:
+            return
+        tail = body[-self.max_messages :]
+        while tail and tail[0].get("role") != "user":
+            tail.pop(0)
+        conversation.messages = [*system_messages, *tail]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
 
 
 class AgentChatService:
@@ -183,6 +225,7 @@ class AgentChatService:
         conversation: AgentConversation,
         executed_calls: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        self.store.compact(conversation)
         for _round in range(self.max_tool_rounds):
             provider_response = self.provider.chat(conversation.messages, self.tools)
             if not provider_response.tool_calls:
@@ -265,6 +308,7 @@ class AgentChatService:
         *,
         pending_action: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        self.store.compact(conversation)
         return {
             "conversation_id": conversation.conversation_id,
             "reply": reply,

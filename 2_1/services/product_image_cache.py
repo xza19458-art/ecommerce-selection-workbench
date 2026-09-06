@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import re
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
@@ -28,7 +29,7 @@ _ALLOWED_HOST_SUFFIXES = (
     "media-amazon.com",
     "ssl-images-amazon.com",
     "images-amazon.com",
-    "amazon.com",
+    "images.amazon.com",
 )
 
 _ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -93,7 +94,7 @@ def content_type_for(path: Path) -> str:
 
 def _cache_path_for(url: str) -> Path:
     # 按 URL 哈希命名：image_url 一变就指向新缓存文件，自动避开陈旧图。
-    digest = hashlib.md5(url.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
     return _cache_dir() / f"{digest}{_ext_from_url(url)}"
 
 
@@ -114,17 +115,39 @@ def _download_and_cache(url: str) -> Path | None:
         return path
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
+        opener = urllib.request.build_opener(_AllowedImageRedirectHandler())
+        with opener.open(request, timeout=_TIMEOUT_SECONDS) as response:
+            if not _is_allowed_host(response.geturl()):
+                return None
+            content_type = str(response.headers.get_content_type() or "").lower()
             data = response.read(_MAX_BYTES + 1)
     except Exception:
         return None
     if not data or len(data) > _MAX_BYTES:
+        return None
+    if not content_type.startswith("image/") and not _looks_like_image(data):
         return None
     # 先写临时文件再原子替换，避免并发/中断留下半截缓存。
     tmp = path.with_suffix(path.suffix + ".part")
     tmp.write_bytes(data)
     tmp.replace(path)
     return path
+
+
+class _AllowedImageRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_allowed_host(newurl):
+            raise urllib.error.URLError("商品图片重定向目标不在 Amazon 媒体域名白名单")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _looks_like_image(data: bytes) -> bool:
+    return (
+        data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"\x89PNG\r\n\x1a\n")
+        or data.startswith((b"GIF87a", b"GIF89a"))
+        or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    )
 
 
 def fetch_product_image(asin: str, *, large: bool = False, client: MySQLClient | None = None) -> Path | None:

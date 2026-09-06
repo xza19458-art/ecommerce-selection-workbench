@@ -1,0 +1,1 @@
+"""Vertically sliced FastAPI routers."""

@@ -49,9 +49,6 @@ def backfill_translations(
                 summary.migration_needed = True
                 return summary
 
-            db.ensure_translation_columns(cursor)
-            if runtime_config.enabled and runtime_config.use_cache:
-                db.ensure_translation_cache_table(cursor)
             if include_products and runtime_config.translate_products:
                 _backfill_products(cursor, translator, runtime_config, summary, limit=limit, dry_run=dry_run)
             if include_reviews and runtime_config.translate_reviews:

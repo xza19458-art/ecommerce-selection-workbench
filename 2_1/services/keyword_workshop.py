@@ -139,9 +139,7 @@ class WorkshopRunResult:
 
 def ensure_keyword_workshop_schema(*, client: MySQLClient | None = None) -> None:
     db = client or MySQLClient()
-    with db.connect() as conn:
-        with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
+    db.initialize_schema()
 
 
 def normalize_keyword(value: str | None) -> str:
@@ -517,7 +515,6 @@ def run_keyword_workshop(
 
         with db.connect() as conn:
             with conn.cursor() as cursor:
-                db.ensure_keyword_workshop_tables(cursor)
                 _attach_existing_keyword_signals(cursor, marketplace, candidates)
                 total_saved = _save_candidates(cursor, run_id=run_id, marketplace=marketplace, candidates=candidates)
                 _finish_run(
@@ -577,7 +574,6 @@ def fetch_keyword_ideas_page(
     order_sql, normalized_sort, normalized_dir = _idea_order_by(sort_by, sort_dir)
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             cursor.execute(f"SELECT COUNT(*) AS total FROM keyword_ideas {where_sql}", params)
             total = int((cursor.fetchone() or {}).get("total") or 0)
             cursor.execute(
@@ -614,7 +610,6 @@ def fetch_keyword_idea_runs_page(
     offset_value = _normalize_offset(offset)
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             cursor.execute(
                 """
                 SELECT COUNT(*) AS total
@@ -671,7 +666,6 @@ def promote_keyword_ideas(
     updated = 0
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             rows = _fetch_ideas_by_ids(cursor, ids, marketplace=marketplace)
             for row in rows:
                 keyword_id = db.upsert_keyword(cursor, row["keyword"], marketplace)
@@ -703,7 +697,6 @@ def create_tracking_from_keyword_ideas(
     marketplace = _normalize_marketplace(marketplace)
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             rows = _fetch_ideas_by_ids(cursor, ids, marketplace=marketplace)
 
     tasks: list[dict[str, Any]] = []
@@ -721,7 +714,6 @@ def create_tracking_from_keyword_ideas(
         tasks.append(task)
         with db.connect() as conn:
             with conn.cursor() as cursor:
-                db.ensure_keyword_workshop_tables(cursor)
                 cursor.execute(
                     """
                     UPDATE keyword_ideas
@@ -750,7 +742,6 @@ def update_keyword_idea_status(
     placeholders = ", ".join(["%s"] * len(ids))
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             cursor.execute(
                 f"""
                 UPDATE keyword_ideas
@@ -782,7 +773,6 @@ def update_keyword_idea_status_by_run(
     marketplace = _normalize_marketplace(marketplace)
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             cursor.execute(
                 """
                 UPDATE keyword_ideas
@@ -812,7 +802,6 @@ def _create_run(
 ) -> int:
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             cursor.execute(
                 """
                 INSERT INTO keyword_idea_runs (
@@ -878,7 +867,6 @@ def _collect_title_candidates(
     row_limit = _clamp_int(limit, default=300, minimum=20, maximum=2000)
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
             for seed in seeds:
                 cursor.execute(
                     """
@@ -1279,7 +1267,6 @@ def _mark_run_error(db: MySQLClient, run_id: int, message: str, *, total_found: 
     try:
         with db.connect() as conn:
             with conn.cursor() as cursor:
-                db.ensure_keyword_workshop_tables(cursor)
                 _finish_run(
                     cursor,
                     run_id=run_id,

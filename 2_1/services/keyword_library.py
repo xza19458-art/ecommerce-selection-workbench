@@ -60,8 +60,6 @@ def fetch_keyword_assets_page(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
-            db.ensure_keyword_tracking_table(cursor)
             summary = _fetch_summary(cursor, marketplace)
             cursor.execute(f"SELECT COUNT(*) AS total FROM ({select_sql}) AS q", params)
             total = int((cursor.fetchone() or {}).get("total") or 0)
@@ -112,8 +110,6 @@ def fetch_keyword_asset_tree(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
-            db.ensure_keyword_tracking_table(cursor)
             summary = _fetch_summary(cursor, marketplace)
             cursor.execute(f"SELECT COUNT(*) AS total FROM ({select_sql}) AS q", params)
             total = int((cursor.fetchone() or {}).get("total") or 0)
@@ -154,8 +150,6 @@ def fetch_keyword_asset_detail(
     select_sql = _keyword_asset_select(where_sql)
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_workshop_tables(cursor)
-            db.ensure_keyword_tracking_table(cursor)
             cursor.execute(f"{select_sql} LIMIT 1", params)
             row = cursor.fetchone()
             if not row:

@@ -1,0 +1,15 @@
+target-version = "py312"
+exclude = [
+  ".venv",
+  "data_warehouse",
+  "exports",
+  "html",
+  "web/vendor",
+]
+
+[lint.per-file-ignores]
+"api/app.py" = ["E402"]
+"main.py" = ["E402"]
+"main_gui.py" = ["E402"]
+"scripts/*.py" = ["E402"]
+"tests/*.py" = ["E402"]

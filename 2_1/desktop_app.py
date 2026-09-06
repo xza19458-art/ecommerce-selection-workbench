@@ -1,7 +1,8 @@
 """桌面壳（打包路线阶段 2）：双击即用的本地选品分析工作台入口。
 
 启动流程（见 decisions/2026-06-20-本地选品分析工作台打包路线.md §阶段2）：
-    双击 → 自动选可用端口 → 后台线程起 FastAPI/Uvicorn → 轮询 /api/health 就绪
+    双击 → 自动选可用端口 → 后台线程起 FastAPI/Uvicorn → 轮询 /api/health 存活
+    → 检查 /api/ready 数据库就绪
     → pywebview 打开桌面窗口加载本地 Web UI → 关闭窗口时优雅停止后端。
 
 边界：桌面壳只是承载/分发形态，**不改现有 API 与数据口径、不绕过采集边界**。
@@ -13,13 +14,16 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
+import json
+import os
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -74,7 +78,13 @@ def _make_server(port: int):
         def install_signal_handlers(self) -> None:  # 子线程里不装信号处理器
             pass
 
-    config = uvicorn.Config("api.app:app", host=HOST, port=port, log_level="warning")
+    config = uvicorn.Config(
+        "api.app:app",
+        host=HOST,
+        port=port,
+        log_level="warning",
+        log_config=None,
+    )
     return _ThreadedServer(config)
 
 
@@ -83,6 +93,174 @@ def _app_icon_path() -> Path | None:
 
     icon_path = resource_path(*APP_ICON_RESOURCE)
     return icon_path if icon_path.exists() else None
+
+
+def _webview_start_options() -> dict[str, object]:
+    """Use a stable user-writable profile so local UI state survives restarts."""
+    from pkg_paths import user_data_path
+
+    storage_path = user_data_path("webview_state").resolve()
+    storage_path.mkdir(parents=True, exist_ok=True)
+    return {"private_mode": False, "storage_path": str(storage_path)}
+
+
+def _open_database_config(path: Path) -> None:
+    opener = getattr(os, "startfile", None)
+    if sys.platform != "win32" or opener is None:
+        return
+    try:
+        opener(str(path))
+    except OSError:
+        logger.debug("无法自动打开数据库配置文件：%s", path, exc_info=True)
+
+
+def _database_not_ready_message(reason: str, config_path: Path, *, frozen: bool) -> str:
+    if frozen:
+        initialization = (
+            "如这是新数据库，请在 EXE 所在目录打开 PowerShell 并运行：\n"
+            ".\\AmazonSelectionWorkbench.exe --init-mysql"
+        )
+    else:
+        initialization = (
+            "如这是新数据库，请在项目 2_1 目录运行：\n"
+            "..\\.venv\\Scripts\\python.exe scripts\\init_mysql.py"
+        )
+    return (
+        f"数据库尚未就绪：{reason}\n\n"
+        f"请确认 MySQL 已启动，并检查配置文件：\n{config_path}\n\n"
+        f"{initialization}\n\n"
+        "详情见 logs/desktop.log。"
+    )
+
+
+def _initialize_database() -> int:
+    try:
+        from database.mysql_client import MySQLClient
+
+        result = MySQLClient().initialize_schema()
+        action_labels = {
+            "fresh_baseline": "新数据库已创建并建立迁移基线",
+            "legacy_baseline": "现有数据库已核验并纳入迁移基线",
+            "migrated": "数据库增量迁移已完成",
+            "current": "数据库已经是当前版本",
+        }
+        message = (
+            f"{action_labels.get(result['action'], result['action'])}。\n\n"
+            f"数据库：{result['database']}\n"
+            f"迁移文件：{result['migration_count']}"
+        )
+        logger.info(message.replace("\n", " "))
+        _message_box_info(None, message)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("桌面包初始化数据库失败")
+        _message_box_info(None, f"数据库初始化失败：{exc}\n\n详情见 logs/desktop.log。")
+        return 1
+
+
+def _utility_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Amazon 选品助手部署与迁移工具")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument(
+        "--deployment-preflight",
+        action="store_true",
+        help="只读检查数据库、浏览器、分析仓库和本地数据目录",
+    )
+    modes.add_argument(
+        "--backup-local-data",
+        action="store_true",
+        help="备份本地证据；不包含 MySQL 和浏览器会话",
+    )
+    modes.add_argument(
+        "--restore-local-data",
+        type=Path,
+        metavar="ARCHIVE",
+        help="校验并恢复本地证据迁移包",
+    )
+    parser.add_argument("--backup-output", type=Path, help="指定迁移包输出路径")
+    parser.add_argument(
+        "--include-private-config",
+        action="store_true",
+        help="备份时显式加入明文数据库与 Agent 等私有配置",
+    )
+    parser.add_argument(
+        "--overwrite-existing",
+        action="store_true",
+        help="恢复时覆盖不同内容，并先备份原文件",
+    )
+    return parser
+
+
+def _run_utility_mode(argv: list[str]) -> int | None:
+    mode_flags = {
+        "--deployment-preflight",
+        "--backup-local-data",
+        "--restore-local-data",
+    }
+    if not any(flag in argv for flag in mode_flags):
+        return None
+    try:
+        args = _utility_parser().parse_args(argv)
+        if not args.backup_local_data and (
+            args.backup_output is not None or args.include_private_config
+        ):
+            raise ValueError("--backup-output 与 --include-private-config 只能用于本地数据备份。")
+        if args.restore_local_data is None and args.overwrite_existing:
+            raise ValueError("--overwrite-existing 只能用于本地数据恢复。")
+        if args.deployment_preflight:
+            from services.deployment_preflight import get_deployment_preflight
+
+            result = get_deployment_preflight()
+            message = (
+                f"{result['message']}\n\n"
+                f"分析功能：{'已就绪' if result['ready_for_analysis'] else '未就绪'}\n"
+                f"联网采集：{'已就绪' if result['ready_for_collection'] else '未就绪'}\n\n"
+                "该检查未下载驱动、未启动 Chrome、未修改数据库或业务数据。"
+            )
+            exit_code = 0 if result["ready_for_analysis"] else 1
+        elif args.backup_local_data:
+            from services.user_data_transfer import create_user_data_backup
+
+            result = create_user_data_backup(
+                output_path=args.backup_output,
+                include_private_config=args.include_private_config,
+            ).to_dict()
+            private_note = (
+                "\n\n注意：本次迁移包包含明文私有配置，请按敏感文件保管。"
+                if args.include_private_config
+                else ""
+            )
+            message = (
+                f"{result['message']}\n\n"
+                f"路径：{result['archive_path']}\n"
+                f"文件：{result['file_count']} 个\n"
+                f"SHA-256：{result['archive_sha256']}"
+                f"{private_note}"
+            )
+            exit_code = 0
+        else:
+            from services.user_data_transfer import restore_user_data_backup
+
+            result = restore_user_data_backup(
+                args.restore_local_data,
+                overwrite=args.overwrite_existing,
+            ).to_dict()
+            message = (
+                f"{result['message']}\n\n"
+                f"目标：{result['target_root']}\n"
+                f"恢复前备份：{result['backup_dir'] or '未产生'}\n\n"
+                "MySQL 业务数据不在该迁移包中。"
+            )
+            exit_code = 0
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        _message_box_info(None, message)
+        return exit_code
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - utility modes need a stable desktop error.
+        print(f"操作失败：{exc}")
+        _message_box_info(None, f"操作失败：{exc}")
+        return 1
 
 
 def _hex_to_colorref(hex_color: str) -> int:
@@ -454,6 +632,31 @@ def wait_for_health(base_url: str, timeout: float = HEALTH_TIMEOUT) -> bool:
     return False
 
 
+def wait_for_readiness(base_url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """等待数据库 readiness，并保留后端返回的中文失败原因。"""
+    deadline = time.monotonic() + timeout
+    url = f"{base_url}/api/ready"
+    last_message = "数据库就绪检查未返回结果"
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(url, timeout=3) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                report = payload.get("data") or {}
+                if resp.status == 200 and report.get("ready"):
+                    return True, str(report.get("message") or "数据库已就绪")
+                last_message = str(payload.get("message") or last_message)
+        except HTTPError as exc:
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+                last_message = str(payload.get("message") or last_message)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                last_message = f"数据库就绪检查返回 HTTP {exc.code}"
+        except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            last_message = f"数据库就绪检查失败: {exc}"
+        time.sleep(0.4)
+    return False, last_message
+
+
 def _smoke_check() -> int:
     """打包自检：起后端 + health + 取首页后退出，不开窗（无显示器/CI/冻结产物可用）。
 
@@ -482,11 +685,42 @@ def _smoke_check() -> int:
 
 
 def main() -> int:
+    if "--smoke" in sys.argv:
+        return _smoke_check()
+
+    utility_result = _run_utility_mode(sys.argv[1:])
+    if utility_result is not None:
+        return utility_result
+
     log_path = _setup_logging()
     logger.info("桌面壳启动，日志：%s", log_path)
 
-    if "--smoke" in sys.argv:
-        return _smoke_check()
+    try:
+        from database.config_bootstrap import prepare_database_config
+
+        config_preparation = prepare_database_config()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("准备数据库配置失败")
+        _message_box_info(None, f"无法准备数据库配置：{exc}\n\n详情见 logs/desktop.log。")
+        return 1
+
+    if config_preparation.status == "created":
+        msg = (
+            "已为桌面版创建数据库配置模板。\n\n"
+            f"请填写 MySQL 信息后重新打开应用：\n{config_preparation.path}"
+        )
+        logger.warning(msg.replace("\n", " "))
+        _message_box_info(None, msg)
+        _open_database_config(config_preparation.path)
+        return 1
+    if config_preparation.status == "migrated":
+        logger.info(
+            "已将误放在 _internal/config 的数据库配置复制到可写目录：%s",
+            config_preparation.path,
+        )
+
+    if "--init-mysql" in sys.argv:
+        return _initialize_database()
 
     try:
         import webview  # 延迟导入：缺依赖时给中文提示而非裸栈
@@ -510,7 +744,22 @@ def main() -> int:
             print(msg)
             return 1
 
-        logger.info("后端就绪，打开桌面窗口。")
+        database_ready, readiness_message = wait_for_readiness(base_url)
+        if not database_ready:
+            server.should_exit = True
+            thread.join(timeout=5)
+            from pkg_paths import is_frozen
+
+            msg = _database_not_ready_message(
+                readiness_message,
+                config_preparation.path,
+                frozen=is_frozen(),
+            )
+            logger.error(msg.replace("\n", " "))
+            _message_box_info(None, msg)
+            return 1
+
+        logger.info("后端与数据库就绪，打开桌面窗口。")
         icon_path = _app_icon_path()
         window = webview.create_window(
             APP_TITLE,
@@ -522,11 +771,11 @@ def main() -> int:
         )
         controller = DesktopShellController(window, base_url, icon_path)
         controller.attach()
-        # 注意：数据相关报错（如 MySQL 未启动）由 Web 页内统一中文提示，不影响窗口启动。
         webview.start(
             func=_on_window_started,
             args=(window, controller),
             icon=str(icon_path) if icon_path else None,
+            **_webview_start_options(),
         )  # 阻塞直到窗口关闭
 
         logger.info("窗口已关闭，停止后端。")

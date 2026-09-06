@@ -51,6 +51,14 @@ data_warehouse/
 2_1/.argos/
 2_1/数据结果/
 数据结果/
+2_1/exports/
+exports/
+2_1/webview_state/
+webview_state/
+2_1/runtime/
+runtime/
+2_1/.quality_gate_tmp/
+2_1/release/
 
 # Editor and OS noise
 .idea/

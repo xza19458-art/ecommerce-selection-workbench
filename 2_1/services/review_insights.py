@@ -35,7 +35,9 @@ def fetch_review_insight_list(
                   insight.positive_points_json,
                   insight.opportunity_summary,
                   insight.risk_summary,
-                  insight.updated_at
+                  insight.updated_at,
+                  COALESCE(evidence.imported_review_count, 0) AS imported_review_count,
+                  COALESCE(evidence.traceable_review_count, 0) AS traceable_review_count
                 FROM product_review_insights insight
                 JOIN products p ON p.id = insight.product_id
                 JOIN (
@@ -45,6 +47,20 @@ def fetch_review_insight_list(
                 ) latest
                   ON latest.product_id = insight.product_id
                  AND latest.insight_date = insight.insight_date
+                LEFT JOIN (
+                  SELECT
+                    product_id,
+                    COUNT(*) AS imported_review_count,
+                    SUM(
+                      CASE
+                        WHEN COALESCE(NULLIF(source_url, ''), '') <> ''
+                          OR COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$.source_file')), ''), '') <> ''
+                        THEN 1 ELSE 0
+                      END
+                    ) AS traceable_review_count
+                  FROM product_reviews
+                  GROUP BY product_id
+                ) evidence ON evidence.product_id = insight.product_id
                 {where_sql}
                 ORDER BY insight.negative_count DESC, insight.review_count DESC, insight.updated_at DESC
                 LIMIT %s
@@ -118,6 +134,23 @@ def fetch_product_review_insight(asin: str, client: MySQLClient | None = None) -
                 (product_id,),
             )
             samples = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT
+                  COUNT(*) AS imported_review_count,
+                  SUM(
+                    CASE
+                      WHEN COALESCE(NULLIF(source_url, ''), '') <> ''
+                        OR COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$.source_file')), ''), '') <> ''
+                      THEN 1 ELSE 0
+                    END
+                  ) AS traceable_review_count
+                FROM product_reviews
+                WHERE product_id = %s
+                """,
+                (product_id,),
+            )
+            evidence_row = cursor.fetchone() or {}
 
     if not insight and not samples:
         return _empty_result("暂未采集评论内容，无法形成评论痛点分析。建议后续采集商品详情页评论或导入评论样本。")
@@ -126,6 +159,7 @@ def fetch_product_review_insight(asin: str, client: MySQLClient | None = None) -
         "status": "ready" if insight else "samples_only",
         "insight": _normalize_insight(insight) if insight else None,
         "low_rating_reviews": [_normalize_review(row) for row in samples],
+        "evidence": _review_evidence(evidence_row),
     }
 
 
@@ -135,6 +169,7 @@ def _empty_result(message: str) -> dict[str, Any]:
         "message": message,
         "insight": None,
         "low_rating_reviews": [],
+        "evidence": _review_evidence({}),
     }
 
 
@@ -177,7 +212,32 @@ def _normalize_insight_list_row(row: dict[str, Any]) -> dict[str, Any]:
     review_count = normalized.get("review_count") or 0
     negative_count = normalized.get("negative_count") or 0
     normalized["negative_rate"] = round(negative_count / review_count * 100, 1) if review_count else 0.0
+    normalized["evidence"] = _review_evidence(normalized)
     return normalized
+
+
+def _review_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    total = int(row.get("imported_review_count") or row.get("review_count") or 0)
+    traceable = int(row.get("traceable_review_count") or 0)
+    if total <= 0:
+        status = "无样本"
+        message = "尚无评论样本。"
+    elif traceable <= 0:
+        status = "不可核验"
+        message = "评论样本缺少来源链接或来源 HTML 文件标记，只能作为演示/待核验线索，不能作为正式选品证据。"
+    elif traceable < total:
+        status = "部分可追溯"
+        message = f"{traceable}/{total} 条评论带有来源定位；未定位样本不应参与高置信结论。"
+    else:
+        status = "可追溯"
+        message = f"{traceable}/{total} 条评论带有来源链接或来源 HTML 文件标记。"
+    return {
+        "status": status,
+        "sample_count": total,
+        "traceable_count": traceable,
+        "traceable_rate": round(traceable / total * 100, 1) if total else 0.0,
+        "message": message,
+    }
 
 
 def _normalize_limit(limit: int) -> int:

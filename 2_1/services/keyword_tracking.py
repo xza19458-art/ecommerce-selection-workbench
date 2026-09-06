@@ -53,9 +53,7 @@ class KeywordTrackingTask:
 
 def ensure_keyword_tracking_schema(*, client: MySQLClient | None = None) -> None:
     db = client or MySQLClient()
-    with db.connect() as conn:
-        with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
+    db.initialize_schema()
 
 
 def create_tracking_task(
@@ -74,7 +72,6 @@ def create_tracking_task(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             achieved = _count_keyword_snapshot_times(cursor, marketplace, keyword)
             status = STATUS_COMPLETED if achieved >= target_snapshots else STATUS_ACTIVE
             cursor.execute(
@@ -117,7 +114,6 @@ def list_tracking_tasks(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             cursor.execute(
                 f"""
                 SELECT
@@ -156,7 +152,6 @@ def get_tracking_task(task_id: int, *, client: MySQLClient | None = None) -> Key
     db = client or MySQLClient()
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             return _fetch_task_by_id(cursor, int(task_id), missing_ok=True)
 
 
@@ -180,7 +175,6 @@ def refresh_tracking_task_progress(
     db = client or MySQLClient()
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             task = _fetch_task_by_id(cursor, int(task_id))
             achieved = _count_keyword_snapshot_times(cursor, task.marketplace, task.keyword)
             next_status = STATUS_COMPLETED if task.status == STATUS_ACTIVE and achieved >= task.target_snapshots else task.status
@@ -218,7 +212,6 @@ def update_tracking_task_status(
     db = client or MySQLClient()
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             cursor.execute(
                 """
                 UPDATE keyword_tracking_tasks
@@ -244,7 +237,6 @@ def record_tracking_collection(
     db = client or MySQLClient()
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             task = _fetch_task_by_id(cursor, int(task_id))
             if error_message:
                 cursor.execute(
@@ -280,7 +272,6 @@ def delete_tracking_task(task_id: int, *, client: MySQLClient | None = None) -> 
     db = client or MySQLClient()
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            db.ensure_keyword_tracking_table(cursor)
             cursor.execute("DELETE FROM keyword_tracking_tasks WHERE id = %s", (int(task_id),))
             return cursor.rowcount > 0
 

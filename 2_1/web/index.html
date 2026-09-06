@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Amazon 选品助手</title>
-  <link rel="stylesheet" href="/styles.css?v=20260704-agent" />
-  <!-- 轻量图表库（决策 §3 允许 ECharts/Chart.js，不引入 React 重型栈） -->
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <link rel="stylesheet" href="/styles.css?v=20260728-ux-refinement1" />
+  <!-- 固定随应用分发，断网时趋势图仍可用。 -->
+  <script src="/vendor/echarts-5.6.0.min.js"></script>
 </head>
 <body>
   <div class="layout">
@@ -35,9 +35,15 @@
         <div class="nav-group">
           <div class="nav-group-title">洞察与决策</div>
           <a class="nav-item" href="#/recommendations">推荐 · 蓝海</a>
+          <a class="nav-item" href="#/model-replay">模型实验室</a>
           <a class="nav-item" href="#/keyword-workshop">关键词创意工坊</a>
           <a class="nav-item" href="#/keyword-library">关键词资产库</a>
           <a class="nav-item" href="#/keywords">关键词机会</a>
+          <a class="nav-item" href="#/market-niches">市场与利基</a>
+          <a class="nav-item" href="#/competitive-graph">竞品图谱</a>
+          <a class="nav-item" href="#/research-projects">研究项目</a>
+          <a class="nav-item" href="#/research-review-queue">项目复核队列</a>
+          <a class="nav-item" href="#/metrics">指标与估算</a>
           <a class="nav-item" href="#/reviews">评论痛点</a>
           <a class="nav-item" href="#/agent">AI 助手</a>
         </div>
@@ -68,6 +74,6 @@
     </main>
   </div>
 
-  <script src="/app.js?v=20260704-agent"></script>
+  <script src="/app.js?v=20260728-ux-refinement1"></script>
 </body>
 </html>

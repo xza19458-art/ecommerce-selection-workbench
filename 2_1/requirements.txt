@@ -1,3 +1,5 @@
+# Human-maintained runtime dependency inputs for Windows + Python 3.12.
+# Reproducible installs must use requirements.lock.txt instead of this file.
 beautifulsoup4
 cryptography
 duckdb

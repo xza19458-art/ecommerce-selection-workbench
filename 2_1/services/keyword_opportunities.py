@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from database.mysql_client import MySQLClient
-from services.analytics_warehouse import query_warehouse
+from services.analytics_warehouse import get_warehouse_status, query_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +47,23 @@ def fetch_keyword_opportunities_page(
     """Aggregate keyword opportunities with true pagination metadata."""
     if prefer_warehouse and client is None:
         try:
-            page = _fetch_keyword_opportunities_page_from_warehouse(
-                limit=limit,
-                offset=offset,
-                keyword=keyword,
-                min_products=min_products,
-                sort_by=sort_by,
-                sort_dir=sort_dir,
+            warehouse_status = get_warehouse_status()
+            if warehouse_status.get("status") == "current":
+                page = _fetch_keyword_opportunities_page_from_warehouse(
+                    limit=limit,
+                    offset=offset,
+                    keyword=keyword,
+                    min_products=min_products,
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                )
+                page["rows"] = [_enrich_row(_normalize_row(row)) for row in page["rows"]]
+                return page
+
+            logger.warning(
+                "Warehouse keyword-opportunity data is %s; skipping stale replica and falling back to MySQL.",
+                warehouse_status.get("status") or "unknown",
             )
-            page["rows"] = [_enrich_row(_normalize_row(row)) for row in page["rows"]]
-            return page
         except Exception:
             # The warehouse is an optional acceleration layer: when it has not
             # been synced yet we must keep the MySQL-backed UI path usable. But
@@ -216,28 +223,80 @@ def _fetch_keyword_opportunities_page_from_warehouse(
 
 def _keyword_opportunity_mysql_ctes() -> str:
     return """
-        WITH latest_snaps AS (
-          SELECT snap.*
-          FROM product_snapshots snap
-          JOIN (
-            SELECT product_id, MAX(snapshot_at) AS snapshot_at
-            FROM product_snapshots
-            GROUP BY product_id
-          ) latest
-            ON latest.product_id = snap.product_id
-           AND latest.snapshot_at = snap.snapshot_at
+        WITH batch_times AS (
+          SELECT
+            keyword_id,
+            snapshot_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY keyword_id
+              ORDER BY snapshot_at DESC
+            ) AS batch_no
+          FROM (
+            SELECT DISTINCT keyword_id, snapshot_at
+            FROM keyword_rank_snapshots
+          ) distinct_batches
+        ),
+        latest_batches AS (
+          SELECT
+            keyword_id,
+            MAX(CASE WHEN batch_no = 1 THEN snapshot_at END) AS current_snapshot_at,
+            MAX(CASE WHEN batch_no = 2 THEN snapshot_at END) AS previous_snapshot_at,
+            COUNT(*) AS observation_count
+          FROM batch_times
+          GROUP BY keyword_id
         ),
         latest_ranks AS (
           SELECT krs.*
           FROM keyword_rank_snapshots krs
-          JOIN (
-            SELECT keyword_id, product_id, MAX(snapshot_at) AS snapshot_at
-            FROM keyword_rank_snapshots
-            GROUP BY keyword_id, product_id
-          ) latest
-            ON latest.keyword_id = krs.keyword_id
-           AND latest.product_id = krs.product_id
-           AND latest.snapshot_at = krs.snapshot_at
+          JOIN latest_batches batch
+            ON batch.keyword_id = krs.keyword_id
+           AND batch.current_snapshot_at = krs.snapshot_at
+        ),
+        previous_ranks AS (
+          SELECT krs.*
+          FROM keyword_rank_snapshots krs
+          JOIN latest_batches batch
+            ON batch.keyword_id = krs.keyword_id
+           AND batch.previous_snapshot_at = krs.snapshot_at
+        ),
+        historical_stats AS (
+          SELECT
+            keyword_id,
+            COUNT(DISTINCT product_id) AS historical_product_count
+          FROM keyword_rank_snapshots
+          GROUP BY keyword_id
+        ),
+        previous_stats AS (
+          SELECT
+            keyword_id,
+            COUNT(DISTINCT product_id) AS previous_product_count
+          FROM previous_ranks
+          GROUP BY keyword_id
+        ),
+        transition_stats AS (
+          SELECT
+            current_rank.keyword_id,
+            COUNT(DISTINCT previous_rank.product_id) AS retained_product_count,
+            SUM(
+              CASE
+                WHEN current_rank.organic_rank IS NOT NULL
+                 AND previous_rank.organic_rank IS NOT NULL
+                THEN 1 ELSE 0
+              END
+            ) AS comparable_rank_count,
+            SUM(
+              CASE
+                WHEN current_rank.organic_rank IS NOT NULL
+                 AND previous_rank.organic_rank IS NOT NULL
+                 AND current_rank.organic_rank <> previous_rank.organic_rank
+                THEN 1 ELSE 0
+              END
+            ) AS rank_changed_count
+          FROM latest_ranks current_rank
+          LEFT JOIN previous_ranks previous_rank
+            ON previous_rank.keyword_id = current_rank.keyword_id
+           AND previous_rank.product_id = current_rank.product_id
+          GROUP BY current_rank.keyword_id
         ),
         latest_scores AS (
           SELECT ps.*
@@ -276,38 +335,142 @@ def _keyword_opportunity_mysql_select(where_sql: str, having_sql: str) -> str:
           AVG(snap.monthly_bought) AS avg_monthly_bought,
           AVG(krs.organic_rank) AS avg_organic_rank,
           SUM(CASE WHEN krs.organic_rank IS NOT NULL AND krs.organic_rank <= 10 THEN 1 ELSE 0 END) AS top10_count,
-          SUM(CASE WHEN krs.is_sponsored = 1 OR snap.is_sponsored = 1 THEN 1 ELSE 0 END) AS sponsored_count,
-          MAX(snap.snapshot_at) AS latest_snapshot_at
+          SUM(CASE WHEN krs.is_sponsored = 1 THEN 1 ELSE 0 END) AS sponsored_count,
+          batch.current_snapshot_at AS latest_snapshot_at,
+          batch.previous_snapshot_at,
+          batch.observation_count,
+          history.historical_product_count,
+          previous.previous_product_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE COALESCE(transition.retained_product_count, 0)
+          END AS retained_product_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE COUNT(DISTINCT p.id) - COALESCE(transition.retained_product_count, 0)
+          END AS entered_product_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE COALESCE(previous.previous_product_count, 0) - COALESCE(transition.retained_product_count, 0)
+          END AS exited_product_count,
+          CASE
+            WHEN COALESCE(previous.previous_product_count, 0) = 0 THEN NULL
+            ELSE COALESCE(transition.retained_product_count, 0) * 1.0 / previous.previous_product_count
+          END AS retention_rate,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE transition.comparable_rank_count
+          END AS comparable_rank_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE transition.rank_changed_count
+          END AS rank_changed_count
         FROM keywords k
         JOIN latest_ranks krs ON krs.keyword_id = k.id
+        JOIN latest_batches batch ON batch.keyword_id = k.id
+        JOIN historical_stats history ON history.keyword_id = k.id
+        LEFT JOIN previous_stats previous ON previous.keyword_id = k.id
+        LEFT JOIN transition_stats transition ON transition.keyword_id = k.id
         JOIN products p ON p.id = krs.product_id
-        JOIN latest_snaps snap ON snap.product_id = p.id
+        JOIN product_snapshots snap
+          ON snap.product_id = p.id
+         AND snap.snapshot_at = krs.snapshot_at
         LEFT JOIN latest_scores ps
           ON ps.product_id = p.id
          AND ps.keyword_id = k.id
         {where_sql}
-        GROUP BY k.id, k.marketplace, k.keyword
+        GROUP BY
+          k.id,
+          k.marketplace,
+          k.keyword,
+          batch.current_snapshot_at,
+          batch.previous_snapshot_at,
+          batch.observation_count,
+          history.historical_product_count,
+          previous.previous_product_count,
+          transition.retained_product_count,
+          transition.comparable_rank_count,
+          transition.rank_changed_count
         {having_sql}
     """
 
 
 def _keyword_opportunity_warehouse_ctes() -> str:
     return """
-        WITH latest_snaps AS (
-          SELECT *
-          FROM fact_product_snapshots
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY product_id
-            ORDER BY snapshot_at DESC, snapshot_id DESC
-          ) = 1
+        WITH batch_times AS (
+          SELECT
+            keyword_id,
+            snapshot_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY keyword_id
+              ORDER BY snapshot_at DESC
+            ) AS batch_no
+          FROM (
+            SELECT DISTINCT keyword_id, snapshot_at
+            FROM fact_keyword_rank_snapshots
+          ) distinct_batches
+        ),
+        latest_batches AS (
+          SELECT
+            keyword_id,
+            MAX(CASE WHEN batch_no = 1 THEN snapshot_at END) AS current_snapshot_at,
+            MAX(CASE WHEN batch_no = 2 THEN snapshot_at END) AS previous_snapshot_at,
+            COUNT(*) AS observation_count
+          FROM batch_times
+          GROUP BY keyword_id
         ),
         latest_ranks AS (
-          SELECT *
+          SELECT rank.*
+          FROM fact_keyword_rank_snapshots rank
+          JOIN latest_batches batch
+            ON batch.keyword_id = rank.keyword_id
+           AND batch.current_snapshot_at = rank.snapshot_at
+        ),
+        previous_ranks AS (
+          SELECT rank.*
+          FROM fact_keyword_rank_snapshots rank
+          JOIN latest_batches batch
+            ON batch.keyword_id = rank.keyword_id
+           AND batch.previous_snapshot_at = rank.snapshot_at
+        ),
+        historical_stats AS (
+          SELECT
+            keyword_id,
+            COUNT(DISTINCT product_id) AS historical_product_count
           FROM fact_keyword_rank_snapshots
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY keyword_id, product_id
-            ORDER BY snapshot_at DESC, rank_snapshot_id DESC
-          ) = 1
+          GROUP BY keyword_id
+        ),
+        previous_stats AS (
+          SELECT
+            keyword_id,
+            COUNT(DISTINCT product_id) AS previous_product_count
+          FROM previous_ranks
+          GROUP BY keyword_id
+        ),
+        transition_stats AS (
+          SELECT
+            current_rank.keyword_id,
+            COUNT(DISTINCT previous_rank.product_id) AS retained_product_count,
+            SUM(
+              CASE
+                WHEN current_rank.organic_rank IS NOT NULL
+                 AND previous_rank.organic_rank IS NOT NULL
+                THEN 1 ELSE 0
+              END
+            ) AS comparable_rank_count,
+            SUM(
+              CASE
+                WHEN current_rank.organic_rank IS NOT NULL
+                 AND previous_rank.organic_rank IS NOT NULL
+                 AND current_rank.organic_rank <> previous_rank.organic_rank
+                THEN 1 ELSE 0
+              END
+            ) AS rank_changed_count
+          FROM latest_ranks current_rank
+          LEFT JOIN previous_ranks previous_rank
+            ON previous_rank.keyword_id = current_rank.keyword_id
+           AND previous_rank.product_id = current_rank.product_id
+          GROUP BY current_rank.keyword_id
         ),
         latest_scores AS (
           SELECT *
@@ -342,16 +505,61 @@ def _keyword_opportunity_warehouse_select(where_sql: str, having_sql: str) -> st
           AVG(snap.monthly_bought) AS avg_monthly_bought,
           AVG(krs.organic_rank) AS avg_organic_rank,
           SUM(CASE WHEN krs.organic_rank IS NOT NULL AND krs.organic_rank <= 10 THEN 1 ELSE 0 END) AS top10_count,
-          SUM(CASE WHEN krs.is_sponsored = 1 OR snap.is_sponsored = 1 THEN 1 ELSE 0 END) AS sponsored_count,
-          MAX(snap.snapshot_at) AS latest_snapshot_at
+          SUM(CASE WHEN krs.is_sponsored = 1 THEN 1 ELSE 0 END) AS sponsored_count,
+          batch.current_snapshot_at AS latest_snapshot_at,
+          batch.previous_snapshot_at,
+          batch.observation_count,
+          history.historical_product_count,
+          previous.previous_product_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE COALESCE(transition.retained_product_count, 0)
+          END AS retained_product_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE COUNT(DISTINCT krs.product_id) - COALESCE(transition.retained_product_count, 0)
+          END AS entered_product_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE COALESCE(previous.previous_product_count, 0) - COALESCE(transition.retained_product_count, 0)
+          END AS exited_product_count,
+          CASE
+            WHEN COALESCE(previous.previous_product_count, 0) = 0 THEN NULL
+            ELSE COALESCE(transition.retained_product_count, 0) * 1.0 / previous.previous_product_count
+          END AS retention_rate,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE transition.comparable_rank_count
+          END AS comparable_rank_count,
+          CASE
+            WHEN batch.previous_snapshot_at IS NULL THEN NULL
+            ELSE transition.rank_changed_count
+          END AS rank_changed_count
         FROM dim_keywords k
         JOIN latest_ranks krs ON krs.keyword_id = k.keyword_id
-        JOIN latest_snaps snap ON snap.product_id = krs.product_id
+        JOIN latest_batches batch ON batch.keyword_id = k.keyword_id
+        JOIN historical_stats history ON history.keyword_id = k.keyword_id
+        LEFT JOIN previous_stats previous ON previous.keyword_id = k.keyword_id
+        LEFT JOIN transition_stats transition ON transition.keyword_id = k.keyword_id
+        JOIN fact_product_snapshots snap
+          ON snap.product_id = krs.product_id
+         AND snap.snapshot_at = krs.snapshot_at
         LEFT JOIN latest_scores ps
           ON ps.product_id = krs.product_id
          AND ps.keyword_id = k.keyword_id
         {where_sql}
-        GROUP BY k.keyword_id, k.marketplace, k.keyword
+        GROUP BY
+          k.keyword_id,
+          k.marketplace,
+          k.keyword,
+          batch.current_snapshot_at,
+          batch.previous_snapshot_at,
+          batch.observation_count,
+          history.historical_product_count,
+          previous.previous_product_count,
+          transition.retained_product_count,
+          transition.comparable_rank_count,
+          transition.rank_changed_count
         {having_sql}
     """
 
@@ -438,8 +646,22 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         "total_monthly_bought",
         "avg_monthly_bought",
         "avg_organic_rank",
+        "retention_rate",
     )
-    int_keys = ("keyword_id", "product_count", "top10_count", "sponsored_count")
+    int_keys = (
+        "keyword_id",
+        "product_count",
+        "top10_count",
+        "sponsored_count",
+        "observation_count",
+        "historical_product_count",
+        "previous_product_count",
+        "retained_product_count",
+        "entered_product_count",
+        "exited_product_count",
+        "comparable_rank_count",
+        "rank_changed_count",
+    )
 
     for key in float_keys:
         value = normalized.get(key)
@@ -451,6 +673,8 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = int(value)
     if normalized.get("latest_snapshot_at") is not None:
         normalized["latest_snapshot_at"] = str(normalized["latest_snapshot_at"])
+    if normalized.get("previous_snapshot_at") is not None:
+        normalized["previous_snapshot_at"] = str(normalized["previous_snapshot_at"])
     return normalized
 
 
@@ -458,10 +682,27 @@ def _enrich_row(row: dict[str, Any]) -> dict[str, Any]:
     opportunity_score = _calculate_opportunity_score(row)
     row["opportunity_score"] = opportunity_score
     row["opportunity_level"] = _opportunity_level(opportunity_score)
+    row["aggregation_scope"] = "latest_keyword_batch"
+    row["scope_message"] = "当前市场指标仅使用该关键词最新完整采集批次；历史观察与批次变化单独展示。"
+    row["transition_summary"] = _build_transition_summary(row)
     row["opportunity_reason"] = _build_reason(row)
     row["risk_warnings"] = _build_risk_warnings(row)
     row["entry_strategy"] = _build_entry_strategy(row)
     return row
+
+
+def _build_transition_summary(row: dict[str, Any]) -> str:
+    if not row.get("previous_snapshot_at"):
+        return "当前仅有 1 个采集时点，尚无法比较批次留存、进入、退出和排名变化。"
+    retained = row.get("retained_product_count") or 0
+    entered = row.get("entered_product_count") or 0
+    exited = row.get("exited_product_count") or 0
+    comparable = row.get("comparable_rank_count") or 0
+    changed = row.get("rank_changed_count") or 0
+    return (
+        f"相对上一批留存 {retained} 个、新进入 {entered} 个、退出 {exited} 个；"
+        f"{comparable} 个可比较自然序位中 {changed} 个发生变化。"
+    )
 
 
 def _calculate_opportunity_score(row: dict[str, Any]) -> float:
@@ -548,6 +789,12 @@ def _build_risk_warnings(row: dict[str, Any]) -> str:
     top10_count = row.get("top10_count") or 0
     product_count = row.get("product_count") or 0
     sponsored_count = row.get("sponsored_count") or 0
+    observation_count = row.get("observation_count") or 0
+
+    if observation_count < 2:
+        warnings.append("仅有一个采集时点，无法判断批次稳定性或趋势")
+    elif observation_count == 2:
+        warnings.append("仅有两个相邻采集时点，批次变化置信度低，不能解释为长期趋势")
 
     if avg_reviews >= 10000:
         warnings.append("头部评论壁垒很高，新品冷启动难度大")

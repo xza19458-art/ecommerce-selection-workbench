@@ -7,10 +7,23 @@ from dataclasses import dataclass
 from datetime import date, datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterator
 
+from pkg_paths import resource_path, user_data_path
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "database.json"
+
+CONFIG_PATH = user_data_path("config", "database.json")
+SCHEMA_PATH = resource_path("database", "schema.sql")
+METRIC_CENTER_MIGRATION_PATH = resource_path(
+    "database", "migrations", "20260712_metric_center_v1.sql"
+)
+RESEARCH_WORKSPACE_MIGRATION_PATH = resource_path(
+    "database", "migrations", "20260713_research_workspace_v1.sql"
+)
+MARKET_NICHE_MIGRATION_PATH = resource_path(
+    "database", "migrations", "20260713_market_niche_v1.sql"
+)
 
 
 PRODUCT_TRANSLATION_COLUMNS = {
@@ -230,13 +243,49 @@ class MySQLClient:
         finally:
             conn.close()
 
-    def initialize_schema(self) -> None:
-        schema_path = Path(__file__).with_name("schema.sql")
-        statements = _split_sql(schema_path.read_text(encoding="utf-8"))
+    def initialize_schema(self) -> dict[str, Any]:
+        """Create or upgrade the configured database under the migration ledger."""
+        database_sql = _quote_mysql_identifier(self.config.database)
         with self.connect(database="") as conn:
             with conn.cursor() as cursor:
-                for statement in statements:
-                    cursor.execute(statement)
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS {database_sql} "
+                    "DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci"
+                )
+        from database.migration_runner import MigrationManager
+
+        return MigrationManager(self).initialize(
+            schema_path=SCHEMA_PATH,
+            legacy_bootstrap=self._bootstrap_legacy_schema,
+        )
+
+    def _bootstrap_legacy_schema(self, cursor: Any) -> None:
+        """Guarded one-time upgrade path for databases created before the ledger."""
+        self.ensure_translation_columns(cursor)
+        self.ensure_product_detail_schema(cursor)
+        self.ensure_translation_cache_table(cursor)
+        self.ensure_keyword_tracking_table(cursor)
+        self.ensure_keyword_workshop_tables(cursor)
+        self.ensure_metric_center_schema(cursor)
+        self.ensure_research_workspace_schema(cursor)
+        self.ensure_market_niche_schema(cursor)
+        cursor.execute(
+            """
+            SELECT is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = 'product_snapshots'
+              AND column_name = 'monthly_bought'
+            """,
+            (self.config.database,),
+        )
+        row = cursor.fetchone() or {}
+        if str(row.get("is_nullable") or row.get("IS_NULLABLE") or "").upper() != "YES":
+            cursor.execute(
+                "ALTER TABLE product_snapshots "
+                "MODIFY COLUMN monthly_bought INT UNSIGNED NULL "
+                "COMMENT '近月购买量（缺失徽标=NULL=未知）'"
+            )
 
     def upsert_keyword(self, cursor: Any, keyword: str | None, marketplace: str) -> int | None:
         if not keyword:
@@ -317,6 +366,35 @@ class MySQLClient:
         self.ensure_product_attribute_columns(cursor)
         self._ensure_table_columns(cursor, "products", PRODUCT_DETAIL_COLUMNS)
         cursor.execute(PRODUCT_BSR_SNAPSHOTS_TABLE_SQL)
+
+    def ensure_metric_center_schema(self, cursor: Any) -> None:
+        """Create additive V1 metric tables without changing existing scores."""
+        if not METRIC_CENTER_MIGRATION_PATH.exists():
+            raise DatabaseConfigError(f"未找到指标中心迁移文件: {METRIC_CENTER_MIGRATION_PATH}")
+        for statement in _split_sql(METRIC_CENTER_MIGRATION_PATH.read_text(encoding="utf-8")):
+            if statement.lstrip().upper().startswith("USE "):
+                continue
+            cursor.execute(statement)
+
+    def ensure_research_workspace_schema(self, cursor: Any) -> None:
+        """Create additive V1 research workspace tables."""
+        if not RESEARCH_WORKSPACE_MIGRATION_PATH.exists():
+            raise DatabaseConfigError(f"未找到研究项目迁移文件: {RESEARCH_WORKSPACE_MIGRATION_PATH}")
+        for statement in _split_sql(RESEARCH_WORKSPACE_MIGRATION_PATH.read_text(encoding="utf-8")):
+            if statement.lstrip().upper().startswith("USE "):
+                continue
+            cursor.execute(statement)
+
+    def ensure_market_niche_schema(self, cursor: Any) -> None:
+        """Create additive V1 market-niche tables and their dependencies."""
+        self.ensure_research_workspace_schema(cursor)
+        self.ensure_metric_center_schema(cursor)
+        if not MARKET_NICHE_MIGRATION_PATH.exists():
+            raise DatabaseConfigError(f"未找到市场利基迁移文件: {MARKET_NICHE_MIGRATION_PATH}")
+        for statement in _split_sql(MARKET_NICHE_MIGRATION_PATH.read_text(encoding="utf-8")):
+            if statement.lstrip().upper().startswith("USE "):
+                continue
+            cursor.execute(statement)
 
     def ensure_translation_cache_table(self, cursor: Any) -> None:
         cursor.execute(TRANSLATION_CACHE_TABLE_SQL)
@@ -423,6 +501,38 @@ class MySQLClient:
         )
 
     def upsert_score(self, cursor: Any, product_id: int, keyword_id: int | None, score: Any, score_date: date) -> None:
+        score_values = (
+            score.total_score,
+            score.demand_score,
+            score.growth_score,
+            score.competition_score,
+            score.rating_score,
+            score.price_score,
+            score.rank_score,
+            score.reason,
+        )
+        if keyword_id is None:
+            # MySQL unique indexes permit multiple NULL values, so the composite
+            # unique key cannot deduplicate legacy scores without a keyword.
+            cursor.execute(
+                """
+                UPDATE product_scores
+                SET total_score = %s,
+                    demand_score = %s,
+                    growth_score = %s,
+                    competition_score = %s,
+                    rating_score = %s,
+                    price_score = %s,
+                    rank_score = %s,
+                    reason = %s
+                WHERE product_id = %s
+                  AND keyword_id IS NULL
+                  AND score_date = %s
+                """,
+                (*score_values, product_id, score_date),
+            )
+            if int(cursor.rowcount or 0) > 0:
+                return
         cursor.execute(
             """
             INSERT INTO product_scores (
@@ -444,14 +554,7 @@ class MySQLClient:
                 product_id,
                 keyword_id,
                 score_date,
-                score.total_score,
-                score.demand_score,
-                score.growth_score,
-                score.competition_score,
-                score.rating_score,
-                score.price_score,
-                score.rank_score,
-                score.reason,
+                *score_values,
             ),
         )
 
@@ -506,3 +609,10 @@ def _split_sql(sql: str) -> list[str]:
     if current:
         statements.append("\n".join(current).strip())
     return statements
+
+
+def _quote_mysql_identifier(value: str) -> str:
+    identifier = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_$]{1,64}", identifier):
+        raise DatabaseConfigError("数据库名称只能包含字母、数字、下划线或 $，且长度不能超过 64。")
+    return f"`{identifier}`"

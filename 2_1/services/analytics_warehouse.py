@@ -17,9 +17,10 @@ from typing import Any, Sequence
 import pandas as pd
 
 from database.mysql_client import MySQLClient
+from pkg_paths import user_data_path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = user_data_path()
 CONFIG_PATH = ROOT / "config" / "warehouse.json"
 DEFAULT_ROOT_DIR = ROOT / "data_warehouse"
 DEFAULT_PARQUET_DIR = DEFAULT_ROOT_DIR / "parquet"
@@ -97,6 +98,80 @@ WAREHOUSE_TABLES: dict[str, str] = {
         FROM product_bsr_snapshots b
         JOIN products p ON p.id = b.product_id
     """,
+    "dim_product_physical_specs": """
+        SELECT
+          s.id AS spec_id,
+          s.product_id,
+          p.marketplace,
+          p.asin,
+          s.parent_asin,
+          s.item_length_in,
+          s.item_width_in,
+          s.item_height_in,
+          s.package_length_in,
+          s.package_width_in,
+          s.package_height_in,
+          s.item_weight_oz,
+          s.package_weight_oz,
+          s.unit_count,
+          s.model_number,
+          s.raw_dimensions_json,
+          s.raw_weight_json,
+          s.source_file,
+          s.collected_at,
+          s.created_at,
+          s.updated_at
+        FROM product_physical_specs s
+        JOIN products p ON p.id = s.product_id
+    """,
+    "fact_product_offer_snapshots": """
+        SELECT
+          o.id AS offer_snapshot_id,
+          o.product_id,
+          p.marketplace,
+          p.asin,
+          o.snapshot_at,
+          o.current_price,
+          o.list_price,
+          o.currency,
+          o.discount_percent,
+          o.coupon_text,
+          o.availability_status,
+          o.featured_offer_seller,
+          o.ships_from,
+          o.fulfillment_channel,
+          o.is_prime,
+          o.offer_count,
+          o.badges_json,
+          o.image_count,
+          o.video_count,
+          o.bullet_count,
+          o.has_a_plus,
+          o.rating_histogram_json,
+          o.postal_code,
+          o.source_file,
+          o.raw_json,
+          o.created_at
+        FROM product_offer_snapshots o
+        JOIN products p ON p.id = o.product_id
+    """,
+    "bridge_product_variants": """
+        SELECT
+          v.id AS variant_relation_id,
+          v.source_product_id,
+          v.marketplace,
+          v.parent_asin,
+          v.child_asin,
+          v.attributes_json,
+          v.product_url,
+          v.is_selected,
+          v.first_seen_at,
+          v.last_seen_at,
+          v.source_file,
+          v.created_at,
+          v.updated_at
+        FROM product_variants v
+    """,
     "fact_keyword_rank_snapshots": """
         SELECT
           r.id AS rank_snapshot_id,
@@ -113,6 +188,35 @@ WAREHOUSE_TABLES: dict[str, str] = {
         FROM keyword_rank_snapshots r
         JOIN keywords k ON k.id = r.keyword_id
         JOIN products p ON p.id = r.product_id
+    """,
+    "fact_keyword_serp_snapshots": """
+        SELECT
+          s.id AS serp_snapshot_id,
+          s.keyword_id,
+          k.marketplace,
+          k.keyword,
+          s.snapshot_at,
+          s.page_count,
+          s.total_card_count,
+          s.organic_count,
+          s.sponsored_count,
+          s.unique_asin_count,
+          s.ad_density,
+          s.price_p25,
+          s.price_median,
+          s.price_p75,
+          s.review_p25,
+          s.review_median,
+          s.review_p75,
+          s.rating_median,
+          s.monthly_bought_median,
+          s.demand_cr3,
+          s.demand_cr10,
+          s.data_coverage,
+          s.raw_json,
+          s.created_at
+        FROM keyword_serp_snapshots s
+        JOIN keywords k ON k.id = s.keyword_id
     """,
     "fact_product_scores": """
         SELECT
@@ -135,6 +239,68 @@ WAREHOUSE_TABLES: dict[str, str] = {
         FROM product_scores ps
         JOIN products p ON p.id = ps.product_id
         LEFT JOIN keywords k ON k.id = ps.keyword_id
+    """,
+    "fact_product_metric_inputs": """
+        SELECT
+          i.id AS metric_input_id,
+          i.product_id,
+          p.marketplace,
+          p.asin,
+          i.period_start,
+          i.period_end,
+          i.source_type,
+          i.source_label,
+          i.sessions,
+          i.page_views,
+          i.units_ordered,
+          i.orders,
+          i.ordered_sales,
+          i.featured_offer_percentage,
+          i.impressions,
+          i.clicks,
+          i.cart_adds,
+          i.purchases,
+          i.ad_spend,
+          i.ad_clicks,
+          i.ad_orders,
+          i.ad_sales,
+          i.total_sales,
+          i.unit_purchase_cost,
+          i.unit_shipping_cost,
+          i.unit_fba_fee,
+          i.unit_referral_fee,
+          i.unit_other_cost,
+          i.assumed_cvr_low,
+          i.assumed_cvr_base,
+          i.assumed_cvr_high,
+          i.notes,
+          i.raw_json,
+          i.created_at,
+          i.updated_at
+        FROM product_metric_inputs i
+        JOIN products p ON p.id = i.product_id
+    """,
+    "fact_product_estimates": """
+        SELECT
+          e.id AS estimate_id,
+          e.product_id,
+          p.marketplace,
+          p.asin,
+          e.as_of_date,
+          e.metric_key,
+          e.value_low,
+          e.value_base,
+          e.value_high,
+          e.unit,
+          e.model_version,
+          e.confidence_score,
+          e.confidence_level,
+          e.method,
+          e.evidence_json,
+          e.created_at,
+          e.updated_at
+        FROM product_estimates e
+        JOIN products p ON p.id = e.product_id
     """,
     "fact_product_reviews": """
         SELECT
@@ -186,6 +352,34 @@ WAREHOUSE_TABLES: dict[str, str] = {
     """,
 }
 
+WAREHOUSE_SOURCE_TABLES = {
+    "dim_products": "products",
+    "dim_keywords": "keywords",
+    "fact_product_snapshots": "product_snapshots",
+    "fact_product_bsr_snapshots": "product_bsr_snapshots",
+    "dim_product_physical_specs": "product_physical_specs",
+    "fact_product_offer_snapshots": "product_offer_snapshots",
+    "bridge_product_variants": "product_variants",
+    "fact_keyword_rank_snapshots": "keyword_rank_snapshots",
+    "fact_keyword_serp_snapshots": "keyword_serp_snapshots",
+    "fact_product_scores": "product_scores",
+    "fact_product_metric_inputs": "product_metric_inputs",
+    "fact_product_estimates": "product_estimates",
+    "fact_product_reviews": "product_reviews",
+    "mart_review_insights": "product_review_insights",
+}
+
+_MARKER_COLUMN_PRIORITY = (
+    "updated_at",
+    "collected_at",
+    "snapshot_at",
+    "score_date",
+    "insight_date",
+    "last_seen_at",
+    "created_at",
+)
+MANIFEST_FILE_NAME = "warehouse_manifest.json"
+
 
 @dataclass(frozen=True)
 class WarehouseConfig:
@@ -234,6 +428,8 @@ class WarehouseSyncSummary:
     duckdb_path: Path
     parquet_dir: Path
     tables: tuple[WarehouseTableSummary, ...]
+    synced_at: datetime
+    manifest_path: Path
 
     @property
     def total_rows(self) -> int:
@@ -260,10 +456,9 @@ def sync_analytics_warehouse(
     warehouse_config.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
 
     summaries: list[WarehouseTableSummary] = []
+    source_markers: dict[str, dict[str, Any]] = {}
     with db.connect() as mysql_conn:
         with mysql_conn.cursor() as cursor:
-            db.ensure_product_attribute_columns(cursor)
-            db.ensure_product_detail_schema(cursor)
             with duckdb.connect(str(warehouse_config.duckdb_path)) as warehouse_conn:
                 for table_name in selected_tables:
                     dataframe = _fetch_dataframe(cursor, WAREHOUSE_TABLES[table_name])
@@ -278,11 +473,26 @@ def sync_analytics_warehouse(
                             parquet_path=parquet_path,
                         )
                     )
+                source_markers = {
+                    table_name: _source_table_marker(cursor, WAREHOUSE_SOURCE_TABLES[table_name])
+                    for table_name in selected_tables
+                }
+
+    synced_at = datetime.now().replace(microsecond=0)
+    manifest_path = _write_warehouse_manifest(
+        warehouse_config,
+        selected_tables,
+        summaries,
+        source_markers,
+        synced_at=synced_at,
+    )
 
     return WarehouseSyncSummary(
         duckdb_path=warehouse_config.duckdb_path,
         parquet_dir=warehouse_config.parquet_dir,
         tables=tuple(summaries),
+        synced_at=synced_at,
+        manifest_path=manifest_path,
     )
 
 
@@ -319,6 +529,73 @@ def query_warehouse(
         return [dict(zip(columns, row)) for row in result.fetchall()]
 
 
+def get_warehouse_status(
+    *,
+    config: WarehouseConfig | None = None,
+    client: MySQLClient | None = None,
+) -> dict[str, Any]:
+    warehouse_config = config or WarehouseConfig.from_file()
+    db = client or MySQLClient()
+    manifest_path = warehouse_config.root_dir / MANIFEST_FILE_NAME
+    manifest = _read_warehouse_manifest(manifest_path)
+    manifest_tables = manifest.get("tables") if isinstance(manifest.get("tables"), dict) else {}
+
+    current_markers: dict[str, dict[str, Any]] = {}
+    with db.connect() as conn:
+        with conn.cursor() as cursor:
+            for warehouse_table, source_table in WAREHOUSE_SOURCE_TABLES.items():
+                current_markers[warehouse_table] = _source_table_marker(cursor, source_table)
+
+    rows: list[dict[str, Any]] = []
+    stale_tables: list[str] = []
+    missing_tables: list[str] = []
+    for table_name in WAREHOUSE_TABLES:
+        parquet_path = warehouse_config.parquet_dir / f"{table_name}.parquet"
+        recorded = manifest_tables.get(table_name) if isinstance(manifest_tables, dict) else None
+        current = current_markers[table_name]
+        exists = parquet_path.is_file()
+        marker_matches = bool(recorded) and recorded.get("source") == current
+        if not exists or not recorded:
+            state = "missing"
+            missing_tables.append(table_name)
+        elif not marker_matches:
+            state = "stale"
+            stale_tables.append(table_name)
+        else:
+            state = "current"
+        rows.append(
+            {
+                "name": table_name,
+                "source_table": WAREHOUSE_SOURCE_TABLES[table_name],
+                "state": state,
+                "rows": int((recorded or {}).get("rows") or 0),
+                "source_rows": int(current.get("rows") or 0),
+                "parquet_path": str(parquet_path),
+            }
+        )
+
+    if missing_tables:
+        status = "missing"
+        message = f"分析仓库缺少 {len(missing_tables)} 张表，请先执行同步。"
+    elif stale_tables:
+        status = "stale"
+        message = f"MySQL 已变化，分析仓库有 {len(stale_tables)} 张表需要同步。"
+    else:
+        status = "current"
+        message = "分析仓库与当前 MySQL 来源标记一致。"
+    return {
+        "status": status,
+        "message": message,
+        "last_synced_at": manifest.get("synced_at"),
+        "manifest_path": str(manifest_path),
+        "duckdb_path": str(warehouse_config.duckdb_path),
+        "parquet_dir": str(warehouse_config.parquet_dir),
+        "stale_tables": stale_tables,
+        "missing_tables": missing_tables,
+        "tables": rows,
+    }
+
+
 def _fetch_dataframe(cursor: Any, sql: str) -> pd.DataFrame:
     cursor.execute(sql)
     rows = cursor.fetchall()
@@ -353,13 +630,86 @@ def _normalize_value(value: Any) -> Any:
 
 def _write_parquet(conn: Any, table_name: str, dataframe: pd.DataFrame, parquet_path: Path) -> None:
     temp_view = f"export_{table_name}"
+    temp_path = parquet_path.with_suffix(parquet_path.suffix + ".tmp")
+    temp_path.unlink(missing_ok=True)
     conn.register(temp_view, dataframe)
     try:
         conn.execute(
-            f"COPY {temp_view} TO {_sql_literal(parquet_path)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+            f"COPY {temp_view} TO {_sql_literal(temp_path)} (FORMAT PARQUET, COMPRESSION ZSTD)"
         )
+        temp_path.replace(parquet_path)
     finally:
         conn.unregister(temp_view)
+        temp_path.unlink(missing_ok=True)
+
+
+def _source_table_marker(cursor: Any, table_name: str) -> dict[str, Any]:
+    table_sql = _quote_mysql_identifier(table_name)
+    cursor.execute(f"SHOW COLUMNS FROM {table_sql}")
+    columns = {
+        str(row.get("Field") or row.get("field") or row.get("COLUMN_NAME") or "")
+        for row in cursor.fetchall()
+    }
+    marker_column = next((column for column in _MARKER_COLUMN_PRIORITY if column in columns), None)
+    marker_select = (
+        f", MAX({_quote_mysql_identifier(marker_column)}) AS max_marker"
+        if marker_column
+        else ", NULL AS max_marker"
+    )
+    max_id_select = ", MAX(`id`) AS max_id" if "id" in columns else ", NULL AS max_id"
+    cursor.execute(f"SELECT COUNT(*) AS row_count{max_id_select}{marker_select} FROM {table_sql}")
+    row = cursor.fetchone() or {}
+    return {
+        "rows": int(row.get("row_count") or 0),
+        "max_id": int(row.get("max_id") or 0) if row.get("max_id") is not None else None,
+        "marker_column": marker_column,
+        "max_marker": str(row.get("max_marker")) if row.get("max_marker") is not None else None,
+    }
+
+
+def _write_warehouse_manifest(
+    config: WarehouseConfig,
+    selected_tables: Sequence[str],
+    summaries: Sequence[WarehouseTableSummary],
+    source_markers: dict[str, dict[str, Any]],
+    *,
+    synced_at: datetime,
+) -> Path:
+    path = config.root_dir / MANIFEST_FILE_NAME
+    existing = _read_warehouse_manifest(path)
+    table_state = existing.get("tables") if isinstance(existing.get("tables"), dict) else {}
+    table_state = dict(table_state)
+    summary_by_name = {summary.name: summary for summary in summaries}
+    for table_name in selected_tables:
+        summary = summary_by_name[table_name]
+        table_state[table_name] = {
+            "rows": summary.rows,
+            "parquet_path": str(summary.parquet_path),
+            "synced_at": synced_at.isoformat(sep=" "),
+            "source": source_markers[table_name],
+        }
+    payload = {
+        "schema_version": 1,
+        "synced_at": synced_at.isoformat(sep=" "),
+        "duckdb_path": str(config.duckdb_path),
+        "parquet_dir": str(config.parquet_dir),
+        "tables": table_state,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+    return path
+
+
+def _read_warehouse_manifest(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _create_view(conn: Any, view_name: str, parquet_path: Path, *, temporary: bool = False) -> None:
@@ -407,6 +757,13 @@ def _sql_literal(path: Path) -> str:
 
 def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_mysql_identifier(value: str) -> str:
+    identifier = str(value or "")
+    if not identifier or not identifier.replace("_", "").isalnum():
+        raise ValueError(f"Invalid MySQL identifier: {value}")
+    return f"`{identifier}`"
 
 
 def _import_duckdb() -> Any:

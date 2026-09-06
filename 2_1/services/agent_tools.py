@@ -53,12 +53,22 @@ class AgentToolExecutor:
             "query_recommendations": self._query_recommendations,
             "query_products": self._query_products,
             "query_product_detail": self._query_product_detail,
+            "query_product_metrics": self._query_product_metrics,
+            "query_detail_evidence_priorities": self._query_detail_evidence_priorities,
             "query_product_trend": self._query_product_trend,
             "query_keyword_opportunities": self._query_keyword_opportunities,
             "query_keyword_groups": self._query_keyword_groups,
             "query_keyword_ideas": self._query_keyword_ideas,
+            "query_research_projects": self._query_research_projects,
+            "query_research_review_queue": self._query_research_review_queue,
+            "query_research_decision_report": self._query_research_decision_report,
+            "query_market_niches": self._query_market_niches,
+            "query_competitive_graph": self._query_competitive_graph,
+            "query_scoring_v2_replay": self._query_scoring_v2_replay,
+            "query_scoring_v2_calibration": self._query_scoring_v2_calibration,
             "query_review_insights": self._query_review_insights,
             "query_tracking_tasks": self._query_tracking_tasks,
+            "query_tracking_evidence": self._query_tracking_evidence,
             "query_tasks": self._query_tasks,
             "open_amazon_page": self._open_amazon_page,
             "create_keyword_tracking": self._create_keyword_tracking,
@@ -109,6 +119,9 @@ class AgentToolExecutor:
                 )
             ),
             "关键词创意候选": _safe_call(lambda: self._query_keyword_ideas({"limit": limit, "status": "candidate"})),
+            "研究项目": _safe_call(lambda: self._query_research_projects({"limit": limit})),
+            "研究复核队列": _safe_call(lambda: self._query_research_review_queue({"limit": limit})),
+            "市场利基": _safe_call(lambda: self._query_market_niches({"limit": limit})),
             "评论洞察": _safe_call(lambda: self.controller.get_review_insights(limit=limit, keyword=keyword)),
             "追踪任务": _safe_call(lambda: self._tracking_tasks(limit=limit)),
             "任务中心": _safe_call(lambda: self.controller.get_task_jobs(limit=limit)),
@@ -122,17 +135,125 @@ class AgentToolExecutor:
         return overview
 
     def _query_products(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        keyword_scope = _optional_str(data.get("keyword_scope"))
         return self.controller.get_product_pool(
             limit=_int(data.get("limit"), 100, 1, 500),
             keyword=_optional_str(data.get("keyword")),
+            keyword_exact=_bool(data.get("keyword_exact"), False),
+            keyword_scope="observed" if keyword_scope == "observed" else "current",
             min_score=_optional_float(data.get("min_score")),
+            max_score=_optional_float(data.get("max_score")),
             min_price=_optional_float(data.get("min_price")),
             max_price=_optional_float(data.get("max_price")),
+            min_rating=_optional_float(data.get("min_rating")),
+            max_rating=_optional_float(data.get("max_rating")),
+            min_reviews=_optional_int(data.get("min_reviews")),
             max_reviews=_optional_int(data.get("max_reviews")),
+            min_bought=_optional_int(data.get("min_bought")),
+            max_bought=_optional_int(data.get("max_bought")),
+            min_rank=_optional_int(data.get("min_rank")),
+            max_rank=_optional_int(data.get("max_rank")),
+            deal_status=_enum(data.get("deal_status"), {"all", "deal", "regular"}, "all"),
+            size_status=_enum(data.get("size_status"), {"all", "known", "missing"}, "all"),
         )
 
     def _query_product_detail(self, data: dict[str, Any]) -> dict[str, Any]:
         return self.controller.get_product_history(_required_str(data, "asin"))
+
+    def _query_product_metrics(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.metric_center import get_product_metric_center
+
+        return get_product_metric_center(_required_str(data, "asin"))
+
+    def _query_detail_evidence_priorities(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.detail_reparse import MAX_SCAN_FILES, list_detail_reparse_candidates
+
+        query = {
+            "limit": _int(data.get("limit"), 10, 1, 50),
+            "file_limit": MAX_SCAN_FILES,
+            "stale_days": _int(data.get("stale_days"), 30, 1, 3650),
+            "priority": _enum(
+                data.get("priority"),
+                {"all", "focus", "project", "planned", "recent", "routine"},
+                "all",
+            ),
+        }
+        project_id = _optional_int(data.get("project_id"))
+        if project_id is not None:
+            query["project_id"] = project_id
+        result = list_detail_reparse_candidates(
+            **query,
+        )
+        gaps = result.get("gaps") or {}
+        rows = []
+        for raw in gaps.get("rows") or []:
+            row = dict(raw)
+            action = dict(row.get("recommended_action") or {})
+            rows.append(
+                {
+                    "asin": row.get("asin"),
+                    "marketplace": row.get("marketplace"),
+                    "title": row.get("title_zh") or row.get("title"),
+                    "evidence_status": row.get("evidence_status"),
+                    "evidence_gaps": list(row.get("reasons") or []),
+                    "detail_collected_at": row.get("detail_collected_at"),
+                    "last_seen_at": row.get("last_seen_at"),
+                    "priority_tier": row.get("priority_tier"),
+                    "priority_label": row.get("priority_label"),
+                    "priority_reasons": list(row.get("priority_reasons") or []),
+                    "recommended_action": {
+                        "code": action.get("code"),
+                        "label": action.get("label"),
+                        "kind": action.get("kind"),
+                        "reason": action.get("reason"),
+                        "follow_up": action.get("follow_up"),
+                        "requires_amazon": bool(action.get("accesses_amazon")),
+                        "requires_explicit_user_action": bool(
+                            action.get("user_confirmation_required")
+                        ),
+                        "automatic": False,
+                        "local_evidence_checked": bool(action.get("local_evidence_checked")),
+                        "local_evidence_scan_complete": bool(
+                            action.get("local_evidence_scan_complete")
+                        ),
+                    },
+                    "research_projects": [
+                        {
+                            "project_id": context.get("project_id"),
+                            "project_name": context.get("project_name"),
+                            "project_status_label": context.get("project_status_label"),
+                            "role_label": context.get("role_label"),
+                            "plan_active": context.get("plan_active"),
+                            "plan_due": context.get("plan_due"),
+                            "next_review_on": context.get("next_review_on"),
+                        }
+                        for context in row.get("research_context") or []
+                    ],
+                    "monitoring": row.get("monitoring"),
+                }
+            )
+        policy = dict(gaps.get("priority_policy") or {})
+        policy.update(
+            {
+                "read_only": True,
+                "writes_database": False,
+                "automatic_collection": False,
+                "automatic_task_creation": False,
+            }
+        )
+        return {
+            "generated_at": result.get("generated_at"),
+            "stale_days": result.get("stale_days"),
+            "summary": result.get("summary"),
+            "priority_filter": gaps.get("priority_filter"),
+            "priority_filter_label": gaps.get("priority_filter_label"),
+            "project_filter": gaps.get("project_filter"),
+            "priority_summary": gaps.get("priority_summary"),
+            "disposition_summary": gaps.get("disposition_summary"),
+            "disposition_policy": gaps.get("disposition_policy"),
+            "rows": rows,
+            "policy": policy,
+        }
 
     def _query_product_trend(self, data: dict[str, Any]) -> Any:
         from services.trend_analysis import assess_product_trend
@@ -180,6 +301,202 @@ class AgentToolExecutor:
         )
         return page["rows"]
 
+    def _query_research_projects(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        from services.research_workspace import fetch_research_projects_page
+
+        page = fetch_research_projects_page(
+            limit=_int(data.get("limit"), 50, 1, 200),
+            offset=0,
+            marketplace=_optional_str(data.get("marketplace")) or "US",
+            status=_optional_str(data.get("status")),
+            keyword=_optional_str(data.get("keyword")),
+            sort_by="updated_at",
+            sort_dir="desc",
+        )
+        return page["rows"]
+
+    def _query_research_review_queue(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.research_review_queue import (
+            compact_research_review_queue,
+            fetch_research_review_queue,
+        )
+
+        page = fetch_research_review_queue(
+            limit=_int(data.get("limit"), 25, 1, 100),
+            offset=0,
+            marketplace=_optional_str(data.get("marketplace")) or "US",
+            status=_optional_str(data.get("status")),
+            keyword=_optional_str(data.get("keyword")),
+            attention=_optional_str(data.get("attention")),
+            monitoring=_optional_str(data.get("monitoring")),
+            as_of=_optional_str(data.get("as_of")),
+        )
+        return compact_research_review_queue(page)
+
+    def _query_research_decision_report(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.research_decision_report import (
+            build_research_decision_report,
+            compact_research_decision_report,
+        )
+        from services.research_detail_readiness import (
+            compact_research_project_detail_readiness,
+            get_research_project_detail_readiness,
+        )
+
+        project_id = _required_int(data, "project_id")
+        report = build_research_decision_report(
+            project_id,
+            as_of=_optional_str(data.get("as_of")),
+        )
+        compact = compact_research_decision_report(report)
+        compact["detail_evidence_readiness"] = compact_research_project_detail_readiness(
+            get_research_project_detail_readiness(project_id)
+        )
+        return compact
+
+    def _query_market_niches(self, data: dict[str, Any]) -> Any:
+        from services.market_niches import fetch_market_niches_page, get_market_niche
+
+        niche_id = _optional_int(data.get("niche_id"))
+        if niche_id is not None:
+            return get_market_niche(niche_id)
+        page = fetch_market_niches_page(
+            limit=_int(data.get("limit"), 50, 1, 200),
+            offset=0,
+            marketplace=_optional_str(data.get("marketplace")) or "US",
+            status=_optional_str(data.get("status")),
+            keyword=_optional_str(data.get("keyword")),
+            sort_by="updated_at",
+            sort_dir="desc",
+        )
+        return page["rows"]
+
+    def _query_competitive_graph(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.competitive_graph import get_competitive_graph
+
+        return get_competitive_graph(
+            _required_int(data, "niche_id"),
+            snapshot_id=_optional_int(data.get("snapshot_id")),
+            limit=_int(data.get("limit"), 50, 10, 100),
+            min_shared=_int(data.get("min_shared"), 1, 1, 100_000),
+            focus_asin=_optional_str(data.get("focus_asin")),
+        )
+
+    def _query_scoring_v2_replay(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.scoring_v2 import fetch_scoring_v2_replay
+
+        page = fetch_scoring_v2_replay(
+            limit=_int(data.get("limit"), 10, 1, 20),
+            offset=0,
+            marketplace=_optional_str(data.get("marketplace")) or "US",
+            keyword=_optional_str(data.get("keyword")),
+            strategy=_optional_str(data.get("strategy")) or "balanced",
+            recommendation=_optional_str(data.get("recommendation")),
+            min_confidence=_optional_float(data.get("min_confidence")),
+            max_risk=_optional_float(data.get("max_risk")),
+            sort_by=_optional_str(data.get("sort_by")) or "opportunity_score",
+            sort_dir=_optional_str(data.get("sort_dir")) or "desc",
+        )
+        compact_rows = []
+        for row in page.get("rows", []):
+            trend = row.get("trend") or {}
+            source = row.get("source_identity") or {}
+            compact_rows.append(
+                {
+                    "asin": row.get("asin"),
+                    "title": row.get("title"),
+                    "keyword": row.get("keyword"),
+                    "snapshot_at": row.get("snapshot_at"),
+                    "price": row.get("price"),
+                    "rating": row.get("rating"),
+                    "review_count": row.get("review_count"),
+                    "monthly_bought": row.get("monthly_bought"),
+                    "organic_rank": row.get("organic_rank"),
+                    "legacy_total_score": row.get("legacy_total_score"),
+                    "opportunity_score": row.get("opportunity_score"),
+                    "risk_score": row.get("risk_score"),
+                    "confidence_score": row.get("confidence_score"),
+                    "confidence_level": row.get("confidence_level"),
+                    "recommendation": row.get("recommendation_label"),
+                    "recommendation_reason": row.get("recommendation_reason"),
+                    "supporting_reasons": row.get("supporting_reasons"),
+                    "opposing_reasons": row.get("opposing_reasons"),
+                    "trend": {
+                        "sample_size": trend.get("sample_size"),
+                        "span_days": trend.get("span_days"),
+                        "confidence": trend.get("confidence"),
+                        "growth_score": trend.get("growth_score"),
+                    },
+                    "source": {
+                        "model_version": source.get("model_version"),
+                        "strategy": source.get("strategy"),
+                        "rank_snapshot_id": source.get("rank_snapshot_id"),
+                        "product_snapshot_id": source.get("product_snapshot_id"),
+                    },
+                }
+            )
+        return {
+            "rows": compact_rows,
+            "total": page.get("total"),
+            "summary": page.get("summary"),
+            "strategy": page.get("strategy"),
+            "model": {
+                "version": (page.get("model") or {}).get("version"),
+                "status": (page.get("model") or {}).get("status"),
+                "boundaries": (page.get("model") or {}).get("boundaries"),
+            },
+        }
+
+    def _query_scoring_v2_calibration(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.scoring_v2 import fetch_scoring_v2_calibration
+
+        report = fetch_scoring_v2_calibration(
+            sample_per_bucket=_int(data.get("sample_per_bucket"), 1, 1, 3),
+            marketplace=_optional_str(data.get("marketplace")) or "US",
+            keyword=_optional_str(data.get("keyword")),
+            strategy=_optional_str(data.get("strategy")) or "balanced",
+        )
+        rows = []
+        for row in report.get("rows", []):
+            rows.append(
+                {
+                    "sample_key": row.get("sample_key"),
+                    "bucket": row.get("sample_bucket_label"),
+                    "asin": row.get("asin"),
+                    "title": row.get("title"),
+                    "keyword": row.get("keyword"),
+                    "opportunity_score": row.get("opportunity_score"),
+                    "risk_score": row.get("risk_score"),
+                    "confidence_score": row.get("confidence_score"),
+                    "recommendation": row.get("recommendation_label"),
+                    "strategy_outcomes": row.get("strategy_outcomes"),
+                    "audit_flags": [
+                        {
+                            "code": flag.get("code"),
+                            "label": flag.get("label"),
+                            "reason": flag.get("reason"),
+                        }
+                        for flag in row.get("calibration_flags", [])
+                    ],
+                    "source": {
+                        "model_version": (row.get("source_identity") or {}).get("model_version"),
+                        "rank_snapshot_id": (row.get("source_identity") or {}).get("rank_snapshot_id"),
+                        "product_snapshot_id": (row.get("source_identity") or {}).get("product_snapshot_id"),
+                    },
+                }
+            )
+        return {
+            "rows": rows,
+            "summary": report.get("summary"),
+            "strategy": report.get("strategy"),
+            "calibration": report.get("calibration"),
+            "model": {
+                "version": (report.get("model") or {}).get("version"),
+                "status": (report.get("model") or {}).get("status"),
+                "boundaries": (report.get("model") or {}).get("boundaries"),
+            },
+        }
+
     def _query_review_insights(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         return self.controller.get_review_insights(
             limit=_int(data.get("limit"), 100, 1, 500),
@@ -190,6 +507,22 @@ class AgentToolExecutor:
         return self._tracking_tasks(
             status=_optional_str(data.get("status")),
             limit=_int(data.get("limit"), 50, 1, 500),
+        )
+
+    def _query_tracking_evidence(self, data: dict[str, Any]) -> dict[str, Any]:
+        from services.tracking_evidence import (
+            build_tracking_task_evidence,
+            compact_tracking_task_evidence,
+        )
+
+        movement_limit = _int(data.get("movement_limit"), 5, 1, 10)
+        evidence = build_tracking_task_evidence(
+            _required_int(data, "task_id"),
+            movement_limit=movement_limit,
+        )
+        return compact_tracking_task_evidence(
+            evidence,
+            movement_limit=movement_limit,
         )
 
     def _tracking_tasks(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
@@ -271,15 +604,50 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
         ),
         AgentToolDefinition(
             name="query_products",
-            description="查询商品池，可按关键词、综合分、价格和最大评论数筛选。",
+            description=(
+                "查询商品池，可按关键词、综合分、价格、评分、评论数、近月购买、自然序位、促销和尺寸完整性筛选。"
+                "按已入库关键词精确查询时，默认只返回该词最新完整采集批次；"
+                "只有明确要求历史曾观察商品时才使用 observed。"
+            ),
             parameters=_schema(
                 {
                     "limit": _integer("返回数量，默认 100。", default=100, minimum=1, maximum=500),
-                    "keyword": _string("标题关键词，可为空。"),
+                    "keyword": _string("商品标题/ASIN/关键词过滤，可为空。"),
+                    "keyword_exact": {
+                        "type": "boolean",
+                        "description": "是否按已入库关键词精确筛选；分析某个关键词当前商品时设为 true。",
+                        "default": False,
+                    },
+                    "keyword_scope": {
+                        "type": "string",
+                        "description": "精确关键词范围：current=最新完整批次，observed=历史曾观察并集。",
+                        "enum": ["current", "observed"],
+                        "default": "current",
+                    },
                     "min_score": _number("最低综合得分。"),
+                    "max_score": _number("最高综合得分。"),
                     "min_price": _number("最低价格。"),
                     "max_price": _number("最高价格。"),
+                    "min_rating": _number("最低评分。"),
+                    "max_rating": _number("最高评分。"),
+                    "min_reviews": _integer("最小评论数。", minimum=0),
                     "max_reviews": _integer("最大评论数，用于筛低竞争商品。", minimum=0),
+                    "min_bought": _integer("最小近月购买量。", minimum=0),
+                    "max_bought": _integer("最大近月购买量。", minimum=0),
+                    "min_rank": _integer("最小自然序位估算。", minimum=1),
+                    "max_rank": _integer("最大自然序位估算。", minimum=1),
+                    "deal_status": {
+                        "type": "string",
+                        "description": "促销状态。",
+                        "enum": ["all", "deal", "regular"],
+                        "default": "all",
+                    },
+                    "size_status": {
+                        "type": "string",
+                        "description": "尺寸字段完整性。",
+                        "enum": ["all", "known", "missing"],
+                        "default": "all",
+                    },
                 }
             ),
         ),
@@ -289,13 +657,49 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
             parameters=_schema({"asin": _string("Amazon ASIN。")}, required=["asin"]),
         ),
         AgentToolDefinition(
+            name="query_product_metrics",
+            description=(
+                "按 ASIN 查询指标与估算中心：报价履约、物理规格、SERP 市场证据、"
+                "确定性指标、卖家精确输入、经验情景和数据质量。必须区分事实、计算与估算。"
+            ),
+            parameters=_schema({"asin": _string("Amazon ASIN。")}, required=["asin"]),
+        ),
+        AgentToolDefinition(
+            name="query_detail_evidence_priorities",
+            description=(
+                "只读查询下一批更值得补采详情的商品，按进行中研究项目角色、人工观察计划、"
+                "最近搜索观察和详情证据缺口做全结果优先排序，并结合本地 HTML 区分首次采集、"
+                "过期刷新、本地回填、解析适配和页面未提供；这是无数值评分的人工行动队列。"
+                "页面未提供不等于 0，也不表示应连续重采。工具不创建任务、不启动浏览器、不采集、不写库。"
+            ),
+            parameters=_schema(
+                {
+                    "limit": _integer("返回数量，默认 10，最大 50。", default=10, minimum=1, maximum=50),
+                    "stale_days": _integer("详情证据过期天数，默认 30。", default=30, minimum=1, maximum=3650),
+                    "priority": {
+                        "type": "string",
+                        "description": "优先队列筛选。",
+                        "enum": ["all", "focus", "project", "planned", "recent", "routine"],
+                        "default": "all",
+                    },
+                    "project_id": _integer(
+                        "可选研究项目 ID；传入后，成员范围、计数、排序和分页只针对该项目。",
+                        minimum=1,
+                    ),
+                }
+            ),
+        ),
+        AgentToolDefinition(
             name="query_product_trend",
             description="按 ASIN 查询商品趋势置信度和关键指标变化。",
             parameters=_schema({"asin": _string("Amazon ASIN。")}, required=["asin"]),
         ),
         AgentToolDefinition(
             name="query_keyword_opportunities",
-            description="查询关键词机会聚合，适合发现需求、竞争和机会评分。",
+            description=(
+                "查询关键词机会聚合，当前市场指标只使用每个关键词最新完整采集批次；"
+                "同时返回历史观察商品数、上一批、留存、进入、退出和排名变化证据。"
+            ),
             parameters=_schema(
                 {
                     "limit": _integer("返回数量，默认 100。", default=100, minimum=1, maximum=500),
@@ -347,6 +751,166 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
             ),
         ),
         AgentToolDefinition(
+            name="query_research_projects",
+            description=(
+                "只读查询研究项目及其阶段、关联商品/关键词数量、证据覆盖和人工结论；"
+                "适合回答哪些选品方向正在验证、缺什么证据、哪些已批准或拒绝。"
+            ),
+            parameters=_schema(
+                {
+                    "limit": _integer("返回数量，默认 50。", default=50, minimum=1, maximum=200),
+                    "marketplace": _string("站点，默认 US。"),
+                    "status": {
+                        "type": "string",
+                        "description": "项目状态，可为空。",
+                        "enum": ["idea", "collecting", "validating", "candidate", "manual_review", "approved", "rejected"],
+                    },
+                    "keyword": _string("项目名称、目标或策略关键词，可为空。"),
+                }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_research_review_queue",
+            description=(
+                "只读查询研究项目复核队列，综合证据时效、趋势门槛、核心词追踪任务、冻结报告基线和人工观察计划，"
+                "区分需要处理、等待证据与终态稳定；趋势使用合格时间点，原始点仅供审计。"
+                "观察计划到期只表示该由用户人工查看。工具不保存计划、不完成复核、不创建任务、不采集、"
+                "不冻结报告，也不修改项目状态。"
+            ),
+            parameters=_schema(
+                {
+                    "limit": _integer("返回数量，默认 25，最大 100。", default=25, minimum=1, maximum=100),
+                    "marketplace": _string("站点，默认 US。"),
+                    "status": {
+                        "type": "string",
+                        "description": "项目状态，可为空。",
+                        "enum": ["idea", "collecting", "validating", "candidate", "manual_review", "approved", "rejected"],
+                    },
+                    "keyword": _string("项目名称、目标或策略关键词，可为空。"),
+                    "attention": {
+                        "type": "string",
+                        "description": "关注分组：需要处理、等待证据或终态稳定。",
+                        "enum": ["action_required", "waiting", "terminal"],
+                    },
+                    "monitoring": {
+                        "type": "string",
+                        "description": "人工观察计划筛选；到期不代表后台任务已调度。",
+                        "enum": ["active", "due", "paused", "unplanned"],
+                    },
+                    "as_of": _string("可选评估日期 YYYY-MM-DD；用于复现证据时效判断。"),
+                }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_research_decision_report",
+            description=(
+                "只读生成指定研究项目的决策门禁报告，返回需求、竞争、差异化、趋势、财务、"
+                "证据质量、支持理由、反对理由、数据缺口和来源指纹；趋势同时区分原始点、"
+                "合格点、排名完整性、独立观察窗口与新鲜度，并逐商品返回详情证据准备度与处置建议。"
+                "就绪度不是机会分，工具不能替用户批准/淘汰项目或自动补齐证据。"
+            ),
+            parameters=_schema(
+                {
+                    "project_id": _integer("研究项目 ID。", minimum=1),
+                    "as_of": _string("可选评估日期 YYYY-MM-DD；用于复现同一日期的时效判断。"),
+                },
+                required=["project_id"],
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_market_niches",
+            description=(
+                "只读查询市场利基及其成员关键词、人工锚点商品、研究项目关系和最新证据快照；"
+                "适合解释跨关键词去重市场、覆盖缺口、价格/评论分布、广告密度与集中度。"
+                "证据等级不是机会评分，不可据此自动作进入结论。"
+            ),
+            parameters=_schema(
+                {
+                    "niche_id": _integer("可选利基 ID；提供后返回完整详情。", minimum=1),
+                    "limit": _integer("列表返回数量，默认 50。", default=50, minimum=1, maximum=200),
+                    "marketplace": _string("站点，默认 US。"),
+                    "status": {
+                        "type": "string",
+                        "description": "利基状态，可为空。",
+                        "enum": ["draft", "active", "archived"],
+                    },
+                    "keyword": _string("利基名称、定义或类目范围关键词，可为空。"),
+                }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_competitive_graph",
+            description=(
+                "只读查询指定利基快照的关键词-ASIN共现、关键词相似度、竞品覆盖和目标ASIN关键词缺口。"
+                "所有关系只代表已采集页面观察；自然可见度是位次代理，不是流量，样本置信也不是机会评分。"
+            ),
+            parameters=_schema(
+                {
+                    "niche_id": _integer("市场利基 ID。", minimum=1),
+                    "snapshot_id": _integer("可选利基快照 ID；不传使用最新快照。", minimum=1),
+                    "limit": _integer("返回竞品数量，默认 50。", default=50, minimum=10, maximum=100),
+                    "min_shared": _integer("关键词关系最少共同 ASIN 数，默认 1。", default=1, minimum=1),
+                    "focus_asin": _string("可选目标 ASIN，用于分析成员关键词缺口。"),
+                },
+                required=["niche_id"],
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_scoring_v2_replay",
+            description=(
+                "只读查询 P7 评分 V2 影子回放，分别返回机会分、风险分和置信度，并与旧综合分并列。"
+                "结果按商品与关键词最新完整采集批次计算，不写 product_scores，也不代表已批准进入。"
+            ),
+            parameters=_schema(
+                {
+                    "limit": _integer("返回数量，默认 10，最大 20。", default=10, minimum=1, maximum=20),
+                    "marketplace": _string("站点，默认 US。"),
+                    "keyword": _string("可按关键词、ASIN 或标题过滤。"),
+                    "strategy": {
+                        "type": "string",
+                        "description": "研究策略模板。",
+                        "enum": ["balanced", "low_budget", "differentiation", "trend"],
+                    },
+                    "recommendation": {
+                        "type": "string",
+                        "description": "影子建议状态，可为空。",
+                        "enum": ["priority_validate", "observe", "benchmark_only", "pause"],
+                    },
+                    "min_confidence": _number("最低置信度，0-100。"),
+                    "max_risk": _number("最高风险分，0-100。"),
+                    "sort_by": {
+                        "type": "string",
+                        "description": "排序字段。",
+                        "enum": ["opportunity_score", "risk_score", "confidence_score", "legacy_total_score"],
+                    },
+                    "sort_dir": {
+                        "type": "string",
+                        "description": "排序方向。",
+                        "enum": ["asc", "desc"],
+                    },
+                }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_scoring_v2_calibration",
+            description=(
+                "只读查询 P7.1 评分影子模型的建议×置信度分层校准样本、跨策略分歧和审计标记。"
+                "审计标记只表示优先人工检查，不是错误标签；工具不写人工判断、不调权，也不写数据库。"
+            ),
+            parameters=_schema(
+                {
+                    "sample_per_bucket": _integer("每个实际分层返回数量，默认 1，最大 3。", default=1, minimum=1, maximum=3),
+                    "marketplace": _string("站点，默认 US。"),
+                    "keyword": _string("可按关键词、ASIN 或标题缩小校准范围。"),
+                    "strategy": {
+                        "type": "string",
+                        "description": "作为分层主视角的研究策略。",
+                        "enum": ["balanced", "low_budget", "differentiation", "trend"],
+                    },
+                }
+            ),
+        ),
+        AgentToolDefinition(
             name="query_review_insights",
             description="查询评论洞察和低分痛点摘要。",
             parameters=_schema(
@@ -364,6 +928,26 @@ def get_readonly_tool_definitions() -> list[AgentToolDefinition]:
                     "status": _string("任务状态：active、paused、completed、error，可为空。"),
                     "limit": _integer("返回数量，默认 50。", default=50, minimum=1, maximum=500),
                 }
+            ),
+        ),
+        AgentToolDefinition(
+            name="query_tracking_evidence",
+            description=(
+                "只读查询一个关键词追踪任务的证据复盘：区分原始进度与合格趋势时点，返回安全间隔、"
+                "14/30 天门槛、相邻批次变化、研究候选/对标观察及本地证据摘要。"
+                "不刷新任务、不联网、不采集、不写库；未观察到商品不等于下架或长期衰退。"
+            ),
+            parameters=_schema(
+                {
+                    "task_id": _integer("关键词追踪任务 ID。", minimum=1),
+                    "movement_limit": _integer(
+                        "相邻批次各类明细最多返回数量，默认 5，最大 10。",
+                        default=5,
+                        minimum=1,
+                        maximum=10,
+                    ),
+                },
+                required=["task_id"],
             ),
         ),
         AgentToolDefinition(
@@ -524,6 +1108,24 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _enum(value: Any, allowed: set[str], default: str) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else default
 
 
 def _int(value: Any, default: int, minimum: int, maximum: int) -> int:

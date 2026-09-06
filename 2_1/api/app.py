@@ -1,9 +1,8 @@
-"""FastAPI API 层（D1）——把现有 `AppController` 的只读查询暴露为 REST 端点。
+"""FastAPI API 层：把现有控制器与服务能力暴露为本地 REST 端点。
 
 设计（见 decisions/2026-06-19-前端架构转Web.md §6）：
 - 后端链路完全不变；本层只是新的"调用方"，把 controller 方法包成 HTTP。
-- 本期只做 **GET 查询类**（安全、无写/联网）。写/联网类端点（建追踪任务、触发采集）
-  后续单独加，且必须照守既有边界，不在本层绕过。
+- 查询、显式写入与联网端点共用统一响应契约；写入/联网动作仍由前端确认并遵守采集边界。
 - 统一返回 `{"ok": bool, "data": ..., "message": str}`；异常兜底为 500 + message。
 
 本地启动：
@@ -14,15 +13,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Literal
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI, HTTPException, Request
+from pkg_paths import user_data_path
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -41,6 +43,27 @@ from services.llm_provider import (
     test_agent_provider_config,
 )
 from services.product_detail_collection import ProductDetailCollectionError
+from services.metric_center import MetricInputError
+from services.detail_reparse import DetailReparseError
+from services.research_workspace import ResearchProjectError
+from services.research_decision_report import ResearchDecisionReportError
+from services.research_report_versions import ResearchReportVersionError
+from services.research_review_queue import ResearchReviewQueueError
+from services.research_monitoring import ResearchMonitoringError
+from services.market_niches import MarketNicheError
+from services.competitive_graph import CompetitiveGraphError
+from services.scoring_v2 import ScoringV2Error
+from services.scoring_calibration_export import ScoringCalibrationExportError
+from services.domain_scoring import DomainScoringError
+from api.contracts import ok as _ok
+from api.routers import products as products_routes
+from api.routers import domain_models as domain_model_routes
+from api.routers import research_reports as research_report_routes
+from api.routers import research_reviews as research_review_routes
+from api.routers import research_monitoring as research_monitoring_routes
+from api.routers.system import router as system_router
+from api.routers.warehouse import router as warehouse_router
+from repositories.products import ProductRepository
 
 app = FastAPI(title="Amazon 选品助手 API", version="0.1.0")
 
@@ -53,6 +76,9 @@ _WEB_DIR = resource_path("web")
 # controller 是稳定的前端 API 层；service 变动不冲击本层。
 _controller = AppController()
 _agent_store = AgentConversationStore()
+products_routes.configure_repository(
+    ProductRepository(detail_collector=_controller.collect_product_detail)
+)
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -61,10 +87,6 @@ class NoCacheStaticFiles(StaticFiles):
         if response.status_code == 200:
             response.headers["Cache-Control"] = "no-store"
         return response
-
-
-def _ok(data: Any) -> dict[str, Any]:
-    return {"ok": True, "data": jsonable_encoder(data), "message": ""}
 
 
 @app.exception_handler(BrowserRuntimeError)
@@ -88,10 +110,163 @@ async def _handle_product_detail_collection(_request, exc: ProductDetailCollecti
     )
 
 
+@app.exception_handler(MetricInputError)
+async def _handle_metric_input(_request, exc: MetricInputError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "metric_input_invalid"},
+    )
+
+
+@app.exception_handler(DetailReparseError)
+async def _handle_detail_reparse(_request, exc: DetailReparseError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "detail_reparse_invalid"},
+    )
+
+
+@app.exception_handler(ResearchProjectError)
+async def _handle_research_project(_request, exc: ResearchProjectError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "research_project_invalid"},
+    )
+
+
+@app.exception_handler(ResearchDecisionReportError)
+async def _handle_research_decision_report(
+    _request,
+    exc: ResearchDecisionReportError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "research_report_invalid"},
+    )
+
+
+@app.exception_handler(ResearchReportVersionError)
+async def _handle_research_report_version(
+    _request,
+    exc: ResearchReportVersionError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "data": jsonable_encoder(exc.details),
+            "message": str(exc),
+            "code": exc.code,
+        },
+    )
+
+
+@app.exception_handler(ResearchReviewQueueError)
+async def _handle_research_review_queue(
+    _request,
+    exc: ResearchReviewQueueError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "ok": False,
+            "data": None,
+            "message": str(exc),
+            "code": "research_review_queue_invalid",
+        },
+    )
+
+
+@app.exception_handler(ResearchMonitoringError)
+async def _handle_research_monitoring(
+    _request,
+    exc: ResearchMonitoringError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "data": jsonable_encoder(exc.details),
+            "message": str(exc),
+            "code": exc.code,
+        },
+    )
+
+
+@app.exception_handler(MarketNicheError)
+async def _handle_market_niche(_request, exc: MarketNicheError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "market_niche_invalid"},
+    )
+
+
+@app.exception_handler(CompetitiveGraphError)
+async def _handle_competitive_graph(_request, exc: CompetitiveGraphError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "competitive_graph_invalid"},
+    )
+
+
+@app.exception_handler(ScoringV2Error)
+async def _handle_scoring_v2(_request, exc: ScoringV2Error) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "scoring_v2_invalid"},
+    )
+
+
+@app.exception_handler(ScoringCalibrationExportError)
+async def _handle_scoring_calibration_export(_request, exc: ScoringCalibrationExportError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "scoring_calibration_export_invalid"},
+    )
+
+
+@app.exception_handler(DomainScoringError)
+async def _handle_domain_scoring(_request, exc: DomainScoringError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "domain_scoring_invalid"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _handle_request_validation(_request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "ok": False,
+            "data": {"errors": jsonable_encoder(exc.errors())},
+            "message": "请求参数格式不正确。",
+            "code": "request_validation_error",
+        },
+    )
+
+
+@app.exception_handler(ValueError)
+async def _handle_value_error(_request, exc: ValueError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "data": None, "message": str(exc), "code": "invalid_request"},
+    )
+
+
 @app.exception_handler(Exception)
 async def _handle_all(_request, exc: Exception) -> JSONResponse:
     # 查询失败（如 MySQL 未启动、ASIN 不存在）兜底为结构化错误，前端可统一处理。
     return JSONResponse(status_code=500, content={"ok": False, "data": None, "message": str(exc)})
+
+
+app.include_router(system_router)
+app.include_router(warehouse_router)
+app.include_router(products_routes.router)
+app.include_router(domain_model_routes.router)
+app.include_router(research_report_routes.router)
+app.include_router(research_review_routes.router)
+app.include_router(research_monitoring_routes.router)
 
 
 class KeywordWorkshopRunIn(BaseModel):
@@ -131,53 +306,118 @@ class KeywordLibraryTrackingIn(BaseModel):
     pages_per_keyword: int | None = None
 
 
-class DesktopOpenWebIn(BaseModel):
-    path: str = "/"
+class ProductMetricInputIn(BaseModel):
+    period_start: str
+    period_end: str
+    source_type: str = "manual"
+    source_label: str | None = None
+    sessions: int | None = None
+    page_views: int | None = None
+    units_ordered: int | None = None
+    orders: int | None = None
+    ordered_sales: float | None = None
+    featured_offer_percentage: float | str | None = None
+    impressions: int | None = None
+    clicks: int | None = None
+    cart_adds: int | None = None
+    purchases: int | None = None
+    ad_spend: float | None = None
+    ad_clicks: int | None = None
+    ad_orders: int | None = None
+    ad_sales: float | None = None
+    total_sales: float | None = None
+    unit_purchase_cost: float | None = None
+    unit_shipping_cost: float | None = None
+    unit_fba_fee: float | None = None
+    unit_referral_fee: float | None = None
+    unit_other_cost: float | None = None
+    assumed_cvr_low: float | str | None = None
+    assumed_cvr_base: float | str | None = None
+    assumed_cvr_high: float | str | None = None
+    notes: str | None = None
 
 
-class DesktopOpenAmazonProductIn(BaseModel):
-    asin: str
+class MetricInputImportIn(BaseModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DetailReparseIn(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+
+
+class ResearchProjectCreateIn(BaseModel):
+    name: str
     marketplace: str = "US"
-    product_url: str | None = None
+    objective: str | None = None
+    strategy: str | None = None
 
 
-@app.get("/api/health")
-def health() -> dict[str, Any]:
-    return _ok({"status": "ok"})
+class ResearchProjectUpdateIn(BaseModel):
+    name: str | None = None
+    objective: str | None = None
+    strategy: str | None = None
 
 
-@app.post("/api/desktop/open-web")
-def desktop_open_web(body: DesktopOpenWebIn, request: Request) -> dict[str, Any]:
-    import webbrowser
-
-    path = (body.path or "/").strip().replace("\\", "/")
-    if "://" in path or path.startswith("//"):
-        raise HTTPException(status_code=400, detail="只允许打开当前本地应用页面")
-    if not path.startswith("/"):
-        path = "/" + path
-
-    base_url = str(request.base_url).rstrip("/")
-    if not (base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:")):
-        raise HTTPException(status_code=400, detail="只允许打开本地应用页面")
-
-    url = f"{base_url}{path}"
-    webbrowser.open(url, new=2)
-    return _ok({"url": url})
+class ResearchProjectStatusIn(BaseModel):
+    status: str
+    decision_summary: str | None = None
+    confirmed: bool = False
+    evaluated_on: str | None = None
+    expected_report_fingerprint: str | None = Field(default=None, max_length=64)
+    idempotency_key: str | None = Field(default=None, max_length=64)
+    version_note: str | None = Field(default=None, max_length=2000)
 
 
-@app.post("/api/desktop/open-amazon-product")
-def desktop_open_amazon_product(body: DesktopOpenAmazonProductIn) -> dict[str, Any]:
-    import webbrowser
+class ResearchProjectProductsIn(BaseModel):
+    asins: list[str] = Field(default_factory=list)
+    role: str = "candidate"
+    notes: str | None = None
 
-    from services.amazon_urls import amazon_product_url
 
-    url = amazon_product_url(
-        body.asin,
-        marketplace=body.marketplace,
-        source_url=body.product_url,
-    )
-    webbrowser.open(url, new=2)
-    return _ok({"url": url})
+class ResearchProjectKeywordsIn(BaseModel):
+    keywords: list[str] = Field(default_factory=list)
+    role: str = "candidate"
+    notes: str | None = None
+
+
+class ResearchProjectNoteIn(BaseModel):
+    note_type: str = "observation"
+    content: str
+
+
+class MarketNicheCreateIn(BaseModel):
+    name: str
+    marketplace: str = "US"
+    definition: str | None = None
+    category_scope: str | None = None
+
+
+class MarketNicheUpdateIn(BaseModel):
+    name: str | None = None
+    status: str | None = None
+    definition: str | None = None
+    category_scope: str | None = None
+
+
+class MarketNicheKeywordsIn(BaseModel):
+    keywords: list[str] = Field(default_factory=list)
+    role: str = "core"
+    notes: str | None = None
+
+
+class MarketNicheProductsIn(BaseModel):
+    asins: list[str] = Field(default_factory=list)
+    role: str = "benchmark"
+    notes: str | None = None
+
+
+class MarketNicheProjectsIn(BaseModel):
+    project_ids: list[int] = Field(default_factory=list)
+    role: str = "candidate"
+
+
+class ScoringCalibrationExportIn(BaseModel):
+    payload: dict[str, Any]
 
 
 @app.get("/api/recommendations")
@@ -186,7 +426,21 @@ def recommendations(
     offset: int = 0,
     sort_by: str = "total_score",
     sort_dir: str = "desc",
+    keyword: str | None = None,
     min_score: float | None = None,
+    max_score: float | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    min_rating: float | None = None,
+    max_rating: float | None = None,
+    min_reviews: int | None = None,
+    max_reviews: int | None = None,
+    min_bought: int | None = None,
+    max_bought: int | None = None,
+    min_rank: int | None = None,
+    max_rank: int | None = None,
+    deal_status: Literal["all", "deal", "regular"] = "all",
+    size_status: Literal["all", "known", "missing"] = "all",
 ) -> dict[str, Any]:
     return _ok(
         _controller.get_recommendations_page(
@@ -194,87 +448,190 @@ def recommendations(
             offset=offset,
             sort_by=sort_by,
             sort_dir=sort_dir,
+            keyword=keyword,
             min_score=min_score,
+            max_score=max_score,
+            min_price=min_price,
+            max_price=max_price,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            min_reviews=min_reviews,
+            max_reviews=max_reviews,
+            min_bought=min_bought,
+            max_bought=max_bought,
+            min_rank=min_rank,
+            max_rank=max_rank,
+            deal_status=deal_status,
+            size_status=size_status,
         )
     )
 
 
-@app.get("/api/products")
-def products(
-    limit: int = 100,
+@app.get("/api/scoring-v2/replay")
+def scoring_v2_replay(
+    limit: int = 50,
     offset: int = 0,
+    marketplace: str = "US",
     keyword: str | None = None,
-    keyword_exact: bool = False,
-    min_score: float | None = None,
-    min_price: float | None = None,
-    max_price: float | None = None,
-    max_reviews: int | None = None,
-    sort_by: str = "total_score",
+    strategy: str = "balanced",
+    recommendation: str | None = None,
+    min_confidence: float | None = None,
+    max_risk: float | None = None,
+    sort_by: str = "opportunity_score",
     sort_dir: str = "desc",
 ) -> dict[str, Any]:
+    """Read-only P7 shadow replay; never updates the production score table."""
+    from services.scoring_v2 import fetch_scoring_v2_replay
+
     return _ok(
-        _controller.get_product_pool_page(
+        fetch_scoring_v2_replay(
             limit=limit,
             offset=offset,
+            marketplace=marketplace,
             keyword=keyword,
-            keyword_exact=keyword_exact,
-            min_score=min_score,
-            min_price=min_price,
-            max_price=max_price,
-            max_reviews=max_reviews,
+            strategy=strategy,
+            recommendation=recommendation,
+            min_confidence=min_confidence,
+            max_risk=max_risk,
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
     )
 
 
-@app.get("/api/products/{asin}")
-def product_detail(asin: str) -> dict[str, Any]:
-    return _ok(_controller.get_product_history(asin))
+@app.get("/api/scoring-v2/calibration")
+def scoring_v2_calibration(
+    sample_per_bucket: int = 2,
+    marketplace: str = "US",
+    keyword: str | None = None,
+    strategy: str = "balanced",
+    sample_seed: str = "baseline",
+    exclude_asin: list[str] | None = Query(default=None),
+) -> dict[str, Any]:
+    """Read-only P7.1 sample; drafts stay in the browser unless explicitly exported."""
+    from services.scoring_v2 import fetch_scoring_v2_calibration
 
-
-@app.post("/api/products/{asin}/collect-detail")
-def product_detail_collect(asin: str) -> dict[str, Any]:
-    # 单商品、单页面、用户主动触发；复用共享 Chrome，遇验证即停并保存拦截 HTML。
-    return _ok(_controller.collect_product_detail(asin))
-
-
-@app.get("/api/products/{asin}/image")
-def product_image(asin: str, large: bool = False):
-    # 商品主图联网缓存：首次查看时从采集存下的 Amazon image_url 下载并缓存到本地，
-    # 之后命中缓存。仅允许 Amazon 媒体域名，纯只读派生数据。无图/失败回 404。
-    # large=1 取原始全分辨率图（点击放大看细节），同样缓存。
-    from services.product_image_cache import content_type_for, fetch_product_image
-
-    path = fetch_product_image(asin, large=large)
-    if path is None:
-        return JSONResponse(
-            status_code=404,
-            content={"ok": False, "data": None, "message": "无可用商品图"},
+    return _ok(
+        fetch_scoring_v2_calibration(
+            sample_per_bucket=sample_per_bucket,
+            marketplace=marketplace,
+            keyword=keyword,
+            strategy=strategy,
+            sample_seed=sample_seed,
+            exclude_asins=exclude_asin or (),
         )
-    return FileResponse(
-        path,
-        media_type=content_type_for(path),
-        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 
-@app.get("/api/products/{asin}/trend")
-def product_trend(asin: str) -> dict[str, Any]:
-    # 趋势置信度评估（Claude-Task 趋势模块）：服务端用 assess_product_trend 算，
-    # 保持算法单一真源；前端只渲染。纯只读、不改评分口径、不接 score_record。
-    from services.trend_analysis import assess_product_trend
+@app.post("/api/scoring-v2/calibration/export")
+def scoring_v2_calibration_export(body: ScoringCalibrationExportIn) -> dict[str, Any]:
+    """Persist an explicit calibration review export in the fixed local export directory."""
+    from services.scoring_calibration_export import export_scoring_calibration
 
-    detail = _controller.get_product_history(asin)
-    snapshots = detail.get("snapshots", []) if isinstance(detail, dict) else []
-    return _ok(assess_product_trend(snapshots))
+    return _ok(export_scoring_calibration(body.payload))
 
 
-@app.get("/api/products/{asin}/advice")
-def product_advice(asin: str) -> dict[str, Any]:
-    # 选品建议（结论/风险/进入策略）：透出 controller.get_product_advice，逻辑下沉
-    # 至 services.product_advice，与 GUI 共享；纯只读、不改评分口径。
-    return _ok(_controller.get_product_advice(asin))
+@app.get("/api/scoring-v2/calibration/reviews")
+def scoring_v2_calibration_reviews(limit: int = 200) -> dict[str, Any]:
+    """Read durable human reviews from local calibration exports; never writes MySQL."""
+    from services.scoring_calibration_export import load_exported_scoring_calibration_reviews
+
+    return _ok(load_exported_scoring_calibration_reviews(limit=limit))
+
+
+@app.get("/api/scoring-v2/calibration/export")
+def scoring_v2_calibration_export_capability() -> dict[str, Any]:
+    """Expose the fixed local destination without writing a file."""
+    from services.scoring_calibration_export import EXPORT_SCHEMA_VERSION, scoring_calibration_export_directory
+
+    return _ok(
+        {
+            "available": True,
+            "directory": str(scoring_calibration_export_directory()),
+            "schema_version": EXPORT_SCHEMA_VERSION,
+            "default_scope": "reviewed",
+            "writes_database": False,
+        }
+    )
+
+
+@app.get("/api/metrics/products")
+def metric_products(
+    limit: int = 50,
+    offset: int = 0,
+    keyword: str | None = None,
+) -> dict[str, Any]:
+    from services.metric_center import fetch_metric_products_page
+
+    return _ok(fetch_metric_products_page(limit=limit, offset=offset, keyword=keyword))
+
+
+@app.get("/api/metrics/products/{asin}")
+def metric_product_detail(asin: str) -> dict[str, Any]:
+    from services.metric_center import get_product_metric_center
+
+    return _ok(get_product_metric_center(asin))
+
+
+@app.post("/api/metrics/products/{asin}/inputs")
+def metric_product_input(asin: str, body: ProductMetricInputIn) -> dict[str, Any]:
+    from services.metric_center import save_metric_input
+
+    return _ok(save_metric_input(asin, body.dict()))
+
+
+@app.post("/api/metrics/inputs/import")
+def metric_inputs_import(body: MetricInputImportIn) -> dict[str, Any]:
+    from services.metric_center import import_metric_inputs
+
+    return _ok(import_metric_inputs(body.rows))
+
+
+@app.post("/api/metrics/products/{asin}/refresh-estimates")
+def metric_product_estimates_refresh(asin: str) -> dict[str, Any]:
+    from services.metric_center import refresh_product_estimates
+
+    return _ok(refresh_product_estimates(asin))
+
+
+@app.get("/api/metrics/evidence")
+def metric_evidence_queue(
+    limit: int = 50,
+    offset: int = 0,
+    file_limit: int = 100,
+    stale_days: int = 30,
+    refresh_cache: bool = False,
+    priority: Literal["all", "focus", "project", "planned", "recent", "routine"] = "all",
+    project_id: int | None = None,
+) -> dict[str, Any]:
+    from services.detail_reparse import list_detail_reparse_candidates
+
+    query: dict[str, Any] = {
+        "limit": limit,
+        "offset": offset,
+        "file_limit": file_limit,
+        "stale_days": stale_days,
+        "force_refresh": refresh_cache,
+        "priority": priority,
+    }
+    if project_id is not None:
+        query["project_id"] = project_id
+    return _ok(list_detail_reparse_candidates(**query))
+
+
+@app.post("/api/metrics/evidence/preview")
+def metric_evidence_preview(body: DetailReparseIn) -> dict[str, Any]:
+    from services.detail_reparse import preview_detail_files
+
+    return _ok(preview_detail_files(body.paths))
+
+
+@app.post("/api/metrics/evidence/apply")
+def metric_evidence_apply(body: DetailReparseIn) -> dict[str, Any]:
+    # 纯本地回放；前端确认后调用。服务端会重新读取并校验白名单文件。
+    from services.detail_reparse import apply_detail_files
+
+    return _ok(apply_detail_files(body.paths))
 
 
 @app.get("/api/keywords/opportunities")
@@ -463,6 +820,277 @@ def keyword_workshop_set_run_status(run_id: int, body: KeywordRunStatusIn) -> di
     return _ok(update_keyword_idea_status_by_run(run_id, body.status, marketplace=body.marketplace))
 
 
+# ---------- 研究项目工作区：连接已有商品、关键词、证据与人工结论 ----------
+
+@app.get("/api/research-projects")
+def research_projects(
+    limit: int = 50,
+    offset: int = 0,
+    marketplace: str = "US",
+    status: str | None = None,
+    keyword: str | None = None,
+    sort_by: str = "updated_at",
+    sort_dir: str = "desc",
+) -> dict[str, Any]:
+    from services.research_workspace import fetch_research_projects_page
+
+    return _ok(
+        fetch_research_projects_page(
+            limit=limit,
+            offset=offset,
+            marketplace=marketplace,
+            status=status,
+            keyword=keyword,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    )
+
+
+@app.post("/api/research-projects")
+def research_project_create(body: ResearchProjectCreateIn) -> dict[str, Any]:
+    from services.research_workspace import create_research_project
+
+    return _ok(
+        create_research_project(
+            body.name,
+            marketplace=body.marketplace,
+            objective=body.objective,
+            strategy=body.strategy,
+        )
+    )
+
+
+@app.get("/api/research-projects/{project_id}")
+def research_project_detail(project_id: int) -> dict[str, Any]:
+    from services.research_workspace import get_research_project
+
+    return _ok(get_research_project(project_id))
+
+
+@app.patch("/api/research-projects/{project_id}")
+def research_project_update(project_id: int, body: ResearchProjectUpdateIn) -> dict[str, Any]:
+    from services.research_workspace import update_research_project
+
+    return _ok(
+        update_research_project(
+            project_id,
+            name=body.name,
+            objective=body.objective,
+            strategy=body.strategy,
+        )
+    )
+
+
+@app.post("/api/research-projects/{project_id}/status")
+def research_project_status(project_id: int, body: ResearchProjectStatusIn) -> dict[str, Any]:
+    from services.research_workspace import set_research_project_status
+
+    return _ok(
+        set_research_project_status(
+            project_id,
+            body.status,
+            decision_summary=body.decision_summary,
+            confirmed=body.confirmed,
+            evaluated_on=body.evaluated_on,
+            expected_report_fingerprint=body.expected_report_fingerprint,
+            idempotency_key=body.idempotency_key,
+            version_note=body.version_note,
+        )
+    )
+
+
+@app.post("/api/research-projects/{project_id}/products")
+def research_project_products_add(project_id: int, body: ResearchProjectProductsIn) -> dict[str, Any]:
+    from services.research_workspace import add_research_project_products
+
+    return _ok(
+        add_research_project_products(
+            project_id,
+            body.asins,
+            role=body.role,
+            notes=body.notes,
+        )
+    )
+
+
+@app.delete("/api/research-projects/{project_id}/products/{product_id}")
+def research_project_product_delete(project_id: int, product_id: int) -> dict[str, Any]:
+    from services.research_workspace import remove_research_project_product
+
+    return _ok(remove_research_project_product(project_id, product_id))
+
+
+@app.post("/api/research-projects/{project_id}/keywords")
+def research_project_keywords_add(project_id: int, body: ResearchProjectKeywordsIn) -> dict[str, Any]:
+    from services.research_workspace import add_research_project_keywords
+
+    return _ok(
+        add_research_project_keywords(
+            project_id,
+            body.keywords,
+            role=body.role,
+            notes=body.notes,
+        )
+    )
+
+
+@app.delete("/api/research-projects/{project_id}/keywords/{keyword_id}")
+def research_project_keyword_delete(project_id: int, keyword_id: int) -> dict[str, Any]:
+    from services.research_workspace import remove_research_project_keyword
+
+    return _ok(remove_research_project_keyword(project_id, keyword_id))
+
+
+@app.post("/api/research-projects/{project_id}/notes")
+def research_project_note_add(project_id: int, body: ResearchProjectNoteIn) -> dict[str, Any]:
+    from services.research_workspace import add_research_project_note
+
+    return _ok(add_research_project_note(project_id, body.note_type, body.content))
+
+
+@app.delete("/api/research-projects/{project_id}/notes/{note_id}")
+def research_project_note_delete(project_id: int, note_id: int) -> dict[str, Any]:
+    from services.research_workspace import delete_research_project_note
+
+    return _ok(delete_research_project_note(project_id, note_id))
+
+
+# ---------- 市场与利基：显式成员、现有证据聚合与人工项目关系 ----------
+
+@app.get("/api/market-niches")
+def market_niches(
+    limit: int = 50,
+    offset: int = 0,
+    marketplace: str = "US",
+    status: str | None = None,
+    keyword: str | None = None,
+    sort_by: str = "updated_at",
+    sort_dir: str = "desc",
+) -> dict[str, Any]:
+    from services.market_niches import fetch_market_niches_page
+
+    return _ok(
+        fetch_market_niches_page(
+            limit=limit,
+            offset=offset,
+            marketplace=marketplace,
+            status=status,
+            keyword=keyword,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    )
+
+
+@app.post("/api/market-niches")
+def market_niche_create(body: MarketNicheCreateIn) -> dict[str, Any]:
+    from services.market_niches import create_market_niche
+
+    return _ok(
+        create_market_niche(
+            body.name,
+            marketplace=body.marketplace,
+            definition=body.definition,
+            category_scope=body.category_scope,
+        )
+    )
+
+
+@app.get("/api/market-niches/{niche_id}")
+def market_niche_detail(niche_id: int) -> dict[str, Any]:
+    from services.market_niches import get_market_niche
+
+    return _ok(get_market_niche(niche_id))
+
+
+@app.patch("/api/market-niches/{niche_id}")
+def market_niche_update(niche_id: int, body: MarketNicheUpdateIn) -> dict[str, Any]:
+    from services.market_niches import update_market_niche
+
+    return _ok(
+        update_market_niche(
+            niche_id,
+            name=body.name,
+            status=body.status,
+            definition=body.definition,
+            category_scope=body.category_scope,
+        )
+    )
+
+
+@app.post("/api/market-niches/{niche_id}/keywords")
+def market_niche_keywords_add(niche_id: int, body: MarketNicheKeywordsIn) -> dict[str, Any]:
+    from services.market_niches import add_niche_keywords
+
+    return _ok(add_niche_keywords(niche_id, body.keywords, role=body.role, notes=body.notes))
+
+
+@app.delete("/api/market-niches/{niche_id}/keywords/{keyword_id}")
+def market_niche_keyword_delete(niche_id: int, keyword_id: int) -> dict[str, Any]:
+    from services.market_niches import remove_niche_keyword
+
+    return _ok(remove_niche_keyword(niche_id, keyword_id))
+
+
+@app.post("/api/market-niches/{niche_id}/products")
+def market_niche_products_add(niche_id: int, body: MarketNicheProductsIn) -> dict[str, Any]:
+    from services.market_niches import add_niche_products
+
+    return _ok(add_niche_products(niche_id, body.asins, role=body.role, notes=body.notes))
+
+
+@app.delete("/api/market-niches/{niche_id}/products/{product_id}")
+def market_niche_product_delete(niche_id: int, product_id: int) -> dict[str, Any]:
+    from services.market_niches import remove_niche_product
+
+    return _ok(remove_niche_product(niche_id, product_id))
+
+
+@app.post("/api/market-niches/{niche_id}/projects")
+def market_niche_projects_add(niche_id: int, body: MarketNicheProjectsIn) -> dict[str, Any]:
+    from services.market_niches import add_niche_projects
+
+    return _ok(add_niche_projects(niche_id, body.project_ids, role=body.role))
+
+
+@app.delete("/api/market-niches/{niche_id}/projects/{project_id}")
+def market_niche_project_delete(niche_id: int, project_id: int) -> dict[str, Any]:
+    from services.market_niches import remove_niche_project
+
+    return _ok(remove_niche_project(niche_id, project_id))
+
+
+@app.post("/api/market-niches/{niche_id}/snapshots")
+def market_niche_snapshot_generate(niche_id: int) -> dict[str, Any]:
+    from services.market_niches import generate_niche_snapshot
+
+    return _ok(generate_niche_snapshot(niche_id))
+
+
+# ---------- 竞品图谱：仅从利基快照冻结来源构建只读关系 ----------
+
+@app.get("/api/competitive-graph/{niche_id}")
+def competitive_graph(
+    niche_id: int,
+    snapshot_id: int | None = None,
+    limit: int = 100,
+    min_shared: int = 1,
+    focus_asin: str | None = None,
+) -> dict[str, Any]:
+    from services.competitive_graph import get_competitive_graph
+
+    return _ok(
+        get_competitive_graph(
+            niche_id,
+            snapshot_id=snapshot_id,
+            limit=limit,
+            min_shared=min_shared,
+            focus_asin=focus_asin,
+        )
+    )
+
+
 @app.get("/api/reviews/insights")
 def review_insights(limit: int = 100, keyword: str | None = None) -> dict[str, Any]:
     return _ok(_controller.get_review_insights(limit=limit, keyword=keyword))
@@ -471,6 +1099,25 @@ def review_insights(limit: int = 100, keyword: str | None = None) -> dict[str, A
 @app.get("/api/tasks")
 def tasks(limit: int = 100, status: str | None = None) -> dict[str, Any]:
     return _ok(_controller.get_task_jobs(limit=limit, status=status))
+
+
+@app.get("/api/tasks/page")
+def task_page(
+    limit: int = 25,
+    offset: int = 0,
+    keyword: str | None = None,
+    status: str | None = None,
+    job_type: str | None = None,
+) -> dict[str, Any]:
+    return _ok(
+        _controller.get_task_jobs_page(
+            limit=limit,
+            offset=offset,
+            keyword=keyword,
+            status=status,
+            job_type=job_type,
+        )
+    )
 
 
 # ---------- 关键词追踪（C3 对接）：写 / 联网类端点 ----------
@@ -535,6 +1182,13 @@ def tracking_list(status: str | None = None, limit: int = 50) -> dict[str, Any]:
     from services.keyword_tracking import list_tracking_tasks
 
     return _ok(list_tracking_tasks(status=status, limit=limit))
+
+
+@app.get("/api/tracking/tasks/{task_id}/evidence")
+def tracking_evidence(task_id: int) -> dict[str, Any]:
+    from services.tracking_evidence import build_tracking_task_evidence
+
+    return _ok(build_tracking_task_evidence(task_id))
 
 
 @app.post("/api/tracking/tasks")
@@ -644,12 +1298,15 @@ def crawl_queues_delete(name: str) -> dict[str, Any]:
 # - 预览(只读解析)与入库(写库)分两步；入库前端须二次确认。透出既有 controller
 #   方法，不新造业务逻辑、不改评分/采集口径。
 
-_HTML_IMPORT_DIR = ROOT / "html"
+_HTML_IMPORT_DIR = user_data_path("html")
 
 
 class HtmlImportIn(BaseModel):
     files: list[str]
     keyword: str | None = None
+    confirmation_token: str | None = None
+    expected_valid: int | None = Field(default=None, ge=0)
+    confirmed: bool = False
 
 
 def _list_html_files() -> list[str]:
@@ -658,7 +1315,7 @@ def _list_html_files() -> list[str]:
     files: list[str] = []
     for path in _HTML_IMPORT_DIR.rglob("*.html"):
         rel = path.relative_to(_HTML_IMPORT_DIR)
-        if rel.parts and rel.parts[0] in {"_blocked", "_details"}:
+        if any(part in {"_blocked", "_details"} for part in rel.parts):
             continue
         files.append(rel.as_posix())
     return sorted(files)
@@ -697,43 +1354,26 @@ def import_html_preview(body: HtmlImportIn) -> dict[str, Any]:
 
 @app.post("/api/import/html/commit")
 def import_html_commit(body: HtmlImportIn) -> dict[str, Any]:
-    # 写库：前端二次确认后调用，透出既有 import_files_to_database。
+    if not body.confirmed:
+        raise ValueError("写入数据库前必须由用户明确确认。")
+    if not body.confirmation_token or body.expected_valid is None:
+        raise ValueError("请先完成本批 HTML 预览，再确认写入数据库。")
     files = _safe_html_files(body.files)
-    return _ok(_controller.import_files_to_database(files, keyword=body.keyword))
-
-
-# ---------- 分析仓库手动同步（阶段1 单元③·透出现有 sync_analytics_warehouse） ----------
-# 边界：单向 MySQL→DuckDB/Parquet 分析副本，不反写主库（架构基线）。透出既有
-# controller 方法，不改同步逻辑/聚合口径。前端二次确认后触发。
-
-@app.post("/api/warehouse/sync")
-def warehouse_sync() -> dict[str, Any]:
-    return _ok(_controller.sync_analytics_warehouse())
-
-
-# ---------- 用户设置（S3 设置页·透出 services.settings） ----------
-# 边界：B 层（采集间隔/页数/72h/快照过期）由服务端按安全边界强制校验，不信前端；
-# C 层自定义评分只作独立参考层、不替换标准评分口径。GET 返回设置+schema，POST 回报调整记录。
-
-class SettingsPatchIn(BaseModel):
-    patch: dict[str, Any]
-
-
-@app.get("/api/settings")
-def settings_get() -> dict[str, Any]:
-    return _ok(_controller.get_settings())
-
-
-@app.post("/api/settings")
-def settings_update(body: SettingsPatchIn) -> dict[str, Any]:
-    return _ok(_controller.update_settings(body.patch))
+    return _ok(
+        _controller.import_previewed_files_to_database(
+            files,
+            keyword=body.keyword,
+            confirmation_token=body.confirmation_token,
+            expected_valid=body.expected_valid,
+        )
+    )
 
 
 # ---------- 评论导入（阶段1 单元②·透出现有 review_import / review_html_export） ----------
 # 边界同单元①：白名单只允许 reviews/ 目录下文件、只收 basename、拒绝路径分隔/上跳。
 # CSV/JSON 导入分预览(只读)/入库(写库，前端二次确认)；HTML 解析仅离线本地、不联网、不写业务库。
 
-_REVIEW_DIR = ROOT / "reviews"
+_REVIEW_DIR = user_data_path("reviews")
 
 
 class ReviewImportIn(BaseModel):
@@ -806,7 +1446,7 @@ def agent_config_get() -> dict[str, Any]:
 @app.put("/api/agent/config")
 def agent_config_save(body: AgentConfigIn) -> dict[str, Any]:
     try:
-        return _ok(save_agent_config(body.dict()))
+        return _ok(save_agent_config(body.model_dump()))
     except LLMProviderError as exc:
         return {"ok": False, "data": None, "message": str(exc)}
 
@@ -814,7 +1454,7 @@ def agent_config_save(body: AgentConfigIn) -> dict[str, Any]:
 @app.post("/api/agent/config/test")
 def agent_config_test(body: AgentConfigIn) -> dict[str, Any]:
     try:
-        return _ok(test_agent_provider_config(body.dict()))
+        return _ok(test_agent_provider_config(body.model_dump()))
     except LLMProviderError as exc:
         return {"ok": False, "data": None, "message": str(exc)}
 

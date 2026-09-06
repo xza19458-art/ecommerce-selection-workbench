@@ -21,6 +21,8 @@ import sys
 import threading
 from typing import Iterable
 
+from pkg_paths import user_data_path
+
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,15 @@ class BrowserRuntimeError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.details = details or {}
+
+
+class BrowserBusyError(BrowserRuntimeError):
+    def __init__(self, operation: str = "浏览器操作") -> None:
+        super().__init__(
+            f"共享采集浏览器正在执行其他任务，暂不能开始{operation}。请等待当前任务完成后重试。",
+            code="browser_busy",
+            details={"operation": operation, "retryable": True},
+        )
 
 
 class ChromeNotFoundError(BrowserRuntimeError):
@@ -389,7 +400,7 @@ def _driver_candidate_paths() -> list[tuple[Path, str]]:
         (Path.home() / ".wdm" / "drivers" / "chromedriver", "webdriver-manager 缓存"),
         (Path.home() / ".cache" / "selenium" / "chromedriver", "Selenium 缓存"),
         (Path(sys.executable).resolve().parent / "drivers", "应用驱动目录"),
-        (Path(__file__).resolve().parents[1] / "drivers", "项目驱动目录"),
+        (user_data_path("drivers"), "应用数据驱动目录"),
     ]
     for root, source in roots:
         if not root.is_dir():

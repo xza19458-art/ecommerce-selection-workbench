@@ -30,15 +30,21 @@ REVIEW_COLUMNS = (
 
 def main() -> None:
     db = MySQLClient()
+    before_products = False
+    before_reviews = False
+    before_cache = False
+    try:
+        with db.connect() as conn:
+            with conn.cursor() as cursor:
+                before_products = db.has_columns(cursor, "products", PRODUCT_COLUMNS)
+                before_reviews = db.has_columns(cursor, "product_reviews", REVIEW_COLUMNS)
+                before_cache = _table_exists(cursor, db.config.database, "translation_cache")
+    except Exception:  # noqa: BLE001 - unified initialization handles absent schema.
+        pass
+
+    result = db.initialize_schema()
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            before_products = db.has_columns(cursor, "products", PRODUCT_COLUMNS)
-            before_reviews = db.has_columns(cursor, "product_reviews", REVIEW_COLUMNS)
-            before_cache = _table_exists(cursor, db.config.database, "translation_cache")
-
-            db.ensure_translation_columns(cursor)
-            db.ensure_translation_cache_table(cursor)
-
             after_products = db.has_columns(cursor, "products", PRODUCT_COLUMNS)
             after_reviews = db.has_columns(cursor, "product_reviews", REVIEW_COLUMNS)
             after_cache = _table_exists(cursor, db.config.database, "translation_cache")
@@ -51,6 +57,7 @@ def main() -> None:
     print(f"products_columns_after: {after_products}")
     print(f"reviews_columns_after: {after_reviews}")
     print(f"cache_table_after: {after_cache}")
+    print(f"migration_action: {result['action']}")
 
 
 def _table_exists(cursor, database: str, table: str) -> bool:

@@ -10,7 +10,8 @@
 - 入口 = desktop_app.py（桌面壳）。后端经 `uvicorn.Config("api.app:app")` 以**字符串**加载，
   PyInstaller 静态分析探测不到；且本项目大量使用**函数内惰性 import**（`from services.x import ...`）。
   故用 collect_submodules 显式收集 api/core/services/analysis/database/parsers 全部子模块 + uvicorn。
-- datas：打包 web/ 静态前端 + config/*.example.json 模板（**不打包真实密钥** database.json 等）。
+- datas：打包 web/、schema 快照、完整迁移目录和 config/*.example.json 模板
+  （**不打包真实密钥** database.json 等）。
 - 路径：运行时由 pkg_paths 定位（web 走 _MEIPASS，用户数据走 exe 同级），不写死。
 - console=False（窗口应用，错误写 logs/desktop.log）；首次排错可临时改 True 看控制台。
 """
@@ -28,6 +29,7 @@ hiddenimports = (
     + collect_submodules("api")
     + collect_submodules("core")
     + collect_submodules("services", filter=_no_translation)
+    + collect_submodules("repositories")
     + collect_submodules("analysis")
     + collect_submodules("database")
     + collect_submodules("parsers")
@@ -42,6 +44,8 @@ hiddenimports = (
 
 datas = [
     ("web", "web"),
+    ("database/schema.sql", "database"),
+    ("database/migrations", "database/migrations"),
     ("config/database.example.json", "config"),
     ("config/warehouse.example.json", "config"),
     ("config/translation.example.json", "config"),

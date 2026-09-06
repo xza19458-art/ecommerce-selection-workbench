@@ -26,7 +26,7 @@ def parse_count(text):
         return int(float(text.replace("K", "")) * 1000)
     try:
         return int(text)
-    except:
+    except (TypeError, ValueError):
         return None
 
 
@@ -37,7 +37,7 @@ def clean_price(text):
     price_str = re.sub(r'[^\d.]', '', text)
     try:
         return float(price_str)
-    except:
+    except (TypeError, ValueError):
         return None
 
 

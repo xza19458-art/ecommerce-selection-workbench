@@ -17,6 +17,7 @@ SNAPSHOT_WAREHOUSE_TABLES = (
     "dim_keywords",
     "fact_product_snapshots",
     "fact_keyword_rank_snapshots",
+    "fact_keyword_serp_snapshots",
     "fact_product_scores",
 )
 

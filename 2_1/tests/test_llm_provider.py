@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 import tempfile
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -12,6 +14,7 @@ if str(ROOT) not in sys.path:
 from services.llm_provider import (
     AnthropicProvider,
     LLMProviderConfig,
+    LLMProviderError,
     OpenAICompatibleProvider,
     ToolCall,
     build_provider,
@@ -21,6 +24,27 @@ from services.llm_provider import (
     _parse_openai_response,
     _to_anthropic_messages,
 )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///C:/temp/model",
+        "ftp://localhost/model",
+        "https://user:secret@example.com/v1",
+        "https://example.com/v1?token=secret",
+    ],
+)
+def test_agent_base_url_rejects_non_http_or_embedded_credentials(base_url: str) -> None:
+    with pytest.raises(LLMProviderError):
+        LLMProviderConfig.from_dict(
+            {
+                "provider": "openai_compatible",
+                "base_url": base_url,
+                "api_key": "test",
+                "model": "model",
+            }
+        )
 
 
 def test_config_parses_string_false_for_tool_support() -> None:

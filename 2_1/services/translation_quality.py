@@ -59,8 +59,6 @@ def collect_translation_samples(
 
     with db.connect() as conn:
         with conn.cursor() as cursor:
-            if use_cache and runtime_config.enabled and runtime_config.use_cache:
-                db.ensure_translation_cache_table(cursor)
             if include_products:
                 for row in _fetch_product_rows(cursor, product_limit):
                     samples.append(
